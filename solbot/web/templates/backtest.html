@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+{% block title %}Backtest — Solana TA Bot{% endblock %}
+
+{% block content %}
+
+<div class="grid grid-2" style="margin-bottom:16px">
+  <div class="panel">
+    <h2>Historical data pull</h2>
+    <p class="hint" style="margin-top:0">
+      The first pull is heavy and rate limited, so it is started manually rather than
+      running on boot. Later runs are incremental — only newly elapsed days are fetched.
+    </p>
+    <div id="pullProgress" style="margin:12px 0">
+      <div class="progress"><div id="pullBar" style="width:0%"></div></div>
+      <p class="hint" id="pullLabel">{{ pull.message or 'Not run yet' }}</p>
+    </div>
+    <form method="post" action="{{ url_for('dashboard.historical_pull') }}" class="btn-row">
+      <input type="number" name="days" value="90" min="7" max="365" style="width:100px">
+      <button class="btn-primary">Start historical pull</button>
+    </form>
+    <div class="kv" style="margin-top:14px">
+      <span>Birdeye budget used this month</span>
+      <span id="budgetUsed">{{ budget.units }} / {{ budget_limit }} CU</span>
+    </div>
+    <p class="hint">
+      An OHLCV call costs 35 CU and returns up to 1000 candles. The free Standard tier's
+      30,000 CU is roughly 857 calls per month, so a large first pull needs planning —
+      or the Starter plan.
+    </p>
+  </div>
+
+  <div class="panel">
+    <h2>Backtest</h2>
+    <p class="hint" style="margin-top:0">
+      Runs the live entry/exit rules against stored candles, entirely offline. The basket
+      is built from what actually passed the filters on each historical day, and keeps
+      tokens that later went to zero — otherwise the results would flatter themselves.
+    </p>
+    <div id="backtestProgress" style="margin:12px 0">
+      <div class="progress"><div id="backtestBar" style="width:0%"></div></div>
+      <p class="hint" id="backtestLabel">{{ backtest_progress.message or 'Not run yet' }}</p>
+    </div>
+    <form method="post" action="{{ url_for('dashboard.run_backtest') }}" class="btn-row">
+      <input type="number" name="days" value="90" min="7" max="365" style="width:100px">
+      <button class="btn-primary">Run backtest now</button>
+    </form>
+    <p class="hint">
+      This also runs automatically once a day, so drift between what the rules are
+      expected to do and what they are actually doing shows up without being checked for.
+    </p>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Backtest history</h2>
+  <div class="table-scroll">
+    <table>
+      <thead>
+        <tr>
+          <th>Run (UTC)</th><th class="num">Trades</th><th class="num">Win rate</th>
+          <th class="num">Profit factor</th><th class="num">Max drawdown</th>
+          <th class="num">Return</th><th class="num">Avg win</th><th class="num">Avg loss</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in runs %}
+        <tr>
+          <td class="mono nowrap">{{ r.ts | ts }}</td>
+          <td class="num">{{ r.trades }}</td>
+          <td class="num">{{ '%.1f' % ((r.win_rate or 0) * 100) }}%</td>
+          <td class="num">{{ ('%.2f' % r.profit_factor) if r.profit_factor is not none else '∞' }}</td>
+          <td class="num warn">{{ '%.1f' % ((r.max_drawdown or 0) * 100) }}%</td>
+          <td class="num {{ 'pos' if (r.total_return or 0) > 0 else 'neg' }}">
+            {{ '%+.2f' % ((r.total_return or 0) * 100) }}%
+          </td>
+          <td class="num pos">{{ r.avg_win | money }}</td>
+          <td class="num neg">{{ r.avg_loss | money }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="8" class="empty">No backtest runs yet</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% endblock %}

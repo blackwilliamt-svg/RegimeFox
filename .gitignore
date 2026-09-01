@@ -1,0 +1,16 @@
+.env
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+data/
+__pycache__/
+*.pyc
+.venv/
+venv/
+config.json
+*.log
+.pytest_cache/
+
+# Local editor/tooling config (hardcodes machine-specific paths)
+.claude/

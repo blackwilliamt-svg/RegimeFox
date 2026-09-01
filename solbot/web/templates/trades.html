@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}Trade journal — Solana TA Bot{% endblock %}
+{% block live %}off{% endblock %}
+
+{% block content %}
+<div class="panel">
+  <div class="panel-head">
+    <h2>Trade journal — {{ instance }}</h2>
+    <div class="btn-row">
+      <a class="btn btn-sm {{ 'btn-primary' if instance == 'all' }}"
+         href="{{ url_for('dashboard.trades') }}">All</a>
+      {% for name in instances %}
+      <a class="btn btn-sm {{ 'btn-primary' if instance == name }}"
+         href="{{ url_for('dashboard.trades', instance=name) }}">{{ name }}</a>
+      {% endfor %}
+      <a class="btn btn-sm" href="{{ url_for('dashboard.export_trades', instance=(none if instance == 'all' else instance)) }}">
+        Export CSV
+      </a>
+    </div>
+  </div>
+
+  <div class="table-scroll">
+    <table>
+      <thead>
+        <tr>
+          <th>Closed (UTC)</th><th>Instance</th><th>Token</th>
+          <th class="num">Entry</th><th class="num">Exit</th>
+          <th class="num">Size</th><th class="num">P&amp;L</th><th class="num">Fees</th>
+          <th class="num">Held</th><th>Entry reason</th><th>Exit reason</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for t in trades %}
+        <tr>
+          <td class="mono nowrap">{{ t.exit_ts | ts }}</td>
+          <td>
+            <span class="tag tag-{{ t.instance }}">{{ t.instance }}</span>
+            {% if t.manual %}<span class="tag tag-manual">manual</span>{% endif %}
+          </td>
+          <td><strong>{{ t.symbol or t.mint[:8] }}</strong></td>
+          <td class="num">{{ '%.6g' % t.entry_price }}</td>
+          <td class="num">{{ '%.6g' % t.exit_price }}</td>
+          <td class="num">{{ t.size_usd | money }}</td>
+          <td class="num {{ 'pos' if t.pnl_usd > 0 else 'neg' }}">
+            {{ t.pnl_usd | money }}<br>
+            <span class="dim">{{ '%+.2f' % (t.pnl_pct * 100) }}%</span>
+          </td>
+          <td class="num dim">{{ t.fees_usd | money }}</td>
+          <td class="num dim">{{ ((t.hold_seconds or 0) / 60) | round(0) | int }}m</td>
+          <td class="dim" style="max-width:260px;font-size:12px">{{ t.entry_reason or '—' }}</td>
+          <td class="dim" style="max-width:200px;font-size:12px">{{ t.exit_reason or '—' }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="11" class="empty">No closed trades yet</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

@@ -1,0 +1,49 @@
+[Unit]
+Description=Solana TA Bot - dashboard (gunicorn)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=solbot
+Group=solbot
+WorkingDirectory=/opt/solana-ta-bot
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/opt/solana-ta-bot/.env
+
+# Two workers is plenty: the dashboard is read-mostly and the trading loop lives
+# in a separate process. More workers on a 1 vCPU box just adds contention.
+# Bound to localhost only - nginx terminates TLS and is the sole public entry.
+ExecStart=/opt/solana-ta-bot/.venv/bin/gunicorn \
+    --workers 2 \
+    --threads 4 \
+    --timeout 60 \
+    --graceful-timeout 30 \
+    --bind 127.0.0.1:8090 \
+    --access-logfile - \
+    --error-logfile - \
+    wsgi:app
+
+Restart=on-failure
+RestartSec=5
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/solana-ta-bot/data /opt/solana-ta-bot/config.json
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+MemoryMax=400M
+CPUWeight=40
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=solbot-web
+
+[Install]
+WantedBy=multi-user.target

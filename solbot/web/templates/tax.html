@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+{% block title %}Tax summary — Solana TA Bot{% endblock %}
+{% block live %}off{% endblock %}
+
+{% block content %}
+
+<div class="banner banner-info">
+  <div>
+    <strong>Live trades only.</strong> Paper and shadow-mode trades are excluded — they
+    are not real taxable events. This is a summary to hand to a preparer, not tax advice.
+  </div>
+  <form method="get" class="btn-row">
+    <input type="number" name="year" value="{{ year or '' }}" placeholder="Year"
+           style="width:100px" min="2020" max="2100">
+    <button class="btn-sm">Filter</button>
+    <a class="btn btn-sm" href="{{ url_for('dashboard.export_tax', year=year) }}">Export CSV</a>
+  </form>
+</div>
+
+<div class="grid grid-4" style="margin-bottom:16px">
+  <div class="stat">
+    <div class="label">Realised gain/loss</div>
+    <div class="value {{ 'pos' if summary.realized_gain > 0 else 'neg' }}">
+      {{ summary.realized_gain | money }}
+    </div>
+    <div class="sub">{{ summary.trades }} live trades</div>
+  </div>
+  <div class="stat">
+    <div class="label">Gross proceeds</div>
+    <div class="value">{{ summary.proceeds | money }}</div>
+  </div>
+  <div class="stat">
+    <div class="label">Cost basis</div>
+    <div class="value">{{ summary.cost_basis | money }}</div>
+  </div>
+  <div class="stat">
+    <div class="label">Fees paid</div>
+    <div class="value dim">{{ summary.fees | money }}</div>
+  </div>
+</div>
+
+<div class="grid grid-2" style="margin-bottom:16px">
+  <div class="stat">
+    <div class="label">Short-term (held under 1 year)</div>
+    <div class="value {{ 'pos' if summary.short_term_gain > 0 else 'neg' }}">
+      {{ summary.short_term_gain | money }}
+    </div>
+  </div>
+  <div class="stat">
+    <div class="label">Long-term (held 1 year or more)</div>
+    <div class="value {{ 'pos' if summary.long_term_gain > 0 else 'neg' }}">
+      {{ summary.long_term_gain | money }}
+    </div>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>By token</h2>
+  <div class="table-scroll">
+    <table>
+      <thead>
+        <tr>
+          <th>Token</th><th>Mint</th><th class="num">Trades</th>
+          <th class="num">Proceeds</th><th class="num">Cost basis</th>
+          <th class="num">Fees</th><th class="num">Realised gain</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in summary.by_token %}
+        <tr>
+          <td><strong>{{ row.symbol or '—' }}</strong></td>
+          <td class="mono dim">{{ row.mint[:14] }}…</td>
+          <td class="num">{{ row.trades }}</td>
+          <td class="num">{{ row.proceeds | money }}</td>
+          <td class="num">{{ row.cost_basis | money }}</td>
+          <td class="num dim">{{ row.fees | money }}</td>
+          <td class="num {{ 'pos' if row.realized_gain > 0 else 'neg' }}">
+            {{ row.realized_gain | money }}
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="7" class="empty">No live trades in this period</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% endblock %}

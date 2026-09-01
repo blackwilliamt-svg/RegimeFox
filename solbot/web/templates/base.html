@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Solana TA Bot{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>📈</text></svg>">
+</head>
+<body data-live="{% block live %}on{% endblock %}">
+{% if session.get('username') %}
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">◈</span>
+    <span>Solana TA Bot</span>
+    <span class="mode mode-{{ mode|default('paper') }}">{{ (mode|default('paper'))|upper }}</span>
+  </div>
+  <nav>
+    <a href="{{ url_for('dashboard.index') }}" class="{{ 'on' if request.endpoint == 'dashboard.index' }}">Dashboard</a>
+    <a href="{{ url_for('dashboard.trades') }}" class="{{ 'on' if request.endpoint == 'dashboard.trades' }}">Trades</a>
+    <a href="{{ url_for('dashboard.backtest') }}" class="{{ 'on' if request.endpoint == 'dashboard.backtest' }}">Backtest</a>
+    <a href="{{ url_for('dashboard.tax') }}" class="{{ 'on' if request.endpoint == 'dashboard.tax' }}">Tax</a>
+    <a href="{{ url_for('dashboard.settings') }}" class="{{ 'on' if request.endpoint == 'dashboard.settings' }}">Settings</a>
+  </nav>
+  <div class="topright">
+    <button type="button" class="theme-toggle" id="themeToggle" title="Toggle light/dark">◐</button>
+    <span class="user">{{ session.get('username') }}</span>
+    <a class="logout" href="{{ url_for('auth.logout') }}">Sign out</a>
+  </div>
+</header>
+{% endif %}
+
+<main class="{% block main_class %}wrap{% endblock %}">
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      <div class="flashes">
+        {% for category, message in messages %}
+          <div class="flash flash-{{ category }}">{{ message }}</div>
+        {% endfor %}
+      </div>
+    {% endif %}
+  {% endwith %}
+
+  {% block content %}{% endblock %}
+</main>
+
+<script src="{{ url_for('static', filename='charts.js') }}"></script>
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

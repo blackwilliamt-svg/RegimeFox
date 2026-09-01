@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}Sign in — Solana TA Bot{% endblock %}
+{% block main_class %}wrap-narrow{% endblock %}
+{% block live %}off{% endblock %}
+
+{% block content %}
+<div class="panel">
+  <h1 style="font-size:18px;margin:0 0 4px">◈ Solana TA Bot</h1>
+  <p class="hint" style="margin:0 0 18px">Sign in to the trading dashboard.</p>
+
+  <form method="post">
+    <div class="field">
+      <label for="username">Username</label>
+      <input type="text" id="username" name="username" autocomplete="username" required autofocus>
+    </div>
+    <div class="field">
+      <label for="password">Password</label>
+      <input type="password" id="password" name="password" autocomplete="current-password" required>
+    </div>
+    <div class="field">
+      <label for="token">Authenticator code</label>
+      <input type="text" id="token" name="token" inputmode="numeric" autocomplete="one-time-code"
+             pattern="[0-9A-Fa-f ]*" required placeholder="6-digit code, or a backup code">
+      <p class="hint">From Google Authenticator or Authy. A one-time backup code also works.</p>
+    </div>
+    <button class="btn-primary" style="width:100%">Sign in</button>
+  </form>
+</div>
+{% endblock %}

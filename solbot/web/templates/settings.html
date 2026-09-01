@@ -1,0 +1,164 @@
+{% extends "base.html" %}
+{% block title %}Settings — Solana TA Bot{% endblock %}
+{% block live %}off{% endblock %}
+
+{% block content %}
+
+<div class="banner banner-info">
+  <div>
+    Changes are validated against sane bounds before they are applied, logged with a
+    timestamp, and picked up by the worker on its next cycle — no SSH, no restart.
+    Trading mode is deliberately not editable here; see the README for the live
+    switchover checklist.
+  </div>
+</div>
+
+<div class="panel" style="margin-bottom:16px">
+  <h2>API keys</h2>
+  <p class="hint" style="margin-top:0">
+    The environment is the default source. A key rotated here is encrypted at rest and
+    takes precedence. Keys are shown masked and must be re-entered in full to change —
+    the full value is never rendered back.
+  </p>
+  {% for key in keys %}
+  <form class="key-form" data-provider="{{ key.provider }}" style="margin-bottom:14px">
+    <label>{{ key.provider|capitalize }}
+      <span class="tag">{{ key.source }}</span>
+      {% if key.updated_by %}<span class="dim">rotated by {{ key.updated_by }}</span>{% endif %}
+    </label>
+    <div class="btn-row">
+      <span class="mono key-masked" style="min-width:120px">{{ key.masked or 'not set' }}</span>
+      <input type="password" name="key" placeholder="Paste a new {{ key.provider }} key"
+             autocomplete="off" style="flex:1;min-width:220px">
+      <button type="submit">Rotate &amp; validate</button>
+    </div>
+    <p class="key-status hint"></p>
+  </form>
+  {% endfor %}
+</div>
+
+<form method="post" action="{{ url_for('dashboard.save_settings') }}">
+  <input type="hidden" name="_form_rendered" value="1">
+
+  {% set groups = [
+    ('Trading &amp; sizing', ['max_concurrent_positions','max_position_pct_of_wallet',
+      'max_position_pct_of_liquidity','gas_reserve_sol','min_position_usd',
+      'paper_starting_balance']),
+    ('Signal timeframe &amp; scan cadence', ['candle_minutes','broad_scan_seconds',
+      'hot_scan_seconds','hot_list_max','min_candles_required']),
+    ('Entry rules', ['volume_spike_multiple','volume_spike_lookback','momentum_candles',
+      'momentum_min_pct','rsi_period','rsi_max_entry','ema_fast','ema_slow','atr_period']),
+    ('Exit rules &amp; reward:risk', ['rr_min','rr_max','trailing_activate_r',
+      'trailing_distance_atr','signal_invalidation_bars','max_hold_minutes']),
+    ('Risk &amp; circuit breaker', ['circuit_consecutive_losses','circuit_daily_drawdown_pct',
+      'correlation_lookback','correlation_max','volatility_size_floor',
+      'volatility_target_atr_pct']),
+    ('Universe filters', ['min_liquidity_usd','min_volume_24h_usd','universe_max_tokens',
+      'universe_refresh_seconds']),
+    ('Execution &amp; slippage', ['max_slippage_pct','taker_fee_pct','priority_fee_lamports',
+      'congestion_max_priority_fee_lamports']),
+    ('Rug Check thresholds', ['rugcheck_min_lp_locked_pct','rugcheck_max_top_holder_pct',
+      'rugcheck_max_insider_pct','rugcheck_min_token_age_hours','rugcheck_min_liquidity_usd',
+      'rugcheck_pass_ttl_seconds','rugcheck_fail_cooldown_seconds']),
+    ('API rate limits', ['jupiter_rps','jupiter_burst','jupiter_price_batch_size',
+      'birdeye_rps','birdeye_monthly_cu_budget','rugcheck_rps']),
+    ('Data retention &amp; backtest', ['candle_retention_days','price_tick_retention_hours',
+      'event_retention_days','backtest_daily_hour_utc','backtest_lookback_days']),
+    ('Dashboard', ['session_timeout_minutes','login_rate_limit_attempts',
+      'login_rate_limit_window_seconds']),
+  ] %}
+
+  {% set bounds = {} %}
+  {% for row in spec %}{% if bounds.update({row.key: row}) %}{% endif %}{% endfor %}
+
+  {% for title, keys_in_group in groups %}
+  <div class="panel" style="margin-bottom:16px">
+    <h2>{{ title|safe }}</h2>
+    <div class="settings-grid">
+      {% for key in keys_in_group %}
+        {% set b = bounds.get(key) %}
+        {% if b %}
+        <div class="field">
+          <label for="f_{{ key }}">{{ key.replace('_', ' ') }}</label>
+          <input type="number" id="f_{{ key }}" name="{{ key }}"
+                 value="{{ values[key] }}"
+                 step="{{ 'any' if b.type == 'float' else '1' }}"
+                 {% if b.min is not none %}min="{{ b.min }}"{% endif %}
+                 {% if b.max is not none %}max="{{ b.max }}"{% endif %}>
+          <p class="hint">
+            {% if b.min is not none and b.max is not none %}
+              allowed {{ b.min }} – {{ b.max }}
+            {% endif %}
+          </p>
+        </div>
+        {% endif %}
+      {% endfor %}
+    </div>
+  </div>
+  {% endfor %}
+
+  <div class="panel" style="margin-bottom:16px">
+    <h2>Toggles</h2>
+    <div class="settings-grid">
+      {% for row in spec if row.kind == 'bool' %}
+      <label style="display:flex;gap:8px;align-items:center;color:var(--text)">
+        <input type="checkbox" name="{{ row.key }}" style="width:auto"
+               {{ 'checked' if values[row.key] }}>
+        {{ row.key.replace('_', ' ') }}
+      </label>
+      {% endfor %}
+    </div>
+  </div>
+
+  <div class="btn-row" style="margin-bottom:24px">
+    <button class="btn-primary">Save settings</button>
+    <span class="hint">Rejected if any value falls outside its bounds or breaks a
+      cross-field rule (e.g. reward:risk min above max).</span>
+  </div>
+</form>
+
+<div class="panel" style="margin-bottom:16px">
+  <h2>Shadow mode</h2>
+  <p class="hint" style="margin-top:0">
+    Run a candidate rule set in paper alongside the live bot before promoting it.
+    Leave a field blank to inherit the live value. Set every field blank to disable.
+  </p>
+  <form method="post" action="{{ url_for('dashboard.save_shadow') }}">
+    <div class="settings-grid">
+      {% for key in ['volume_spike_multiple','momentum_min_pct','rr_min','rr_max',
+                     'trailing_activate_r','trailing_distance_atr',
+                     'signal_invalidation_bars','max_position_pct_of_wallet'] %}
+      <div class="field">
+        <label for="s_{{ key }}">{{ key.replace('_', ' ') }}</label>
+        <input type="number" step="any" id="s_{{ key }}" name="shadow_{{ key }}"
+               placeholder="live: {{ values[key] }}">
+      </div>
+      {% endfor %}
+    </div>
+    <button>Update shadow instance</button>
+  </form>
+</div>
+
+<div class="panel">
+  <h2>Settings change log</h2>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>When (UTC)</th><th>Who</th><th>Setting</th><th>From</th><th>To</th></tr></thead>
+      <tbody>
+        {% for row in audit %}
+        <tr>
+          <td class="mono nowrap">{{ row.ts | ts }}</td>
+          <td>{{ row.username or '—' }}</td>
+          <td class="mono">{{ row.key }}</td>
+          <td class="mono dim">{{ row.old_value }}</td>
+          <td class="mono">{{ row.new_value }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5" class="empty">No settings changes recorded yet</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% endblock %}

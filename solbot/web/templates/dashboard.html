@@ -1,0 +1,128 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — Solana TA Bot{% endblock %}
+
+{% block content %}
+
+{% if not worker_alive %}
+<div class="banner banner-alert">
+  <strong>Worker not responding.</strong>
+  No heartbeat for {{ worker_age }}s. Trading is not running — check
+  <code>systemctl status solbot-worker</code>.
+</div>
+{% endif %}
+
+{% if kill_switch.engaged %}
+<div class="banner banner-alert">
+  <strong>KILL SWITCH ENGAGED.</strong>
+  {{ kill_switch.reason or 'Manual trigger' }} — no new entries are being taken.
+  Open positions remain and can be closed manually below. This does not auto-resume.
+  <form method="post" action="{{ url_for('dashboard.control', action='release_kill_switch') }}">
+    <button class="btn-sm">Release kill switch</button>
+  </form>
+</div>
+{% endif %}
+
+{% if circuit.tripped %}
+<div class="banner banner-alert">
+  <strong>CIRCUIT BREAKER TRIPPED.</strong>
+  {{ circuit.reason or 'Threshold exceeded' }} — new trades are paused and will not
+  resume automatically.
+  <form method="post" action="{{ url_for('dashboard.control', action='reset_circuit') }}"
+        onsubmit="return confirm('Reset the circuit breaker and allow new trades?')">
+    <button class="btn-sm">Reset after review</button>
+  </form>
+</div>
+{% endif %}
+
+{% if reconcile_halt %}
+<div class="banner banner-alert">
+  <strong>TRADING HALTED — reconciliation failed.</strong>
+  The database and the on-chain wallet disagree. Review the event feed before clearing.
+  <form method="post" action="{{ url_for('dashboard.control', action='clear_reconcile_halt') }}"
+        onsubmit="return confirm('Clear the reconciliation halt? Only do this after verifying the wallet against the trade journal.')">
+    <button class="btn-sm">Clear after review</button>
+  </form>
+</div>
+{% endif %}
+
+<div class="panel" style="margin-bottom:16px">
+  <div class="panel-head">
+    <h2>Controls</h2>
+    <span id="workerStatus" class="dim"></span>
+  </div>
+  <div class="btn-row">
+    <form method="post" action="{{ url_for('dashboard.control', action='start') }}">
+      <button class="btn-primary" {{ 'disabled' if running }}>Start bot</button>
+    </form>
+    <form method="post" action="{{ url_for('dashboard.control', action='stop') }}">
+      <button {{ 'disabled' if not running }}>Stop bot</button>
+    </form>
+    <form method="post" action="{{ url_for('dashboard.control', action='refresh_universe') }}">
+      <button class="btn-ghost">Refresh universe</button>
+    </form>
+
+    <span style="flex:1"></span>
+
+    {% if not kill_switch.engaged %}
+    <form method="post" action="{{ url_for('dashboard.control', action='kill_switch') }}" class="kill-form">
+      <input type="hidden" name="confirm" value="yes">
+      <input type="hidden" name="reason" value="manual dashboard trigger">
+      <button class="btn-danger">■ KILL SWITCH</button>
+    </form>
+    {% endif %}
+  </div>
+  <p class="hint" id="scanBudget"></p>
+</div>
+
+<div class="grid grid-4" style="margin-bottom:16px">
+  <div class="stat"><div class="label">Balance</div><div class="value" id="statBalance">—</div>
+    <div class="sub">cash, undeployed</div></div>
+  <div class="stat"><div class="label">Deployed</div><div class="value" id="statDeployed">—</div>
+    <div class="sub"><span id="statOpen">0</span> open position(s)</div></div>
+  <div class="stat"><div class="label">Realised P&amp;L</div><div class="value" id="statPnl">—</div>
+    <div class="sub"><span id="statTrades">0</span> closed trades</div></div>
+  <div class="stat"><div class="label">Win rate</div><div class="value" id="statWinRate">—</div>
+    <div class="sub">profit factor <span id="statPf">—</span></div></div>
+</div>
+
+<div class="grid grid-4" style="margin-bottom:16px">
+  <div class="stat"><div class="label">Average win</div><div class="value pos" id="statAvgWin">—</div></div>
+  <div class="stat"><div class="label">Average loss</div><div class="value neg" id="statAvgLoss">—</div></div>
+  <div class="stat"><div class="label">Total fees</div><div class="value" id="statFees">—</div></div>
+  <div class="stat"><div class="label">Max drawdown</div><div class="value warn" id="statDrawdown">—</div></div>
+</div>
+
+<div class="panel" style="margin-bottom:16px">
+  <h2>Open positions</h2>
+  <div class="table-scroll">
+    <table>
+      <thead>
+        <tr>
+          <th>Instance</th><th>Token</th><th class="num">Entry</th><th class="num">Now</th>
+          <th class="num">Size</th><th class="num">Unrealised</th>
+          <th class="num">Hard stop</th><th class="num">Trailing</th><th></th>
+        </tr>
+      </thead>
+      <tbody id="positionsBody">
+        <tr><td colspan="9" class="empty">Loading…</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="position-charts" id="positionCharts" style="margin-bottom:16px"></div>
+
+<div class="grid grid-2">
+  <div class="panel">
+    <h2>Equity curve — 30 days</h2>
+    <div class="chart-box"><canvas id="equityChart"></canvas></div>
+    <div class="chart-legend" id="equityLegend"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Live activity</h2>
+    <div class="feed" id="eventFeed"><div class="empty">Loading…</div></div>
+  </div>
+</div>
+
+{% endblock %}

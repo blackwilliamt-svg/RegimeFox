@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}First-run setup — Solana TA Bot{% endblock %}
+{% block main_class %}wrap-narrow{% endblock %}
+{% block live %}off{% endblock %}
+
+{% block content %}
+<div class="panel">
+  <h1 style="font-size:18px;margin:0 0 4px">◈ First-run setup</h1>
+  <p class="hint" style="margin:0 0 18px">
+    Create the dashboard account. This is the only unauthenticated page, and it
+    stops working once an account exists.
+  </p>
+
+  <form method="post">
+    <div class="field">
+      <label for="username">Username</label>
+      <input type="text" id="username" name="username" autocomplete="username" required autofocus>
+    </div>
+    <div class="field">
+      <label for="password">Password</label>
+      <input type="password" id="password" name="password" autocomplete="new-password"
+             minlength="12" required>
+      <p class="hint">At least 12 characters. Stored hashed with argon2id, never in plaintext.</p>
+    </div>
+    <div class="field">
+      <label for="confirm">Confirm password</label>
+      <input type="password" id="confirm" name="confirm" autocomplete="new-password"
+             minlength="12" required>
+    </div>
+    <button class="btn-primary" style="width:100%">Create account</button>
+  </form>
+</div>
+{% endblock %}

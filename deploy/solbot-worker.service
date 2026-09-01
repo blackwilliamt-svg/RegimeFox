@@ -1,0 +1,53 @@
+[Unit]
+Description=Solana TA Bot - trading worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=solbot
+Group=solbot
+WorkingDirectory=/opt/solana-ta-bot
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/opt/solana-ta-bot/.env
+ExecStart=/opt/solana-ta-bot/.venv/bin/python run_worker.py
+
+# Restart on failure, as the spec requires. This is safe because the kill
+# switch, the circuit breaker and the reconciliation halt are all persisted in
+# SQLite - a restart re-reads them and re-announces them, so a crash-restart can
+# never be used, even accidentally, to resume trading after a halt.
+Restart=on-failure
+RestartSec=10
+
+# Do not restart-loop forever on a configuration error.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# The worker holds an exclusive lock (data/worker.lock); a second instance
+# refuses to start rather than double every position.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Hardening. The bot needs outbound HTTPS and its own directory, nothing else.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/solana-ta-bot/data /opt/solana-ta-bot/config.json
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+# 2GB droplet shared with other services: keep this one bounded.
+MemoryMax=700M
+CPUWeight=80
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=solbot-worker
+
+[Install]
+WantedBy=multi-user.target
