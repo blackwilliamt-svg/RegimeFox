@@ -468,6 +468,26 @@ def wfmc_storage():
     )
 
 
+@bp.get("/sensitivity")
+def sensitivity():
+    """Parameter sensitivity (explainability): which values of each tunable
+    axis the persistent library's kept combinations correlate with better
+    walk-forward performance - see solopt.sensitivity's docstring for what
+    this is (and is not) computed from.
+    """
+    from ..wfmc import DAILY_STORE_PATH
+    from solopt.sensitivity import compute_sensitivity
+    from solopt.store import RunStore
+
+    try:
+        store = RunStore(DAILY_STORE_PATH)
+        entries = store.top_library_entries(10_000, symbol=None)
+    except Exception:
+        entries = []
+
+    return jsonify(compute_sensitivity(entries))
+
+
 @bp.get("/review")
 def review_status():
     """Recent entry-gate activity and the current market read.

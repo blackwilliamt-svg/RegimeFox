@@ -791,6 +791,48 @@
     });
   }
 
+  /* ---------- parameter sensitivity ---------- */
+  var sensitivityData = {};
+
+  function loadSensitivity() {
+    var body = el("sensitivityRows");
+    if (!body) return Promise.resolve();
+    return get("/api/sensitivity").then(function (d) {
+      sensitivityData = d.axes || {};
+      setText("sensitivitySource", (d.entries_used || 0) + " kept combination" +
+        (d.entries_used === 1 ? "" : "s") + " in the library");
+
+      var ranked = d.ranked || [];
+      if (!ranked.length) {
+        body.innerHTML = "<tr><td colspan='4' class='empty'>Not enough library history yet</td></tr>";
+        clear("sensitivityDetail");
+        return;
+      }
+      body.innerHTML = ranked.map(function (axis) {
+        var a = sensitivityData[axis];
+        return "<tr class='sensitivity-row' data-axis='" + esc(axis) + "' style='cursor:pointer'>" +
+          "<td class='mono'>" + esc(axis) + "</td>" +
+          "<td class='mono'>" + esc(String(a.best_value)) + "</td>" +
+          "<td class='num'>" + a.score_range.toFixed(4) + "</td>" +
+          "<td class='num'>" + a.buckets.length + "</td></tr>";
+      }).join("");
+    });
+  }
+
+  document.addEventListener("click", function (ev) {
+    var row = ev.target.closest && ev.target.closest("#sensitivityRows tr[data-axis]");
+    if (!row) return;
+    var axis = row.getAttribute("data-axis");
+    var a = sensitivityData[axis];
+    var box = el("sensitivityDetail");
+    if (!a || !box) return;
+    var buckets = a.buckets.slice().sort(function (x, y) { return y.mean_score - x.mean_score; });
+    box.innerHTML = "<strong>" + esc(axis) + "</strong> by mean library score: " +
+      buckets.map(function (b) {
+        return esc(String(b.value)) + " (" + b.mean_score.toFixed(3) + ", n=" + b.count + ")";
+      }).join(" · ");
+  });
+
   /* ---------- WF/MC storage browser (spec 6c) ---------- */
   function loadWfmcStorage() {
     if (!el("wfmcStorageRows")) return Promise.resolve();
@@ -932,6 +974,7 @@
     loadDrift().catch(noop);
     loadParamSync().catch(noop);
     loadWfmcStorage().catch(noop);
+    loadSensitivity().catch(noop);
   }
 
   if (document.body.dataset.live !== "off") {

@@ -161,6 +161,33 @@
   </div>
 </div>
 
+<div class="panel" style="margin-bottom:16px">
+  <div class="panel-head">
+    <h2>Parameter sensitivity</h2>
+    <span class="hint" id="sensitivitySource">—</span>
+  </div>
+  <p class="hint" style="margin-top:0">
+    Every combination that has ever cleared the walk-forward gates (the persistent library,
+    not one run's own search), grouped by each parameter's own value and ranked by how much
+    that value swung the outcome - the widest swings first, so it reads as "these are the
+    settings actually worth tuning" rather than an alphabetical parameter list.
+  </p>
+  <div class="table-scroll">
+    <table>
+      <thead>
+        <tr>
+          <th>Parameter</th><th>Best value</th><th class="num">Score range</th>
+          <th class="num">Distinct values tried</th>
+        </tr>
+      </thead>
+      <tbody id="sensitivityRows">
+        <tr><td colspan="4" class="empty">Not enough library history yet</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div id="sensitivityDetail" class="hint" style="margin-top:10px"></div>
+</div>
+
 <div class="grid grid-2" style="margin-bottom:16px">
   <div class="panel">
     <h2>Crash replay</h2>
