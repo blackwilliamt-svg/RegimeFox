@@ -162,6 +162,13 @@ DEFAULTS: dict[str, Any] = {
     "priority_fee_lamports": 200000,
     "congestion_max_priority_fee_lamports": 2000000,
     "congestion_check_enabled": True,
+    # MEV protection: submit the signed swap through a Jito bundle (private
+    # relay, not the public mempool) rather than a plain sendTransaction, so a
+    # sandwich bot never sees it before it lands. Falls back to the existing
+    # Jupiter-managed /execute path if Jito is unreachable or times out -
+    # never blocks a trade outright on it.
+    "mev_protection_enabled": True,
+    "jito_tip_lamports": 100000,          # 0.0001 SOL; Jito's own floor is 1,000
 
     # --- rug check --------------------------------------------------------
     "rugcheck_enabled": True,
@@ -335,6 +342,7 @@ SPEC: dict[str, Bound] = {
     "taker_fee_pct": (float, 0.0, 2.0),
     "priority_fee_lamports": (int, 0, 10000000),
     "congestion_max_priority_fee_lamports": (int, 1000, 100000000),
+    "jito_tip_lamports": (int, 1000, 10000000),
     "rugcheck_min_lp_locked_pct": (float, 0.0, 100.0),
     "rugcheck_lp_lock_waiver_markets": (int, 0, 10000),
     "rugcheck_max_top_holder_pct": (float, 1.0, 100.0),
@@ -366,6 +374,7 @@ ENUMS: dict[str, set[str]] = {
 
 BOOLS = {
     "congestion_check_enabled",
+    "mev_protection_enabled",
     "rugcheck_enabled",
     "rugcheck_require_mint_revoked",
     "rugcheck_require_freeze_revoked",

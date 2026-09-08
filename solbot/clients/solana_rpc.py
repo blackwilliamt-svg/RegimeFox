@@ -145,6 +145,18 @@ class SolanaRpcClient(HttpClient):
             return floor
         return int(max(floor, min(ceiling, c.p75_priority_fee * 1.15)))
 
+    def get_latest_blockhash(self) -> str:
+        """The recent blockhash a locally-built transaction needs to be
+        signable - used for the Jito tip transaction, which Jupiter's /order
+        never returns because we build and sign it ourselves."""
+        result = self._call(
+            "getLatestBlockhash", [{"commitment": "confirmed"}], priority="high"
+        )
+        blockhash = (result or {}).get("value", {}).get("blockhash") if isinstance(result, dict) else None
+        if not blockhash:
+            raise ApiError("rpc getLatestBlockhash: malformed response", provider=self.provider)
+        return str(blockhash)
+
     # ------------------------------------------------------------------
     def confirm(self, signature: str, *, timeout: float = 90.0, poll: float = 2.0) -> dict[str, Any]:
         """Poll until the signature confirms, fails, or the timeout elapses."""

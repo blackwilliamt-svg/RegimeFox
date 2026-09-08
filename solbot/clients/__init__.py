@@ -8,6 +8,7 @@ from ..config import Config
 from ..ratelimit import TokenBucket
 from .base import ApiError, HttpClient, RateLimited
 from .binance import BinanceAsset, BinanceClient, Candle
+from .jito import JitoClient
 from .jupiter import JupiterClient, PriceInfo, Quote, TokenInfo, SOL_MINT, USDC_MINT
 from .rugcheck import RugCheckClient, RugReport
 from .solana_rpc import Congestion, SolanaRpcClient
@@ -19,6 +20,7 @@ __all__ = [
     "BinanceAsset",
     "BinanceClient",
     "Candle",
+    "JitoClient",
     "JupiterClient",
     "PriceInfo",
     "Quote",
@@ -42,10 +44,12 @@ class Clients:
     rugcheck: RugCheckClient
     rpc: SolanaRpcClient
     binance: BinanceClient
+    jito: JitoClient
     jupiter_bucket: TokenBucket
     rugcheck_bucket: TokenBucket
     rpc_bucket: TokenBucket
     binance_bucket: TokenBucket
+    jito_bucket: TokenBucket
 
     def apply_config(self, cfg: Config) -> None:
         """Re-apply rate limits after a live settings change."""
@@ -69,10 +73,11 @@ class Clients:
             "rugcheck": self.rugcheck_bucket.stats(),
             "rpc": self.rpc_bucket.stats(),
             "binance": self.binance_bucket.stats(),
+            "jito": self.jito_bucket.stats(),
         }
 
     def close(self) -> None:
-        for c in (self.jupiter, self.rugcheck, self.rpc, self.binance):
+        for c in (self.jupiter, self.rugcheck, self.rpc, self.binance, self.jito):
             c.close()
 
 
@@ -89,14 +94,21 @@ def build_clients(cfg: Config) -> Clients:
     # volume: a top-coin ranking pull once per universe refresh, and a klines
     # pull once per coin per day for the incremental candle backfill.
     binance_bucket = TokenBucket(cfg["binance_rps"], 3, reserve=0.0, name="binance")
+    # Only ever called on the live-trading path, at most once per swap, so a
+    # generous burst with no sustained-rate concern is fine. A short timeout
+    # keeps a slow/unreachable block engine from stalling a trade for long
+    # before LiveExecutor falls back to plain submission.
+    jito_bucket = TokenBucket(5.0, 5, reserve=0.0, name="jito")
 
     return Clients(
         jupiter=JupiterClient(jupiter_bucket, secrets.jupiter_api_key),
         rugcheck=RugCheckClient(rugcheck_bucket, secrets.rugcheck_api_key),
         rpc=SolanaRpcClient(rpc_bucket, secrets.solana_rpc_url),
         binance=BinanceClient(binance_bucket),
+        jito=JitoClient(jito_bucket, timeout=8.0, max_retries=1),
         jupiter_bucket=jupiter_bucket,
         rugcheck_bucket=rugcheck_bucket,
         rpc_bucket=rpc_bucket,
         binance_bucket=binance_bucket,
+        jito_bucket=jito_bucket,
     )

@@ -213,7 +213,8 @@ class LiveExecutor(Executor):
             raise SkipTrade(f"network congestion: {c.reason}")
 
     def _swap(self, input_mint: str, output_mint: str, amount_raw: int) -> dict[str, Any]:
-        """Quote with a taker, sign, submit, confirm."""
+        """Quote with a taker, sign, submit (Jito bundle first, plain Jupiter
+        execute as fallback), confirm."""
         self._check_congestion()
 
         slippage_bps = int(float(self.cfg["max_slippage_pct"]) * 100)
@@ -241,21 +242,108 @@ class LiveExecutor(Executor):
             raise SkipTrade("Jupiter returned no signable transaction for this order")
 
         signed = self._sign(quote.transaction)
-        result = self.clients.jupiter.execute(signed, quote.request_id)
+        route, mev_fallback_reason, signature = self._submit(signed, quote.request_id)
 
+        if signature:
+            confirmation = self.clients.rpc.confirm(signature)
+            if confirmation["status"] == "failed":
+                raise ApiError(f"swap reverted on-chain: {confirmation.get('error')}")
+        else:
+            confirmation = None
+
+        return {
+            "quote": quote,
+            "signature": signature,
+            "slippage": implied,
+            "route": route,
+            "mev_fallback_reason": mev_fallback_reason,
+            "confirmation": confirmation,
+        }
+
+    def _submit(
+        self, signed_transaction_b64: str, request_id: str
+    ) -> tuple[str, str | None, str | None]:
+        """Send the signed swap. Jito bundle first when MEV protection is on;
+        the existing Jupiter-managed /execute path always as a fallback, so
+        Jito being unreachable, slow, or disabled never blocks a trade.
+
+        Returns (route, fallback_reason, signature). `route` is "jito" or
+        "jupiter_managed"; `fallback_reason` is set only when Jito was tried
+        and failed.
+        """
+        if self.cfg.get("mev_protection_enabled", True):
+            try:
+                signature = self._submit_via_jito(signed_transaction_b64)
+                return "jito", None, signature
+            except (ApiError, RuntimeError) as exc:
+                reason = str(exc)
+                log.warning(
+                    "jito bundle submission failed, falling back to plain "
+                    "Jupiter execute: %s", reason,
+                )
+        else:
+            reason = None
+
+        result = self.clients.jupiter.execute(signed_transaction_b64, request_id)
         signature = result.get("signature") or result.get("txSignature")
         status = str(result.get("status", "")).lower()
         if status in {"failed", "error"} or result.get("error"):
             raise ApiError(
                 f"swap failed: {result.get('error') or result.get('code') or status}"
             )
-        if signature:
-            confirmation = self.clients.rpc.confirm(signature)
-            if confirmation["status"] == "failed":
-                raise ApiError(f"swap reverted on-chain: {confirmation.get('error')}")
-            result["confirmation"] = confirmation
+        return "jupiter_managed", reason, signature
 
-        return {"quote": quote, "result": result, "signature": signature, "slippage": implied}
+    def _submit_via_jito(self, signed_transaction_b64: str) -> str:
+        """Bundle the signed swap with a tip transaction and send it to the
+        Jito Block Engine. Raises ApiError/RuntimeError on any failure - the
+        caller falls back to plain submission rather than propagating this."""
+        from solders.transaction import VersionedTransaction  # noqa: PLC0415
+
+        tip_accounts = self.clients.jito.tip_accounts()
+        if not tip_accounts:
+            raise ApiError("jito: no tip accounts available", provider="jito")
+
+        blockhash = self.clients.rpc.get_latest_blockhash()
+        tip_lamports = int(self.cfg["jito_tip_lamports"])
+        tip_tx = self._build_tip_transaction(tip_accounts[0], tip_lamports, blockhash)
+
+        bundle_id = self.clients.jito.send_bundle([signed_transaction_b64, tip_tx])
+        if not bundle_id:
+            raise ApiError("jito: sendBundle returned no bundle id", provider="jito")
+
+        # The bundle id is not a transaction signature - recover the swap's own
+        # signature from the transaction we already signed, so the caller can
+        # confirm it exactly as it would for the plain-submission path.
+        raw = base64.b64decode(signed_transaction_b64)
+        tx = VersionedTransaction.from_bytes(raw)
+        if not tx.signatures:
+            raise RuntimeError("jito: signed transaction carries no signature")
+        return str(tx.signatures[0])
+
+    def _build_tip_transaction(
+        self, tip_account: str, lamports: int, recent_blockhash: str
+    ) -> str:
+        """A minimal SystemProgram transfer to a Jito tip account, signed by
+        this wallet, base64-encoded for the bundle. Built and signed locally -
+        Jupiter's /order never returns this, it only ever quotes the swap."""
+        from solders.hash import Hash  # noqa: PLC0415
+        from solders.message import MessageV0  # noqa: PLC0415
+        from solders.pubkey import Pubkey  # noqa: PLC0415
+        from solders.system_program import TransferParams, transfer  # noqa: PLC0415
+        from solders.transaction import VersionedTransaction  # noqa: PLC0415
+
+        ix = transfer(
+            TransferParams(
+                from_pubkey=self._keypair.pubkey(),
+                to_pubkey=Pubkey.from_string(tip_account),
+                lamports=max(1000, int(lamports)),
+            )
+        )
+        message = MessageV0.try_compile(
+            self._keypair.pubkey(), [ix], [], Hash.from_string(recent_blockhash)
+        )
+        tx = VersionedTransaction(message, [self._keypair])
+        return base64.b64encode(bytes(tx)).decode("ascii")
 
     def _sign(self, transaction_b64: str) -> str:
         from solders.transaction import VersionedTransaction  # noqa: PLC0415
@@ -285,7 +373,10 @@ class LiveExecutor(Executor):
             fee_usd=max(0.0, quote.in_usd - quote.out_usd),
             slippage_pct=out["slippage"],
             tx_signature=out["signature"],
-            detail={"router": quote.router, "swap_type": quote.swap_type},
+            detail={
+                "router": quote.router, "swap_type": quote.swap_type,
+                "send_route": out["route"], "mev_fallback_reason": out["mev_fallback_reason"],
+            },
         )
 
     def sell(self, mint: str, qty: float, price: float, **kw: Any) -> Fill:
@@ -307,7 +398,10 @@ class LiveExecutor(Executor):
             fee_usd=max(0.0, quote.in_usd - quote.out_usd),
             slippage_pct=out["slippage"],
             tx_signature=out["signature"],
-            detail={"router": quote.router, "swap_type": quote.swap_type},
+            detail={
+                "router": quote.router, "swap_type": quote.swap_type,
+                "send_route": out["route"], "mev_fallback_reason": out["mev_fallback_reason"],
+            },
         )
 
     # ------------------------------------------------------------------

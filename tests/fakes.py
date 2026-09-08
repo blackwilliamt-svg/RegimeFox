@@ -128,6 +128,7 @@ class FakeRpc:
         self.sol = sol
         self.tokens = dict(tokens or {})
         self.healthy = healthy
+        self.blockhash = "11111111111111111111111111111111"  # solders Hash.default()
 
     def get_sol_balance(self, pubkey: str) -> float:
         return self.sol
@@ -144,10 +145,41 @@ class FakeRpc:
     def suggested_priority_fee(self, floor: int, ceiling: int) -> int:
         return floor
 
+    def get_latest_blockhash(self) -> str:
+        return self.blockhash
+
     def confirm(self, signature: str, **kw: Any) -> dict[str, Any]:
         return {"status": "confirmed", "signature": signature}
 
     def close(self) -> None:
+        pass
+
+
+class FakeJito:
+    """Stands in for the Jito Block Engine. `fail_with` lets a test force the
+    fallback-to-plain-RPC path without touching the network."""
+
+    def __init__(self, fail_with: Exception | None = None) -> None:
+        self.fail_with = fail_with
+        self.bundles_sent: list[list[str]] = []
+        self.calls = 0
+
+    def tip_accounts(self) -> list[str]:
+        from solbot.clients.jito import STATIC_TIP_ACCOUNTS
+
+        return list(STATIC_TIP_ACCOUNTS)
+
+    def send_bundle(self, signed_transactions_b64: list[str]) -> str:
+        self.calls += 1
+        if self.fail_with is not None:
+            raise self.fail_with
+        self.bundles_sent.append(list(signed_transactions_b64))
+        return "fake-bundle-id-" + str(self.calls)
+
+    def close(self) -> None:
+        pass
+
+    def set_api_key(self, key: str) -> None:
         pass
 
 
@@ -159,6 +191,7 @@ def fake_clients(
     clean_safety: bool = True,
     sol: float = 1.0,
     wallet_tokens: dict[str, float] | None = None,
+    jito_fail_with: Exception | None = None,
 ) -> Clients:
     bucket = lambda name: TokenBucket(1000.0, 100, reserve=0.0, name=name)
     return Clients(
@@ -166,10 +199,12 @@ def fake_clients(
         rugcheck=FakeRugCheck(clean_safety),
         rpc=FakeRpc(sol, wallet_tokens),
         binance=FakeBinance(binance_assets),
+        jito=FakeJito(jito_fail_with),
         jupiter_bucket=bucket("jupiter"),
         rugcheck_bucket=bucket("rugcheck"),
         rpc_bucket=bucket("rpc"),
         binance_bucket=bucket("binance"),
+        jito_bucket=bucket("jito"),
     )
 
 
