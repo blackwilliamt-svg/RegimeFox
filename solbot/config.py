@@ -35,8 +35,13 @@ DEFAULTS: dict[str, Any] = {
     "paper_starting_balance": 1000.0,
 
     # --- position sizing --------------------------------------------------
-    "max_concurrent_positions": 2,
+    # No hardcoded ceiling on how many positions may be open at once - the bot
+    # decides that itself, as an output of the same sizing logic, from
+    # walk-forward/Monte Carlo evidence. The only hard constraints are the
+    # per-position cap, the total-deployed cap, and always retaining enough
+    # balance to cover transaction fees (the gas reserve, below).
     "max_position_pct_of_wallet": 0.45,       # 45% of wallet per position
+    "max_total_deployed_pct": 0.90,           # 90% of wallet deployed at once, at most
     "max_position_pct_of_liquidity": 0.01,    # 1% of the pool's depth
     "gas_reserve_sol": 0.05,                  # never deployed, always pays fees
     "min_position_usd": 10.0,
@@ -56,9 +61,15 @@ DEFAULTS: dict[str, Any] = {
     "circuit_daily_drawdown_pct": 0.09,   # spec suggested 8-10%
 
     # --- universe filtering -----------------------------------------------
+    # The universe is Binance's top `binance_top_n` coins by 24h quote volume
+    # (spec 2) - established, large-cap coins, not a pure Jupiter-liquidity
+    # floor over the whole token list. That Binance shortlist is then
+    # intersected with what Jupiter can actually route a swap for on Solana,
+    # and the floors below are a filter *on* that shortlist, same as before.
+    "binance_top_n": 100,
     "min_liquidity_usd": 50000.0,
     "min_volume_24h_usd": 75000.0,
-    "universe_max_tokens": 300,
+    "universe_max_tokens": 150,
     "universe_refresh_seconds": 900,
 
     # --- entry rules ------------------------------------------------------
@@ -80,6 +91,31 @@ DEFAULTS: dict[str, Any] = {
     "atr_period": 14,
     "min_candles_required": 40,
 
+    # Stop distance as a multiple of ATR. Was hardcoded at 1.2 inside the
+    # strategy; exposed here because the walk-forward optimizer tunes it, and a
+    # tuned value that cannot be applied is no use.
+    "stop_atr_mult": 1.2,
+
+    # --- regime detection (spec 4.1) --------------------------------------
+    # The efficiency ratio over `regime_lookback` bars separates a trend from a
+    # drift; the ATR threshold then splits the non-trending case into an orderly
+    # range and genuine chop.
+    "regime_lookback": 20,
+    "regime_trend_er": 0.35,
+    "regime_chop_atr_pct": 0.03,
+    # Bitmask of the regimes an entry may fire in: 1 trending | 2 ranging |
+    # 4 choppy. The default admits trending and ranging and excludes chop, which
+    # is where the overtrading in the earlier backtest came from.
+    "regime_allowed": 3,
+    "regime_gate_enabled": True,
+
+    # --- multi-timeframe confluence (spec 4.2) ----------------------------
+    # Aggregate timeframes as multiples of the base candle. At the 10-minute
+    # default, (3, 6) is the 30-minute and hourly view.
+    "confluence_timeframes": [3, 6],
+    "confluence_required": 1,             # how many must agree before an entry
+    "confluence_enabled": True,
+
     # --- exit rules -------------------------------------------------------
     "trailing_activate_r": 1.0,           # arm the trail after +1R
     "trailing_distance_atr": 1.5,
@@ -91,6 +127,34 @@ DEFAULTS: dict[str, Any] = {
     "correlation_max": 0.80,
     "volatility_size_floor": 0.35,        # never size below 35% of base
     "volatility_target_atr_pct": 0.03,
+
+    # --- correlation-aware portfolio sizing (spec 4.4) --------------------
+    # "flat" is the original per-position scaling. "portfolio" solves for the
+    # weight that holds *portfolio* volatility at the target given what is
+    # already open and how correlated the candidate is with it. Both stay inside
+    # the hard caps above; this only ever sizes down.
+    "sizing_mode": "portfolio",
+    # The budget for the book as a whole: two uncorrelated positions at the 45%
+    # cap and the 3% target ATR, i.e. sqrt(2) x 0.45 x 0.03. Anchoring it there
+    # leaves a single position governed by the flat volatility scalar (so
+    # switching modes changes nothing on its own) while still leaving room for a
+    # second one. Anchoring it to a *single* position instead would exhaust the
+    # budget on the first trade and silently halve the bot's concurrency.
+    "portfolio_vol_target": 0.019,
+    # The share of the account the operator will tolerate being underwater in the
+    # 5%-worst case. The Monte Carlo tail below is measured against it.
+    "drawdown_tolerance": 0.25,
+    # 5th-percentile drawdown from the last Monte Carlo run, written by the
+    # parameter hand-off. Zero means "not measured yet", which leaves sizing
+    # untouched rather than guessing.
+    "monte_carlo_p5_drawdown": 0.0,
+
+    # --- live vs backtest drift (spec 4.5) --------------------------------
+    "drift_window_days": 14,
+    "drift_min_trades": 20,
+    "drift_win_rate_tolerance": 0.15,     # absolute, e.g. 0.15 = 15 points
+    "drift_expectancy_tolerance": 0.40,   # relative to the backtest expectancy
+    "drift_check_seconds": 900,
 
     # --- execution --------------------------------------------------------
     "max_slippage_pct": 0.5,              # spec default 0.5%
@@ -122,19 +186,72 @@ DEFAULTS: dict[str, Any] = {
     "jupiter_rps": 1.0,
     "jupiter_burst": 3,
     "jupiter_price_batch_size": 50,       # API hard limit is 50 ids per call
-    "birdeye_rps": 1.0,
-    "birdeye_monthly_cu_budget": 30000,   # free Standard tier
+    # Binance's public endpoints are keyless and generously weight-limited for
+    # this bot's call volume (a ranking pull once per universe refresh, a
+    # klines pull once per coin per day).
+    "binance_rps": 5.0,
     "rugcheck_rps": 2.0,
 
+    # --- candle history (spec 3) -------------------------------------------
+    # Kept indefinitely - no retention window. Raw candle Parquet files are
+    # small (single-digit GB compressed for the whole universe over a year),
+    # unlike walk-forward/Monte Carlo output, which does need one (spec 6c/7).
+    "bulk_backfill_months": 12,
+
     # --- data retention ---------------------------------------------------
-    "candle_retention_days": 120,
     "price_tick_retention_hours": 48,
     "event_retention_days": 45,
+    # WF/MC output (window scores, parameter bundles, Monte Carlo
+    # distributions) is the fastest-growing storage component - unlike raw
+    # candles, which are kept indefinitely, this needs its own bound (spec 6c).
+    "wfmc_result_retention_days": 180,
 
     # --- backtest ---------------------------------------------------------
     "backtest_daily_enabled": True,
     "backtest_daily_hour_utc": 4,
     "backtest_lookback_days": 90,
+
+    # --- overtrading brake (spec 5) ---------------------------------------
+    # A prior backtest fired 244 trades in seven days and paid $449 in fees for
+    # them. These are the hard brakes; the regime gate and confluence check are
+    # the soft ones.
+    "max_trades_per_day": 8,
+    "min_seconds_between_entries": 900,
+    "min_seconds_between_entries_same_mint": 3600,
+
+    # --- entry review gate --------------------------------------------------
+    # A deterministic rules engine, not a model: see solbot/review.py's RUBRIC.
+    "entry_gate_enabled": True,
+    "entry_gate_min_strength": 0.0,       # weaker signals skip straight to the rules score
+    "daily_review_enabled": True,
+
+    # --- walk-forward / Monte Carlo optimizer (spec 5) ---------------------
+    # Daily incremental re-scoring runs on the droplet's own CPU, against a
+    # focused set of retained promising parameter combinations. Scheduled for
+    # a low-activity hour so it doesn't compete with the trading loop.
+    "wfmc_daily_enabled": True,
+    "wfmc_daily_hour_utc": 3,
+    # The monthly full parameter-space retest runs on a RunPod GPU worker,
+    # orchestrated by this droplet: data shipped up, job run, results reported
+    # back, worker torn down and the teardown verified.
+    "wfmc_monthly_enabled": False,        # off until RUNPOD_API_KEY is set
+    "wfmc_monthly_day_utc": 1,
+    "wfmc_monthly_hour_utc": 3,
+    "runpod_gpu_type": "NVIDIA RTX 4090",  # benchmark on RunPod before trusting this
+    "runpod_batch_size": 75,              # coins per parallel RunPod job
+    "runpod_callback_url": "",             # this droplet's own public URL
+    # Auto-promotion from shadow to live: no manual approval, but a long clean
+    # run and a decisive margin over whatever live is doing.
+    "auto_promote_enabled": True,
+    "promotion_check_interval_seconds": 3600,
+    "shadow_min_days": 15,
+    "shadow_min_trades": 30,
+    "shadow_min_margin": 0.25,
+    "shadow_min_confidence": 0.90,
+
+    # --- RunPod worker ingest endpoint --------------------------------------
+    "runpod_ingest_enabled": True,
+    "runpod_rate_limit_per_minute": 60,
 
     # --- dashboard --------------------------------------------------------
     "session_timeout_minutes": 60,
@@ -150,8 +267,8 @@ Bound = tuple[type, float | None, float | None]
 
 SPEC: dict[str, Bound] = {
     "paper_starting_balance": (float, 1.0, 10000000.0),
-    "max_concurrent_positions": (int, 1, 10),
     "max_position_pct_of_wallet": (float, 0.01, 0.50),
+    "max_total_deployed_pct": (float, 0.10, 0.98),
     "max_position_pct_of_liquidity": (float, 0.0001, 0.05),
     "gas_reserve_sol": (float, 0.0, 10.0),
     "min_position_usd": (float, 1.0, 100000.0),
@@ -163,6 +280,7 @@ SPEC: dict[str, Bound] = {
     "rr_max": (float, 2.0, 6.0),
     "circuit_consecutive_losses": (int, 2, 20),
     "circuit_daily_drawdown_pct": (float, 0.01, 0.50),
+    "binance_top_n": (int, 10, 300),
     "min_liquidity_usd": (float, 1000.0, 100000000.0),
     "min_volume_24h_usd": (float, 1000.0, 1000000000.0),
     "universe_max_tokens": (int, 10, 2000),
@@ -181,10 +299,38 @@ SPEC: dict[str, Bound] = {
     "trailing_distance_atr": (float, 0.2, 10.0),
     "signal_invalidation_bars": (int, 1, 10),
     "max_hold_minutes": (int, 10, 10080),
+    "stop_atr_mult": (float, 0.3, 5.0),
+    "regime_lookback": (int, 5, 200),
+    "regime_trend_er": (float, 0.05, 0.95),
+    "regime_chop_atr_pct": (float, 0.001, 0.50),
+    "regime_allowed": (int, 1, 7),
+    "confluence_required": (int, 0, 4),
     "correlation_lookback": (int, 10, 500),
     "correlation_max": (float, 0.1, 1.0),
     "volatility_size_floor": (float, 0.05, 1.0),
     "volatility_target_atr_pct": (float, 0.001, 0.50),
+    "portfolio_vol_target": (float, 0.001, 0.50),
+    "drawdown_tolerance": (float, 0.01, 1.0),
+    "monte_carlo_p5_drawdown": (float, 0.0, 1.0),
+    "drift_window_days": (int, 1, 365),
+    "drift_min_trades": (int, 5, 1000),
+    "drift_win_rate_tolerance": (float, 0.01, 1.0),
+    "drift_expectancy_tolerance": (float, 0.01, 5.0),
+    "drift_check_seconds": (int, 60, 86400),
+    "max_trades_per_day": (int, 1, 500),
+    "min_seconds_between_entries": (int, 0, 86400),
+    "min_seconds_between_entries_same_mint": (int, 0, 604800),
+    "entry_gate_min_strength": (float, 0.0, 1.0),
+    "wfmc_daily_hour_utc": (int, 0, 23),
+    "wfmc_monthly_day_utc": (int, 1, 28),
+    "wfmc_monthly_hour_utc": (int, 0, 23),
+    "runpod_batch_size": (int, 10, 100),
+    "promotion_check_interval_seconds": (int, 60, 86400),
+    "shadow_min_days": (int, 1, 365),
+    "shadow_min_trades": (int, 5, 10000),
+    "shadow_min_margin": (float, 0.0, 10.0),
+    "shadow_min_confidence": (float, 0.5, 1.0),
+    "runpod_rate_limit_per_minute": (int, 1, 10000),
     "max_slippage_pct": (float, 0.05, 5.0),
     "taker_fee_pct": (float, 0.0, 2.0),
     "priority_fee_lamports": (int, 0, 10000000),
@@ -200,11 +346,11 @@ SPEC: dict[str, Bound] = {
     "jupiter_rps": (float, 0.1, 200.0),
     "jupiter_burst": (int, 1, 100),
     "jupiter_price_batch_size": (int, 1, 50),
-    "birdeye_rps": (float, 0.1, 50.0),
-    "birdeye_monthly_cu_budget": (int, 0, 100000000),
+    "binance_rps": (float, 0.5, 50.0),
+    "bulk_backfill_months": (int, 1, 24),
     "rugcheck_rps": (float, 0.1, 50.0),
-    "candle_retention_days": (int, 7, 3650),
     "price_tick_retention_hours": (int, 1, 8760),
+    "wfmc_result_retention_days": (int, 7, 3650),
     "event_retention_days": (int, 1, 3650),
     "backtest_daily_hour_utc": (int, 0, 23),
     "backtest_lookback_days": (int, 7, 1095),
@@ -213,7 +359,10 @@ SPEC: dict[str, Bound] = {
     "login_rate_limit_window_seconds": (int, 30, 86400),
 }
 
-ENUMS: dict[str, set[str]] = {"trading_mode": {"paper", "live"}}
+ENUMS: dict[str, set[str]] = {
+    "trading_mode": {"paper", "live"},
+    "sizing_mode": {"flat", "portfolio"},
+}
 
 BOOLS = {
     "congestion_check_enabled",
@@ -221,11 +370,33 @@ BOOLS = {
     "rugcheck_require_mint_revoked",
     "rugcheck_require_freeze_revoked",
     "backtest_daily_enabled",
+    "regime_gate_enabled",
+    "confluence_enabled",
+    "entry_gate_enabled",
+    "daily_review_enabled",
+    "wfmc_daily_enabled",
+    "wfmc_monthly_enabled",
+    "auto_promote_enabled",
+    "runpod_ingest_enabled",
+}
+
+# Free-text settings. (max length,) - validated for length and stripped, never
+# interpolated anywhere that would let one become an injection.
+STRINGS: dict[str, int] = {
+    "runpod_gpu_type": 64,
+    "runpod_callback_url": 512,
+}
+
+# List settings: (element type, low, high, max length). Rendered on the settings
+# page as a comma-separated field.
+ListBound = tuple[type, float, float, int]
+LISTS: dict[str, ListBound] = {
+    "confluence_timeframes": (int, 1, 288, 4),
 }
 
 # Keys the dashboard settings page may change. `trading_mode` is deliberately
 # excluded - flipping to live is a separate, guarded action.
-EDITABLE = set(SPEC) | BOOLS
+EDITABLE = set(SPEC) | BOOLS | set(STRINGS) | set(LISTS) | {"sizing_mode"}
 
 
 class ConfigError(ValueError):
@@ -242,6 +413,13 @@ def _coerce(key: str, value: Any) -> Any:
         if v not in ENUMS[key]:
             raise ConfigError(f"{key} must be one of {sorted(ENUMS[key])}")
         return v
+    if key in STRINGS:
+        text = str(value).strip()
+        if len(text) > STRINGS[key]:
+            raise ConfigError(f"{key} must be at most {STRINGS[key]} characters")
+        return text
+    if key in LISTS:
+        return _coerce_list(key, value)
     if key not in SPEC:
         return value
     typ, low, high = SPEC[key]
@@ -256,6 +434,31 @@ def _coerce(key: str, value: Any) -> Any:
     if high is not None and v > high:
         raise ConfigError(f"{key} must be <= {high} (got {v})")
     return v
+
+
+def _coerce_list(key: str, value: Any) -> list[Any]:
+    """Parse a list setting from a real list or a comma-separated string."""
+    typ, low, high, max_len = LISTS[key]
+    if isinstance(value, str):
+        items = [part.strip() for part in value.split(",") if part.strip()]
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        raise ConfigError(f"{key} must be a list or a comma-separated string")
+    if len(items) > max_len:
+        raise ConfigError(f"{key} accepts at most {max_len} values")
+
+    out: list[Any] = []
+    for item in items:
+        try:
+            parsed = typ(item)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"{key} values must be {typ.__name__}") from exc
+        if parsed < low or parsed > high:
+            raise ConfigError(f"{key} values must be between {low} and {high}")
+        if parsed not in out:
+            out.append(parsed)
+    return sorted(out)
 
 
 def validate(pending: dict[str, Any], merged: dict[str, Any]) -> dict[str, Any]:
@@ -275,13 +478,24 @@ def validate(pending: dict[str, Any], merged: dict[str, Any]) -> dict[str, Any]:
         raise ConfigError("hot scan must be at least as frequent as the broad scan")
     if after["min_candles_required"] <= after["volume_spike_lookback"]:
         raise ConfigError("min_candles_required must exceed volume_spike_lookback")
-    if after["max_position_pct_of_wallet"] * after["max_concurrent_positions"] > 0.95:
+    if after["max_position_pct_of_wallet"] > after["max_total_deployed_pct"]:
         raise ConfigError(
-            "position size x max concurrent positions would deploy more than 95% "
-            "of the wallet; the spec requires an untouched reserve"
+            "a single position cannot be allowed to exceed the total-deployed cap"
         )
     if after["rugcheck_pass_ttl_seconds"] < after["broad_scan_seconds"]:
         raise ConfigError("rug check TTL must be longer than one scan cycle")
+    if after["confluence_required"] > len(after["confluence_timeframes"]):
+        raise ConfigError(
+            f"confluence_required ({after['confluence_required']}) exceeds the "
+            f"{len(after['confluence_timeframes'])} timeframe(s) configured, so no "
+            "entry could ever satisfy it"
+        )
+    if after["min_seconds_between_entries_same_mint"] < after["min_seconds_between_entries"]:
+        raise ConfigError(
+            "the same-token cooldown cannot be shorter than the global one"
+        )
+    if after["drawdown_tolerance"] <= 0:
+        raise ConfigError("drawdown_tolerance must be positive")
     return clean
 
 
@@ -290,18 +504,28 @@ class Secrets:
     """Read from the environment at import; never written to config.json."""
 
     jupiter_api_key: str = ""
-    birdeye_api_key: str = ""
     rugcheck_api_key: str = ""
     solana_private_key: str = ""
     solana_rpc_url: str = "https://api.mainnet-beta.solana.com"
     flask_secret_key: str = ""
     secret_encryption_key: str = ""
+    # Bearer token a RunPod worker presents when it reports a monthly retest's
+    # progress back to this droplet (spec 5). Held here rather than in
+    # config.json so it never lands in a file the dashboard renders or a
+    # backup copies around casually.
+    bulk_data_token: str = ""
+    # RunPod's own API key, used by this droplet to orchestrate the monthly
+    # GPU retest: spin up a worker, ship it data, tear it down afterward.
+    runpod_api_key: str = ""
+    # RunPod's per-account S3-compatible credentials, for uploading a batch's
+    # Parquet chunk onto its network volume (console -> Settings -> S3 API Keys).
+    runpod_s3_access_key: str = ""
+    runpod_s3_secret_key: str = ""
 
     @classmethod
     def from_env(cls) -> "Secrets":
         return cls(
             jupiter_api_key=os.getenv("JUPITER_API_KEY", "").strip(),
-            birdeye_api_key=os.getenv("BIRDEYE_API_KEY", "").strip(),
             rugcheck_api_key=os.getenv("RUGCHECK_API_KEY", "").strip(),
             solana_private_key=os.getenv("SOLANA_PRIVATE_KEY", "").strip(),
             solana_rpc_url=os.getenv(
@@ -309,6 +533,10 @@ class Secrets:
             ).strip(),
             flask_secret_key=os.getenv("FLASK_SECRET_KEY", "").strip(),
             secret_encryption_key=os.getenv("SECRET_ENCRYPTION_KEY", "").strip(),
+            bulk_data_token=os.getenv("BULK_DATA_TOKEN", "").strip(),
+            runpod_api_key=os.getenv("RUNPOD_API_KEY", "").strip(),
+            runpod_s3_access_key=os.getenv("RUNPOD_S3_ACCESS_KEY", "").strip(),
+            runpod_s3_secret_key=os.getenv("RUNPOD_S3_SECRET_KEY", "").strip(),
         )
 
 
@@ -427,6 +655,21 @@ class Config:
             self._mtime = self._path.stat().st_mtime
         except OSError:
             self._mtime = 0.0
+
+    def ensure_on_disk(self) -> bool:
+        """Write the current (default, on a fresh install) values to `path` if
+        no file exists yet. Returns True if a file was created.
+
+        Deploy needs this: systemd's `ReadWritePaths=` under `ProtectSystem=strict`
+        can only bind-mount a path that already exists, so `config.json` must be
+        created before the first `systemctl enable --now`, not on first settings
+        edit (which is otherwise the only place `_write()` was ever called from).
+        """
+        with self._lock:
+            if self._path.exists():
+                return False
+            self._write()
+            return True
 
     def set_trading_mode(self, mode: str) -> None:
         self.update({"trading_mode": mode}, allow_mode=True)

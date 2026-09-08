@@ -6,12 +6,13 @@
     python manage.py create-user <username>
     python manage.py backup-codes <username>
     python manage.py universe
-    python manage.py pull --days 90
+    python manage.py pull --months 12
     python manage.py backtest --days 90
     python manage.py export --instance live --out trades.csv
     python manage.py tax --year 2026
     python manage.py status
     python manage.py check-apis
+    python manage.py check-deploy     (warns if config.json/db are missing)
     python manage.py go-live          (guarded checklist)
 """
 from __future__ import annotations
@@ -42,6 +43,37 @@ from solbot.universe import UniverseBuilder
 def cmd_init_db(_args: argparse.Namespace) -> int:
     db.init_db()
     print(f"database ready at {db.db_path()}")
+    cfg = get_config()
+    if cfg.ensure_on_disk():
+        print(f"config.json created at {cfg.path} (defaults)")
+    return 0
+
+
+def cmd_check_deploy(_args: argparse.Namespace) -> int:
+    """Warn about the local conditions that make a fresh systemd install fail.
+
+    Currently just the config.json-must-exist-before-bind-mount bug: both
+    solbot-worker.service and solbot-web.service declare
+    `ReadWritePaths=... config.json` under ProtectSystem=strict, and systemd
+    refuses to start (226/NAMESPACE) if that path doesn't exist yet.
+    """
+    problems: list[str] = []
+    cfg = get_config()
+    if not cfg.path.exists():
+        problems.append(
+            f"{cfg.path} does not exist yet - systemd's ReadWritePaths= for it "
+            "will fail to bind-mount (226/NAMESPACE) until it does. "
+            "Run: python manage.py init-db"
+        )
+    if not db.db_path().exists():
+        problems.append(
+            f"{db.db_path()} does not exist yet. Run: python manage.py init-db"
+        )
+    if problems:
+        for p in problems:
+            print(f"[warn] {p}")
+        return 1
+    print("[ok]   config.json and the database both exist")
     return 0
 
 
@@ -110,7 +142,7 @@ def cmd_universe(_args: argparse.Namespace) -> int:
     cfg = get_config()
     db.init_db()
     clients = build_clients(cfg)
-    builder = UniverseBuilder(clients.jupiter, cfg.as_dict())
+    builder = UniverseBuilder(clients.binance, clients.jupiter, cfg.as_dict())
     stats = builder.refresh()
     print(
         f"universe: {stats.passed} tradeable of {stats.considered} considered\n"
@@ -130,31 +162,24 @@ def cmd_pull(args: argparse.Namespace) -> int:
     cfg = get_config()
     db.init_db()
     clients = build_clients(cfg)
-    store = DataStore(clients.birdeye, cfg.as_dict())
+    store = DataStore(clients.binance, cfg.as_dict())
+    conn = db.connect()
 
-    builder = UniverseBuilder(clients.jupiter, cfg.as_dict())
-    mints = list(builder.load_persisted())
-    if not mints:
-        builder.refresh()
-        mints = builder.mints
+    builder = UniverseBuilder(clients.binance, clients.jupiter, cfg.as_dict())
+    if not builder.load_persisted(conn):
+        builder.refresh(conn=conn)
+    pairs = store.pair_map(conn)
     if args.limit:
-        mints = mints[: args.limit]
+        pairs = dict(list(pairs.items())[: args.limit])
 
-    estimate = store.estimate_pull(len(mints), args.days)
+    estimate = store.estimate_pull(len(pairs), args.months)
     print(json.dumps(estimate, indent=2))
-    if not estimate["affordable"]:
-        print(
-            "\nThis pull exceeds the remaining Birdeye budget. Reduce --days or "
-            "--limit, raise birdeye_monthly_cu_budget, or upgrade the plan."
-        )
-        if not args.force:
-            return 1
 
-    def progress(done: int, total: int, mint: str) -> None:
+    def progress(done: int, total: int, pair: str) -> None:
         pct = 100.0 * done / total if total else 0
-        print(f"\r  {done}/{total} ({pct:5.1f}%) {mint[:8]}...", end="", flush=True)
+        print(f"\r  {done}/{total} ({pct:5.1f}%) {pair}...", end="", flush=True)
 
-    report = store.backfill(mints, days=args.days, progress=progress)
+    report = store.bulk_backfill(pairs, months=args.months, conn=conn, progress=progress)
     print()
     print(json.dumps(report.as_dict(), indent=2))
     clients.close()
@@ -164,8 +189,8 @@ def cmd_pull(args: argparse.Namespace) -> int:
 def cmd_backtest(args: argparse.Namespace) -> int:
     cfg = get_config()
     db.init_db()
-    clients = build_clients(cfg, track_budget=False)
-    store = DataStore(clients.birdeye, cfg.as_dict())
+    clients = build_clients(cfg)
+    store = DataStore(clients.binance, cfg.as_dict())
 
     result = run_and_store(store, cfg.as_dict(), days=args.days)
     summary = result.summary()
@@ -229,11 +254,14 @@ def cmd_status(_args: argparse.Namespace) -> int:
     row = conn.execute("SELECT COUNT(*) AS n FROM universe").fetchone()
     print(f"universe          : {row['n']} tokens")
 
-    budget = db.api_usage("birdeye")
+    clients = build_clients(cfg)
+    store = DataStore(clients.binance, cfg.as_dict())
+    cov = store.coverage(conn)
     print(
-        f"birdeye budget    : {budget['units']:,} / "
-        f"{cfg['birdeye_monthly_cu_budget']:,} CU this month ({budget['calls']} calls)"
+        f"candle coverage   : {cov['tokens']}/{row['n']} tokens have history, "
+        f"{cov['candles']:,} candles, {cov['disk']['megabytes']:,.1f} MB on disk"
     )
+    clients.close()
 
     for name in db.INSTANCES:
         p = Portfolio(name, cfg.as_dict())
@@ -256,7 +284,7 @@ def cmd_check_apis(_args: argparse.Namespace) -> int:
     """Verify every API is reachable and every key works."""
     cfg = get_config()
     db.init_db()
-    clients = build_clients(cfg, track_budget=False)
+    clients = build_clients(cfg)
     ok = True
 
     checks = [
@@ -264,11 +292,8 @@ def cmd_check_apis(_args: argparse.Namespace) -> int:
         ("Jupiter tokens", lambda: bool(clients.jupiter.top_tokens(limit=5))),
         ("RugCheck", lambda: clients.rugcheck.ping()),
         ("Solana RPC", lambda: clients.rpc.ping()),
+        ("Binance", lambda: clients.binance.ping()),
     ]
-    if cfg.secrets.birdeye_api_key:
-        checks.append(("Birdeye OHLCV", lambda: clients.birdeye.ping()))
-    else:
-        print("  [skip] Birdeye        (BIRDEYE_API_KEY not set)")
 
     for name, fn in checks:
         try:
@@ -374,10 +399,9 @@ def main() -> int:
         fn=cmd_universe
     )
 
-    p = sub.add_parser("pull", help="backfill historical candles from Birdeye")
-    p.add_argument("--days", type=int, default=90)
+    p = sub.add_parser("pull", help="backfill historical candles from Binance")
+    p.add_argument("--months", type=int, default=12)
     p.add_argument("--limit", type=int, default=0, help="cap the number of tokens")
-    p.add_argument("--force", action="store_true", help="ignore the CU budget check")
     p.set_defaults(fn=cmd_pull)
 
     p = sub.add_parser("backtest", help="run a backtest against stored candles")
@@ -401,6 +425,10 @@ def main() -> int:
     sub.add_parser("check-apis", help="verify API reachability and keys").set_defaults(
         fn=cmd_check_apis
     )
+    sub.add_parser(
+        "check-deploy",
+        help="warn if config.json/the database are missing (systemd bind-mount bug)",
+    ).set_defaults(fn=cmd_check_deploy)
 
     p = sub.add_parser("go-live", help="switch to live trading after the checklist")
     p.add_argument("--force", action="store_true")

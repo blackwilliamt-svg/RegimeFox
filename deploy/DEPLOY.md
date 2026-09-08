@@ -64,17 +64,28 @@ API keys:
 - **Jupiter** — <https://portal.jup.ag>, Developer Platform → create key.
   The free tier is **1 request/second**; the two-tier scan cadence really wants
   the $25/month Developer tier at 10 rps. See "Rate limits" below.
-- **Birdeye** — <https://bds.birdeye.so> (Birdeye Data Services, *not* the
-  general birdeye.so site). Sign up, **verify your email first** — key
-  generation stays disabled until you do — then Security → Generate Key.
 
-Leave `SOLANA_PRIVATE_KEY` blank for now. Paper mode does not need it.
+Binance needs no key — universe ranking and candle history (klines + monthly
+archives) are all keyless public endpoints.
+
+Leave `SOLANA_PRIVATE_KEY` blank for now. Paper mode does not need it. Leave
+`RUNPOD_API_KEY` / `RUNPOD_S3_ACCESS_KEY` / `RUNPOD_S3_SECRET_KEY` blank too —
+they are only needed for the monthly RunPod retest (`wfmc_monthly_enabled`,
+off by default); see the "Walk-forward / Monte Carlo" section below.
 
 ## 5. Initialise and create your dashboard login
 
 ```bash
 sudo -u solbot .venv/bin/python manage.py init-db
 ```
+
+This also creates `config.json` (with default values) if it doesn't already
+exist. That matters for step 6: both systemd units declare
+`ReadWritePaths=... config.json` under `ProtectSystem=strict`, and systemd can
+only bind-mount a path that already exists — skipping `init-db` before
+`systemctl enable --now` fails with status 226/NAMESPACE. Run
+`manage.py check-deploy` at any point to confirm both `config.json` and the
+database are in place before you get to step 6.
 
 ```bash
 sudo -u solbot .venv/bin/python manage.py create-user yourname
@@ -178,12 +189,23 @@ configured cadence outruns the key. Your options, in order of preference:
 3. Leave it — the limiter degrades the *broad* sweep first and protects the hot
    tier, so entries and exits stay responsive while discovery slows down.
 
-**Birdeye** free Standard is 30,000 compute units/month and an OHLCV call costs
-35 CU — about 857 calls a month in total. That is why the historical pull is a
-manual, progress-reported button rather than something that runs on boot, and
-why every Birdeye call checks the budget first and refuses rather than dying
-half-way through a backfill. Plan on the $99/month Starter tier before going
-live.
+**Binance.US** (not global Binance - see below) is keyless and rate-limited
+generously enough (`binance_rps`, 5 rps default) that neither the universe
+refresh nor the daily incremental candle pull needs a budget check. The
+one-time bulk backfill (a trailing year of 1-minute candles per coin, paged
+through the same klines endpoint month by month) is still a manual,
+progress-reported button rather than something that runs on boot, simply
+because it is a heavy one-time load you should kick off deliberately.
+
+**Why Binance.US specifically:** global Binance (`api.binance.com`) geo-blocks
+US-origin traffic outright (HTTP 451). A droplet in a US region gets refused
+by it entirely, so this bot talks to `api.binance.us` instead - same REST API
+shape, keyless, but a smaller listed universe (~150 coins vs. thousands) and
+no documented equivalent of global Binance's bulk monthly-archive download,
+hence the REST paging above. If your droplet is hosted **outside** the US,
+global Binance would also work and has the larger coin selection - but there
+is no config flag to switch back; it would mean reverting
+`solbot/clients/binance.py`'s `base_url`.
 
 ---
 
@@ -203,9 +225,41 @@ Updating:
 cd /opt/solana-ta-bot && sudo -u solbot git pull && sudo -u solbot .venv/bin/pip install -r requirements.txt && sudo systemctl restart solbot-worker solbot-web
 ```
 
+### Walk-forward / Monte Carlo (spec 5)
+
+The daily re-score runs inside `solbot-worker` itself, on this droplet's own
+CPU — nothing to set up beyond the defaults (`wfmc_daily_enabled`, on by
+default). There is no PC and no separate hand-off repository anywhere in this
+picture; an accepted parameter set goes straight into SQLite.
+
+The monthly full-space retest (`wfmc_monthly_enabled`, **off** by default)
+rents a GPU worker from RunPod for the job and needs its own credentials:
+
+1. **RunPod API key + S3 credentials.** Put `RUNPOD_API_KEY`,
+   `RUNPOD_S3_ACCESS_KEY` and `RUNPOD_S3_SECRET_KEY` in `.env`.
+2. **A worker token for this droplet.** Dashboard → Settings → *RunPod worker
+   token* → *Generate a new token*. It is shown exactly once, and grants write
+   access to the run feed and bundle submission only — it cannot halt trading,
+   close a position, change a setting, or read an API key.
+3. **This droplet's own public URL.** Set `runpod_callback_url` on the settings
+   page so a RunPod worker knows where to report its feed and finished bundle
+   back to.
+4. Turn on `wfmc_monthly_enabled` once the above is in place.
+
+The droplet ships the worker its candle data, waits for it to report back,
+then terminates it and **verifies the teardown** — logged to the event feed
+either way, so a worker that failed to self-stop never keeps billing silently.
+
+Full detail, including the daily/monthly architecture, in
+[../docs/OPTIMIZER.md](../docs/OPTIMIZER.md).
+
 ### Backups
 
-The database holds your entire trade history and the tax record. Back it up:
+The database holds your entire trade history, settings, audit log, and WF/MC
+results — back it up. Candle history (Parquet, under `data/candles/`) is
+deliberately **not** backed up off the droplet — it is kept indefinitely and
+rebuilt cheaply from Binance if ever lost, so it is not worth the storage cost
+of a second copy.
 
 ```bash
 sudo -u solbot sqlite3 /opt/solana-ta-bot/data/solbot.db ".backup '/opt/solana-ta-bot/data/backup-$(date +%F).db'"

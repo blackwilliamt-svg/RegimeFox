@@ -11,7 +11,7 @@ from solbot.config import Config, ConfigError, DEFAULTS, SPEC
 
 def test_defaults_load(cfg):
     assert cfg["trading_mode"] == "paper"
-    assert cfg["max_concurrent_positions"] == 2
+    assert cfg["max_total_deployed_pct"] == 0.90
     assert cfg["paper_starting_balance"] == 1000.0
 
 
@@ -54,9 +54,9 @@ def test_ema_ordering_is_enforced(cfg):
 
 
 def test_over_deployment_is_rejected(cfg):
-    """Sizing that would leave no untouched reserve must not be accepted."""
-    with pytest.raises(ConfigError, match="reserve"):
-        cfg.update({"max_position_pct_of_wallet": 0.5, "max_concurrent_positions": 4})
+    """A single position cannot be allowed to exceed the total-deployed cap."""
+    with pytest.raises(ConfigError, match="total-deployed"):
+        cfg.update({"max_position_pct_of_wallet": 0.5, "max_total_deployed_pct": 0.4})
 
 
 def test_hot_scan_cannot_be_slower_than_broad(cfg):
@@ -97,7 +97,7 @@ def test_maybe_reload_picks_up_external_edits(cfg, workspace):
 def test_corrupt_config_falls_back_to_defaults(workspace):
     workspace["config"].write_text("{ this is not json", encoding="utf-8")
     cfg = Config(workspace["config"])
-    assert cfg["max_concurrent_positions"] == DEFAULTS["max_concurrent_positions"]
+    assert cfg["max_total_deployed_pct"] == DEFAULTS["max_total_deployed_pct"]
 
 
 def test_bad_stored_value_falls_back_for_that_key_only(workspace):
@@ -121,3 +121,26 @@ def test_update_reports_only_actual_changes(cfg):
     assert applied == {}
     applied = cfg.update({"max_slippage_pct": 0.75})
     assert applied == {"max_slippage_pct": (DEFAULTS["max_slippage_pct"], 0.75)}
+
+
+def test_ensure_on_disk_creates_defaults_file_when_missing(cfg, workspace):
+    assert not workspace["config"].exists()
+    created = cfg.ensure_on_disk()
+    assert created is True
+    assert workspace["config"].exists()
+
+    stored = json.loads(workspace["config"].read_text(encoding="utf-8"))
+    assert stored["trading_mode"] == DEFAULTS["trading_mode"]
+    assert stored["max_total_deployed_pct"] == DEFAULTS["max_total_deployed_pct"]
+
+
+def test_ensure_on_disk_is_a_noop_when_a_file_already_exists(cfg, workspace):
+    cfg.update({"max_slippage_pct": 0.75})
+    written_at = workspace["config"].stat().st_mtime
+
+    created = cfg.ensure_on_disk()
+
+    assert created is False
+    assert workspace["config"].stat().st_mtime == written_at
+    stored = json.loads(workspace["config"].read_text(encoding="utf-8"))
+    assert stored["max_slippage_pct"] == 0.75  # not clobbered back to defaults
