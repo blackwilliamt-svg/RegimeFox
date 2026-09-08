@@ -384,6 +384,7 @@ class Snapshot:
     plus_di: float = 0.0
     minus_di: float = 0.0
     vwap: float = 0.0
+    volume_zscore: float = 0.0
 
     @property
     def regime_name(self) -> str:
@@ -477,6 +478,9 @@ def compute(df: pd.DataFrame, cfg: dict[str, Any]) -> pd.DataFrame:
     out["adx"], out["plus_di"], out["minus_di"] = adx_line, plus_di, minus_di
 
     out["vwap"] = vwap(out, int(cfg.get("vwap_period", 20)))
+    # Fuzzy-regime section: the third discovery feature (volume behaviour),
+    # so live classification reads the identical signal discovery clustered.
+    out["volume_zscore"] = volume_zscore(out, int(cfg.get("regime_vol_zscore_period", 20)))
     return out
 
 
@@ -522,4 +526,5 @@ def snapshot_at(df: pd.DataFrame, index: int = -1) -> Snapshot | None:
         plus_di=val("plus_di"),
         minus_di=val("minus_di"),
         vwap=val("vwap"),
+        volume_zscore=val("volume_zscore"),
     )

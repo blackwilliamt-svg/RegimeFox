@@ -138,6 +138,18 @@ CREATE TABLE IF NOT EXISTS library (
 );
 CREATE INDEX IF NOT EXISTS idx_library_symbol ON library(symbol);
 CREATE INDEX IF NOT EXISTS idx_library_last_seen ON library(last_seen_at);
+
+-- Per-coin fuzzy regime models (fuzzy-regime section, step 1): one row per
+-- symbol, replaced wholesale on rediscovery (the monthly job or the manual
+-- trigger, step 5) rather than versioned - live classification (step 3)
+-- always wants the latest model, and the discovery run that produced it is
+-- already on record in `runs` if the history matters.
+CREATE TABLE IF NOT EXISTS regime_models (
+    symbol       TEXT PRIMARY KEY,
+    model        TEXT NOT NULL,     -- JSON: CoinRegimeModel.as_dict()
+    run_id       INTEGER,
+    discovered_at INTEGER NOT NULL
+);
 """
 
 
@@ -634,3 +646,39 @@ class RunStore:
                 f"DELETE FROM library WHERE fingerprint IN ({placeholders})", doomed
             )
             return cur.rowcount
+
+    # ------------------------------------------------------------------
+    # per-coin fuzzy regime models (fuzzy-regime section, steps 1 and 3)
+    # ------------------------------------------------------------------
+    def save_regime_model(
+        self, symbol: str, model_dict: dict[str, Any], *, run_id: int | None = None
+    ) -> None:
+        """Replace this symbol's regime model wholesale - rediscovery
+        supersedes whatever centroids were there before, it does not merge
+        with them."""
+        self.conn.execute(
+            "INSERT INTO regime_models(symbol, model, run_id, discovered_at) "
+            "VALUES (?,?,?,?) ON CONFLICT(symbol) DO UPDATE SET "
+            "model=excluded.model, run_id=excluded.run_id, "
+            "discovered_at=excluded.discovered_at",
+            (symbol, _json(model_dict), run_id, now()),
+        )
+
+    def get_regime_model(self, symbol: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM regime_models WHERE symbol = ?", (symbol,)
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "symbol": row["symbol"],
+            "model": _load(row["model"], {}),
+            "run_id": row["run_id"],
+            "discovered_at": int(row["discovered_at"]),
+        }
+
+    def list_regime_models(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT symbol, run_id, discovered_at FROM regime_models ORDER BY symbol"
+        ).fetchall()
+        return [dict(r) for r in rows]

@@ -146,6 +146,10 @@ DEFAULTS: dict[str, Any] = {
     "adx_period": 14,
     "adx_min": 20.0,                      # below this, no trend to trade
     "vwap_period": 20,
+    # Fuzzy-regime section: rolling window for the volume-behaviour discovery
+    # feature. Matches solopt.regime_discovery's own default so a coin's live
+    # feature vector lands in the same space its centroids were discovered in.
+    "regime_vol_zscore_period": 20,
 
     # --- exit rules -------------------------------------------------------
     "trailing_activate_r": 1.0,           # arm the trail after +1R
@@ -367,6 +371,7 @@ SPEC: dict[str, Bound] = {
     "adx_period": (int, 2, 100),
     "adx_min": (float, 0.0, 80.0),
     "vwap_period": (int, 2, 500),
+    "regime_vol_zscore_period": (int, 2, 500),
     "correlation_lookback": (int, 10, 500),
     "correlation_max": (float, 0.1, 1.0),
     "volatility_size_floor": (float, 0.05, 1.0),
