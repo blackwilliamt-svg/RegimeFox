@@ -131,6 +131,7 @@ CREATE TABLE IF NOT EXISTS library (
     performance         TEXT    NOT NULL,       -- JSON: walk-forward summary metrics
     market_regime_score REAL,                   -- continuous efficiency ratio, whole panel
     symbol_regime_score REAL,                   -- continuous efficiency ratio, this symbol only
+    regime_cluster_id   INTEGER,                 -- fuzzy-regime section: this coin's own cluster index
     run_id              INTEGER,
     first_seen_at       INTEGER NOT NULL,
     last_seen_at        INTEGER NOT NULL,
@@ -153,12 +154,40 @@ CREATE TABLE IF NOT EXISTS regime_models (
 """
 
 
+# Columns a version expects but an older solopt store file may not have yet -
+# same pattern solbot.db.migrate uses, since CREATE TABLE IF NOT EXISTS never
+# alters a table that already exists under an older shape.
+MIGRATIONS: dict[str, dict[str, str]] = {
+    "library": {
+        "regime_cluster_id": "INTEGER",
+    },
+}
+
+
+def migrate(conn: sqlite3.Connection) -> list[str]:
+    applied: list[str] = []
+    for table, columns in MIGRATIONS.items():
+        try:
+            existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        except sqlite3.Error:
+            continue
+        if not existing:
+            continue
+        for name, decl in columns.items():
+            if name in existing:
+                continue
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+            applied.append(f"{table}.{name}")
+    return applied
+
+
 def connect(path: str | Path) -> sqlite3.Connection:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), timeout=30.0, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    migrate(conn)
     return conn
 
 
@@ -185,10 +214,15 @@ def _load(raw: Any, default: Any = None) -> Any:
 @dataclass
 class LibraryEntry:
     """A combination worth remembering: it passed the walk-forward thresholds
-    at least once. `regime` tags (item 5) are continuous efficiency-ratio
-    readings, not bucket labels - see solopt/indicators.py's
-    efficiency_ratio_stack, which this reuses rather than reinventing a
-    separate regime measure."""
+    at least once. `market_regime_score`/`symbol_regime_score` (item 5) are
+    continuous efficiency-ratio readings, not bucket labels - see
+    solopt/indicators.py's efficiency_ratio_stack, which this reuses rather
+    than reinventing a separate regime measure. `regime_cluster_id` (the
+    fuzzy-regime section, step 2) is a different, complementary tag: which of
+    a coin's own discovered fuzzy regimes (solopt.regime_discovery) this
+    combination was validated in - a discrete cluster index, not a
+    continuous score, and only meaningful together with `symbol` (a
+    market-wide entry has no coin-specific cluster to belong to)."""
 
     fingerprint: str
     params: dict[str, Any]
@@ -197,6 +231,7 @@ class LibraryEntry:
     per_symbol: dict[str, Any] | None = None
     market_regime_score: float | None = None
     symbol_regime_score: float | None = None
+    regime_cluster_id: int | None = None
     run_id: int | None = None
 
 
@@ -524,13 +559,15 @@ class RunStore:
             if row is None:
                 conn.execute(
                     "INSERT INTO library(fingerprint, symbol, params, per_symbol, "
-                    "performance, market_regime_score, symbol_regime_score, run_id, "
-                    "first_seen_at, last_seen_at, times_seen) VALUES (?,?,?,?,?,?,?,?,?,?,1)",
+                    "performance, market_regime_score, symbol_regime_score, "
+                    "regime_cluster_id, run_id, first_seen_at, last_seen_at, times_seen) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,1)",
                     (
                         entry.fingerprint, entry.symbol, _json(entry.params),
                         _json(entry.per_symbol) if entry.per_symbol else None,
                         _json(entry.performance), entry.market_regime_score,
-                        entry.symbol_regime_score, entry.run_id, ts, ts,
+                        entry.symbol_regime_score, entry.regime_cluster_id,
+                        entry.run_id, ts, ts,
                     ),
                 )
                 return True
@@ -541,13 +578,14 @@ class RunStore:
                 conn.execute(
                     "UPDATE library SET symbol = ?, params = ?, per_symbol = ?, "
                     "performance = ?, market_regime_score = ?, symbol_regime_score = ?, "
-                    "run_id = ?, last_seen_at = ?, times_seen = times_seen + 1 "
-                    "WHERE fingerprint = ?",
+                    "regime_cluster_id = ?, run_id = ?, last_seen_at = ?, "
+                    "times_seen = times_seen + 1 WHERE fingerprint = ?",
                     (
                         entry.symbol, _json(entry.params),
                         _json(entry.per_symbol) if entry.per_symbol else None,
                         _json(entry.performance), entry.market_regime_score,
-                        entry.symbol_regime_score, entry.run_id, ts, entry.fingerprint,
+                        entry.symbol_regime_score, entry.regime_cluster_id,
+                        entry.run_id, ts, entry.fingerprint,
                     ),
                 )
                 return True
@@ -619,6 +657,28 @@ class RunStore:
         ]
         scored.sort(key=lambda t: t[0])
         return [self._library_row(row) for _distance, row in scored[: max(0, int(n))]]
+
+    def regime_cluster_entries(self, symbol: str) -> dict[int, dict[str, Any]]:
+        """This symbol's promoted set per fuzzy regime cluster (fuzzy-regime
+        section, step 2/4) - `{cluster_id: entry}`, the best entry per
+        cluster if more than one was ever stored for it. Used to blend
+        parameters by the symbol's current membership percentages (step 4);
+        an empty dict just means this coin has no per-regime WFMC results
+        yet, the ordinary case for a coin that hasn't gone through the
+        monthly job."""
+        rows = self.conn.execute(
+            "SELECT * FROM library WHERE symbol = ? AND regime_cluster_id IS NOT NULL",
+            (symbol,),
+        ).fetchall()
+        best: dict[int, dict[str, Any]] = {}
+        best_score: dict[int, float] = {}
+        for row in rows:
+            cluster_id = int(row["regime_cluster_id"])
+            score = _library_score(_load(row["performance"], {}))
+            if cluster_id not in best or score > best_score[cluster_id]:
+                best[cluster_id] = self._library_row(row)
+                best_score[cluster_id] = score
+        return best
 
     def prune_library(self, *, keep: int = 500) -> int:
         """Cap the library at `keep` entries, dropping the lowest-scored

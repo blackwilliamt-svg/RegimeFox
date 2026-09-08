@@ -17,7 +17,7 @@ cannot both take the last position slot at the same instant.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -109,6 +109,32 @@ class Frames:
         # window; the engine reads `in_window` for that.
         out.eligible = out.eligible & (out.ts >= int(start_ts)) & (out.ts < int(end_ts))
         return out
+
+    def select_symbols(self, symbols: Sequence[str]) -> "Frames":
+        """Restrict to a subset of symbols, in the given order - the
+        fuzzy-regime section's per-coin walk-forward (step 2) runs the search
+        against one coin alone, not the whole panel, so its promoted set is
+        genuinely that coin's own rather than a market-wide consensus. Each
+        row is already left-packed per symbol, so selecting rows disturbs
+        nothing about that; only the symbol axis shrinks.
+        """
+        idx = [self.symbols.index(s) for s in symbols]
+        return Frames(
+            symbols=list(symbols),
+            ts=self.ts[idx],
+            open=self.open[idx],
+            high=self.high[idx],
+            low=self.low[idx],
+            close=self.close[idx],
+            volume=self.volume[idx],
+            mask=self.mask[idx],
+            eligible=self.eligible[idx],
+            counts=self.counts[idx],
+            grid_pos=self.grid_pos[idx],
+            seconds=self.seconds,
+            schema=self.schema,
+            liquidity=None if self.liquidity is None else self.liquidity[idx],
+        )
 
     def coverage(self) -> dict[str, Any]:
         real = self.mask.sum()

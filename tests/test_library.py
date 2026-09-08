@@ -152,6 +152,71 @@ def test_recency_weight_decays_toward_zero_but_never_negative():
 
 
 # --------------------------------------------------------------------------
+# per-regime-cluster entries (fuzzy-regime section, steps 2 and 4)
+# --------------------------------------------------------------------------
+def test_regime_cluster_entries_groups_by_cluster_id(tmp_path):
+    store = RunStore(tmp_path / "wfmc.db")
+    store.upsert_library(_entry("c0", efficiency=0.5, symbol="AAA", regime_cluster_id=0))
+    store.upsert_library(_entry("c1", efficiency=0.6, symbol="AAA", regime_cluster_id=1))
+    store.upsert_library(_entry("global", efficiency=0.9))   # no cluster, must be excluded
+
+    entries = store.regime_cluster_entries("AAA")
+    assert set(entries) == {0, 1}
+    assert entries[0]["fingerprint"] == "c0"
+    assert entries[1]["fingerprint"] == "c1"
+
+
+def test_regime_cluster_entries_keeps_the_best_per_cluster(tmp_path):
+    store = RunStore(tmp_path / "wfmc.db")
+    store.upsert_library(_entry("worse", efficiency=0.2, symbol="AAA", regime_cluster_id=0))
+    store.upsert_library(_entry("better", efficiency=0.2, symbol="AAA", regime_cluster_id=0))
+    # both same efficiency (0.2) but different fingerprints - simulate two
+    # separate runs landing in the same cluster with different scores by
+    # bumping mean_return on the second.
+    store.conn.execute(
+        "UPDATE library SET performance = ? WHERE fingerprint = 'better'",
+        ('{"walk_forward_efficiency": 0.2, "mean_window_return": 5.0}',),
+    )
+
+    entries = store.regime_cluster_entries("AAA")
+    assert entries[0]["fingerprint"] == "better"
+
+
+def test_regime_cluster_entries_is_empty_for_a_coin_with_no_per_regime_results(tmp_path):
+    store = RunStore(tmp_path / "wfmc.db")
+    store.upsert_library(_entry("global", efficiency=0.9, symbol="AAA"))
+    assert store.regime_cluster_entries("AAA") == {}
+
+
+def test_migrate_adds_regime_cluster_id_to_an_older_library_table(tmp_path):
+    """A store file written before this column existed must still open and
+    work - CREATE TABLE IF NOT EXISTS never alters a table that already
+    exists under the older shape."""
+    import sqlite3
+
+    from solopt.store import SCHEMA
+
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(str(path))
+    old_schema = SCHEMA.replace(
+        "    regime_cluster_id   INTEGER,                 -- fuzzy-regime section: this coin's own cluster index\n",
+        "",
+    )
+    conn.executescript(old_schema)
+    conn.execute(
+        "INSERT INTO library(fingerprint, params, performance, first_seen_at, "
+        "last_seen_at, times_seen) VALUES ('old', '{}', '{}', 0, 0, 1)"
+    )
+    conn.commit()
+    conn.close()
+
+    store = RunStore(path)   # connect() runs the migration
+    row = store.conn.execute("PRAGMA table_info(library)").fetchall()
+    assert any(r["name"] == "regime_cluster_id" for r in row)
+    assert store.library_entry("old") is not None   # existing data survives
+
+
+# --------------------------------------------------------------------------
 # seeding a new search from the library (item 4)
 # --------------------------------------------------------------------------
 def _rng():

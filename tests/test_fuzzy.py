@@ -14,6 +14,7 @@ from solopt.fuzzy import (
     discover_best_k,
     fuzzy_cmeans,
     membership_for,
+    membership_stack,
 )
 
 
@@ -140,3 +141,23 @@ def test_discover_best_k_skips_a_k_larger_than_the_sample_count():
     X = np.random.default_rng(9).normal(size=(4, 2))
     result = discover_best_k(X, k_range=(2, 3, 10))
     assert result.centroids.shape[0] in (2, 3)
+
+
+# --------------------------------------------------------------------------
+# vectorized membership (many points at once)
+# --------------------------------------------------------------------------
+def test_membership_stack_matches_membership_for_pointwise():
+    X, _ = _three_blobs()
+    result = fuzzy_cmeans(X, 3, seed=10)
+
+    stack = membership_stack(X, result.centroids)
+    for i in (0, 40, 90, 150):
+        pointwise = membership_for(X[i], result.centroids)
+        assert np.allclose(stack[i], pointwise, atol=1e-9)
+
+
+def test_membership_stack_rows_sum_to_one():
+    X, _ = _three_blobs()
+    result = fuzzy_cmeans(X, 3, seed=11)
+    stack = membership_stack(X, result.centroids)
+    assert np.allclose(stack.sum(axis=1), 1.0, atol=1e-6)

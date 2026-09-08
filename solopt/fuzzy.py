@@ -134,6 +134,37 @@ def membership_for(
     return inv / inv.sum()
 
 
+def membership_stack(
+    X: np.ndarray, centroids: np.ndarray, *, m: float = 2.0
+) -> np.ndarray:
+    """Vectorized :func:`membership_for` over many points at once -
+    `X` is `[n_samples, n_features]`, returns `[n_samples, n_clusters]`.
+
+    Used to classify a whole bar history at once (per-regime walk-forward,
+    fuzzy-regime section step 2, needs every historical bar's membership to
+    pick which windows belong to a regime) rather than one live point at a
+    time (step 3's membership_for).
+    """
+    X = np.asarray(X, dtype=np.float64)
+    centroids = np.asarray(centroids, dtype=np.float64)
+    dist = np.linalg.norm(X[:, None, :] - centroids[None, :, :], axis=2)  # [n, k]
+
+    out = np.empty_like(dist)
+    on_centroid = dist < 1e-9
+    any_on_centroid = on_centroid.any(axis=1)
+
+    power = 2.0 / (m - 1.0)
+    safe = np.maximum(dist, 1e-12)
+    inv = 1.0 / np.power(safe, power)
+    out = inv / inv.sum(axis=1, keepdims=True)
+
+    if any_on_centroid.any():
+        hard = on_centroid.astype(np.float64)
+        hard /= np.maximum(hard.sum(axis=1, keepdims=True), 1e-12)
+        out = np.where(any_on_centroid[:, None], hard, out)
+    return out
+
+
 @dataclass(slots=True)
 class Standardizer:
     """Per-feature mean/std, fit once at discovery time and reused for every
