@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Callable, Sequence
 
 import numpy as np
 
@@ -153,6 +153,105 @@ def run_pipeline(
         outcome=outcome, monte_carlo=monte, stress=stress_results,
         bundle=bundle, summary=summary, accepted=ok, verdict=why,
     )
+
+
+# --------------------------------------------------------------------------
+# Timeframe search (spec: non-standard candle-timeframe search)
+# --------------------------------------------------------------------------
+# The base candle a strategy trades is itself a parameter, but not one
+# ``ParamSpace``/``TUNABLE`` can hold: it changes which *panel* gets loaded
+# (a different rollup of the 1-minute base, per ``solopt.dataset.rollup``),
+# not a value read out of an already-built one. So it is searched as an outer
+# loop over whole ``run_pipeline`` calls rather than an axis inside one -
+# every candidate gets its own full walk-forward/Monte Carlo/stress
+# evaluation on its own panel, and the results are compared on equal terms.
+# Deliberately not limited to the "standard" 5/10/15-minute candles a human
+# would reach for first: 7 and 13 land off any moving-average's usual period,
+# and 20 sits just past the live bot's previous ceiling (widened alongside
+# this to admit a winning 20-minute set - see solbot/config.py's SPEC).
+TIMEFRAME_SEARCH_CANDIDATES: tuple[int, ...] = (7, 10, 13, 15, 20)
+
+
+def _timeframe_rank(item: tuple[int, "PipelineResult"]) -> tuple[int, float, float]:
+    """Higher is better. Accepted runs always outrank rejected ones; among
+    ties, the out-of-sample return actually earned (not a ratio, which a
+    thinly-traded high timeframe can post a flattering one of on noise)
+    breaks it, then walk-forward efficiency as a second tiebreaker."""
+    _, result = item
+    outcome = result.outcome
+    return (
+        1 if outcome.accepted else 0,
+        float(outcome.aggregate_oos_return),
+        float(outcome.walk_forward_efficiency),
+    )
+
+
+def run_pipeline_over_timeframes(
+    build_frames: Callable[[int], Frames],
+    timeframe_minutes: Sequence[int] = TIMEFRAME_SEARCH_CANDIDATES,
+    *,
+    run_id_for: Callable[[int], int],
+    feed: RunFeed,
+    **run_pipeline_kwargs: Any,
+) -> tuple[int, PipelineResult, dict[int, PipelineResult]]:
+    """Run the full pipeline once per candidate timeframe and keep the best.
+
+    ``build_frames(minutes)`` loads that candidate's panel (a caller-supplied
+    closure so this module stays ignorant of where candles come from - the
+    droplet's Parquet store, a RunPod data bundle, or a test fixture).
+    ``run_id_for(minutes)`` mints this candidate's own run id, since each is
+    tracked (and independently resumable) in ``store`` exactly like a
+    standalone run. Every other keyword is forwarded to :func:`run_pipeline`
+    unchanged for every candidate (``space``, ``portfolio``, ``wf_config``,
+    ``store``, ...); pass neither ``run_id``, ``run_meta`` nor ``coverage``
+    here - ``run_id``/``run_meta`` are supplied per-candidate, and
+    ``coverage`` is derived from each candidate's own ``Frames.coverage()``
+    (a 7-minute panel and a 20-minute panel of the same history do not share
+    one bar count or day span, so one caller-supplied value could not
+    describe both).
+
+    A candidate whose panel comes back empty (too little history rolled up
+    to that timeframe) is skipped rather than failing the whole search. The
+    winner's ``candle_minutes`` is written into its own ``best_params`` (and
+    therefore its bundle's ``global`` params) so promoting the winning set
+    actually switches the live candle timeframe, not just its indicator
+    settings - the same ``EDITABLE``/``SPEC`` bounds check every other
+    promoted parameter goes through on the droplet side.
+    """
+    base_run_meta = dict(run_pipeline_kwargs.pop("run_meta", None) or {})
+    run_pipeline_kwargs.pop("coverage", None)
+    results: dict[int, PipelineResult] = {}
+    for minutes in timeframe_minutes:
+        frames = build_frames(int(minutes))
+        if frames.n_bars == 0 or frames.n_symbols == 0:
+            feed.say(f"Skipping the {minutes}-minute candle: no history rolls up to it.")
+            continue
+        feed.say(f"Searching the {minutes}-minute candle timeframe.")
+        result = run_pipeline(
+            frames,
+            feed=feed,
+            run_id=run_id_for(int(minutes)),
+            coverage=frames.coverage(),
+            run_meta={"candle_minutes": int(minutes), **base_run_meta},
+            **run_pipeline_kwargs,
+        )
+        results[int(minutes)] = result
+
+    if not results:
+        raise ValueError("no candidate timeframe produced a usable panel")
+
+    best_minutes, best_result = max(results.items(), key=_timeframe_rank)
+    if best_result.outcome.best_params is not None:
+        best_result.outcome.best_params = {
+            **best_result.outcome.best_params, "candle_minutes": best_minutes,
+        }
+        best_result.bundle.global_params = dict(best_result.outcome.best_params)
+        best_result.summary["best_params"] = best_result.outcome.best_params
+    feed.say(
+        f"Timeframe search: {best_minutes}-minute candles won "
+        f"({', '.join(f'{m}m={results[m].outcome.aggregate_oos_return:.4f}' for m in sorted(results))})."
+    )
+    return best_minutes, best_result, results
 
 
 def _update_library(

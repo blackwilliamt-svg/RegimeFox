@@ -34,7 +34,7 @@ from .feed import BufferedSink, RunFeed
 from .frames import compact
 from .montecarlo import ExecutionProfile
 from .params import DEFAULT_GRID, ParamSpace
-from .pipeline import run_pipeline
+from .pipeline import TIMEFRAME_SEARCH_CANDIDATES, run_pipeline, run_pipeline_over_timeframes
 from .report import DropletClient, ReportError
 from .schema import CostModel, get_schema
 from .store import RunStore
@@ -135,10 +135,26 @@ class Settings:
         return ParamSpace(values={k: list(v) for k, v in self.grid.items()})
 
 
+def _parse_timeframe_search(raw: str | None) -> tuple[int, ...]:
+    """``--timeframe-search`` with no value means the default candidates
+    (:data:`solopt.pipeline.TIMEFRAME_SEARCH_CANDIDATES`, which already
+    includes the non-standard 7/13/20-minute intervals); a comma-separated
+    value overrides them, e.g. ``--timeframe-search=7,13,20``."""
+    if raw is None:
+        return ()
+    if raw == "auto":
+        return tuple(TIMEFRAME_SEARCH_CANDIDATES)
+    minutes = tuple(int(x) for x in raw.split(",") if x.strip())
+    if not minutes:
+        raise SystemExit("--timeframe-search needs at least one candle-minute value")
+    return minutes
+
+
 # --------------------------------------------------------------------------
 def cmd_run(args: argparse.Namespace, settings: Settings) -> int:
     directory = Path(args.data_dir or settings.data_dir)
     schema = get_schema(settings.asset_class)
+    timeframe_search = _parse_timeframe_search(args.timeframe_search)
     timeframe = int(args.timeframe or settings.timeframe_minutes) * 60
 
     store = RunStore(settings.store_path)
@@ -148,7 +164,13 @@ def cmd_run(args: argparse.Namespace, settings: Settings) -> int:
     wf_config = settings.wf_config()
     portfolio = settings.portfolio_settings()
 
-    existing = store.resumable_run(bundle_id) if not args.fresh else None
+    # The timeframe search runs several full walk-forwards against several
+    # different panels in one invocation, so unlike the single-timeframe path
+    # above it has no one bundle+timeframe pair to resume against - always
+    # fresh, one child run row per candidate (see run_id_for below).
+    existing = (
+        store.resumable_run(bundle_id) if not args.fresh and not timeframe_search else None
+    )
     if existing:
         run_id = int(existing["id"])
         print(f"Resuming run {run_id} against the same data bundle.")
@@ -164,53 +186,123 @@ def cmd_run(args: argparse.Namespace, settings: Settings) -> int:
         except SystemExit:
             client = None
 
-    print(f"Loading {directory} at {timeframe // 60}-minute candles…")
-    panel = load_panel(
-        directory,
-        timeframe_seconds=timeframe,
-        schema=schema,
-        max_symbols=args.max_symbols,
-        since=int(time.time()) - args.days * 86400 if args.days else None,
-    )
-    frames = compact(panel)
-    coverage = panel.coverage()
+    since = int(time.time()) - args.days * 86400 if args.days else None
 
-    if not run_id:
-        run_id = store.start_run(
-            config=wf_config.as_dict(),
-            settings=portfolio.as_dict(),
-            space={"values": space.values},
-            bundle=bundle_id,
-            coverage=coverage,
-            label=args.label or "",
+    if timeframe_search:
+        candidate_run_ids: dict[int, int] = {}
+
+        def build_frames(minutes: int):
+            seconds = minutes * 60
+            print(f"Loading {directory} at {minutes}-minute candles…")
+            return compact(
+                load_panel(
+                    directory, timeframe_seconds=seconds, schema=schema,
+                    max_symbols=args.max_symbols, since=since,
+                )
+            )
+
+        def run_id_for(minutes: int) -> int:
+            rid = store.start_run(
+                config=wf_config.as_dict(), settings=portfolio.as_dict(),
+                space={"values": space.values}, bundle=f"{bundle_id}:{minutes}m",
+                coverage={}, label=f"{args.label or bundle_id} ({minutes}m)",
+            )
+            candidate_run_ids[minutes] = rid
+            return rid
+
+        if not run_id:
+            run_id = store.start_run(
+                config=wf_config.as_dict(), settings=portfolio.as_dict(),
+                space={"values": space.values, "timeframe_search": list(timeframe_search)},
+                bundle=bundle_id, coverage={}, label=args.label or "",
+            )
+        feed = RunFeed(store, run_id, report_run_id=settings.report_run_id, sinks=sinks)
+        feed.say(
+            f"Searching {len(timeframe_search)} candle timeframes: "
+            + ", ".join(f"{m}m" for m in timeframe_search) + "."
         )
-    feed = RunFeed(store, run_id, report_run_id=settings.report_run_id, sinks=sinks)
-    feed.loaded(coverage)
 
-    backend = get_backend(prefer_gpu=settings.prefer_gpu and not args.cpu)
-    feed.say(
-        f"Compute backend: {backend.name} on {backend.device}, "
-        f"capped at {settings.utilization_pct:.0f}% utilization."
-    )
-
-    execution = _execution_profile(client, portfolio)
-    stress_config = StressConfig(**settings.stress) if settings.stress else StressConfig()
-
-    try:
-        result = run_pipeline(
-            frames,
-            space=space, portfolio=portfolio, wf_config=wf_config, backend=backend,
-            feed=feed, store=store, run_id=run_id, resume=not args.fresh,
-            coverage=coverage, execution=execution,
-            monte_carlo_iterations=settings.monte_carlo_iterations,
-            stress_config=stress_config,
-            run_meta={"bundle": bundle_id, "elapsed_minutes": 0.0},
+        backend = get_backend(prefer_gpu=settings.prefer_gpu and not args.cpu)
+        feed.say(
+            f"Compute backend: {backend.name} on {backend.device}, "
+            f"capped at {settings.utilization_pct:.0f}% utilization."
         )
-    except Exception as exc:
-        feed.alert(f"Run failed: {exc}")
-        store.finish_run(run_id, "failed", {"error": str(exc)[:500]})
-        feed.flush()
-        raise
+        execution = _execution_profile(client, portfolio)
+        stress_config = StressConfig(**settings.stress) if settings.stress else StressConfig()
+
+        try:
+            winner_minutes, result, all_results = run_pipeline_over_timeframes(
+                build_frames, timeframe_search, run_id_for=run_id_for, feed=feed,
+                space=space, portfolio=portfolio, wf_config=wf_config, backend=backend,
+                store=store, resume=False, execution=execution,
+                monte_carlo_iterations=settings.monte_carlo_iterations,
+                stress_config=stress_config,
+                run_meta={"bundle": bundle_id, "elapsed_minutes": 0.0},
+            )
+        except Exception as exc:
+            feed.alert(f"Timeframe search failed: {exc}")
+            store.finish_run(run_id, "failed", {"error": str(exc)[:500]})
+            for rid in candidate_run_ids.values():
+                store.finish_run(rid, "failed", {"error": "search aborted"})
+            feed.flush()
+            raise
+
+        for minutes, candidate in all_results.items():
+            store.finish_run(
+                candidate_run_ids[minutes], "done",
+                {**candidate.summary, "accepted": candidate.accepted},
+            )
+        coverage = {
+            **result.bundle.data,  # the winning candidate's own Frames.coverage()
+            "candle_minutes": winner_minutes, "candidates": sorted(all_results),
+        }
+        feed.say(f"Winning timeframe: {winner_minutes} minutes.")
+        feed.loaded(coverage)
+    else:
+        print(f"Loading {directory} at {timeframe // 60}-minute candles…")
+        panel = load_panel(
+            directory, timeframe_seconds=timeframe, schema=schema,
+            max_symbols=args.max_symbols, since=since,
+        )
+        frames = compact(panel)
+        coverage = panel.coverage()
+
+        if not run_id:
+            run_id = store.start_run(
+                config=wf_config.as_dict(),
+                settings=portfolio.as_dict(),
+                space={"values": space.values},
+                bundle=bundle_id,
+                coverage=coverage,
+                label=args.label or "",
+            )
+        feed = RunFeed(store, run_id, report_run_id=settings.report_run_id, sinks=sinks)
+        feed.loaded(coverage)
+
+        backend = get_backend(prefer_gpu=settings.prefer_gpu and not args.cpu)
+        feed.say(
+            f"Compute backend: {backend.name} on {backend.device}, "
+            f"capped at {settings.utilization_pct:.0f}% utilization."
+        )
+
+        execution = _execution_profile(client, portfolio)
+        stress_config = StressConfig(**settings.stress) if settings.stress else StressConfig()
+
+        try:
+            result = run_pipeline(
+                frames,
+                space=space, portfolio=portfolio, wf_config=wf_config, backend=backend,
+                feed=feed, store=store, run_id=run_id, resume=not args.fresh,
+                coverage=coverage, execution=execution,
+                monte_carlo_iterations=settings.monte_carlo_iterations,
+                stress_config=stress_config,
+                run_meta={"bundle": bundle_id, "elapsed_minutes": 0.0},
+            )
+        except Exception as exc:
+            feed.alert(f"Run failed: {exc}")
+            store.finish_run(run_id, "failed", {"error": str(exc)[:500]})
+            feed.flush()
+            raise
 
     summary = dict(result.summary)
     summary["accepted"] = result.accepted
@@ -430,6 +522,12 @@ def build_parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="walk-forward, Monte Carlo, crash replay, report")
     run.add_argument("--data-dir")
     run.add_argument("--timeframe", type=int, help="candle minutes to test")
+    run.add_argument(
+        "--timeframe-search", nargs="?", const="auto", default=None,
+        help="search several candle timeframes instead of just --timeframe - bare "
+        "flag for the default candidates (includes the non-standard 7/13/20-minute "
+        "intervals), or a comma list to override them, e.g. --timeframe-search=7,13,20",
+    )
     run.add_argument("--days", type=int, help="only use the last N days of history")
     run.add_argument("--max-symbols", type=int)
     run.add_argument("--label", help="a name for this run")

@@ -47,7 +47,9 @@ DEFAULTS: dict[str, Any] = {
     "min_position_usd": 10.0,
 
     # --- signal -----------------------------------------------------------
-    "candle_minutes": 10,                 # spec: 5-15 min, default 10
+    "candle_minutes": 10,                 # spec: 5-20 min, default 10 (7/13/20 are the
+                                           # walk-forward optimizer's non-standard-timeframe
+                                           # search candidates - solopt.pipeline.TIMEFRAME_SEARCH_CANDIDATES)
     "broad_scan_seconds": 15,
     "hot_scan_seconds": 1,
     "hot_list_max": 25,
@@ -330,7 +332,7 @@ SPEC: dict[str, Bound] = {
     "max_position_pct_of_liquidity": (float, 0.0001, 0.05),
     "gas_reserve_sol": (float, 0.0, 10.0),
     "min_position_usd": (float, 1.0, 100000.0),
-    "candle_minutes": (int, 5, 15),
+    "candle_minutes": (int, 5, 20),
     "broad_scan_seconds": (int, 5, 600),
     "hot_scan_seconds": (int, 1, 60),
     "hot_list_max": (int, 1, 100),
