@@ -314,6 +314,15 @@ def test_monte_carlo_reports_a_distribution_not_a_point():
     assert 0.0 <= result.probability_of_loss <= 1.0
     assert result.drawdown_histogram["total"] == 2000
 
+    # The dashboard's numeric detail panel: best/worst simulated outcome
+    # bracket every percentile between them, and the spread has a number.
+    assert result.worst_return <= result.p5_return <= result.median_return
+    assert result.median_return <= result.p95_return <= result.best_return
+    assert result.stdev_return > 0.0
+    summary = result.summary()
+    for key in ("stdev_return", "best_return", "worst_return"):
+        assert key in summary
+
 
 def test_monte_carlo_keeps_the_worst_simulated_equity_paths():
     """Spec 6a: the actual worst-case drawdown curves, not just the number."""

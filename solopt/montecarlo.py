@@ -150,6 +150,9 @@ class MonteCarloResult:
     trades: int = 0
     median_return: float = 0.0
     mean_return: float = 0.0
+    stdev_return: float = 0.0
+    best_return: float = 0.0
+    worst_return: float = 0.0
     p5_return: float = 0.0
     p95_return: float = 0.0
     median_max_drawdown: float = 0.0
@@ -174,6 +177,9 @@ class MonteCarloResult:
             "trades": self.trades,
             "median_return": round(self.median_return, 6),
             "mean_return": round(self.mean_return, 6),
+            "stdev_return": round(self.stdev_return, 6),
+            "best_return": round(self.best_return, 6),
+            "worst_return": round(self.worst_return, 6),
             "p5_return": round(self.p5_return, 6),
             "p95_return": round(self.p95_return, 6),
             "median_max_drawdown": round(self.median_max_drawdown, 6),
@@ -314,6 +320,9 @@ def simulate(
     ]
     result.median_return = float(np.median(terminal))
     result.mean_return = float(terminal.mean())
+    result.stdev_return = float(terminal.std(ddof=1)) if terminal.size > 1 else 0.0
+    result.best_return = float(terminal.max())
+    result.worst_return = float(terminal.min())
     result.p5_return = float(np.percentile(terminal, 5))
     result.p95_return = float(np.percentile(terminal, 95))
     result.median_max_drawdown = float(np.median(max_drawdown))

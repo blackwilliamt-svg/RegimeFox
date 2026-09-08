@@ -463,11 +463,17 @@
     if (!mc) return;
     mcData = mc;
     setText("mcMedianReturn", signedPct(mc.median_return, 2));
+    setText("mcMeanReturn", signedPct(mc.mean_return, 2));
+    setText("mcStdevReturn", pctText(mc.stdev_return, 2));
+    setText("mcBestReturn", signedPct(mc.best_return, 2));
+    setText("mcWorstReturn", signedPct(mc.worst_return, 2));
     setText("mcP5Return", signedPct(mc.p5_return, 2));
+    setText("mcP95Return", signedPct(mc.p95_return, 2));
     setText("mcMedianDd", pctText(mc.median_max_drawdown, 2));
     setText("mcP5Dd", pctText(mc.p5_max_drawdown, 2));
     setText("mcHistoricalDd", pctText(mc.historical_max_drawdown, 2));
     setText("mcLossProb", pctText(mc.probability_of_loss, 1));
+    setText("mcRuinProb", pctText(mc.risk_of_ruin, 2));
     setText("wfP5Drawdown", pctText(mc.p5_max_drawdown, 1));
     var exec = mc.execution || {};
     setText("mcSource", (mc.iterations || 0).toLocaleString() + " runs · " +
