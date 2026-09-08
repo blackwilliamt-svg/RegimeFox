@@ -54,3 +54,53 @@ def test_check_deploy_passes_after_init_db(manage_module, workspace, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "[ok]" in out
+
+
+class _Args:
+    def __init__(self, tiers=None):
+        self.tiers = tiers
+
+
+def test_benchmark_runpod_prints_results_and_never_touches_the_setting(
+    manage_module, workspace, capsys, monkeypatch
+):
+    """gap-closure item 7: the CLI reports what run_benchmark found and is
+    explicit that runpod_gpu_type is not changed automatically."""
+    manage_module.cmd_init_db(None)
+
+    def fake_run_benchmark(cfg, store, secrets, *, tiers=None, **kw):
+        assert tiers == ["TIER-A", "TIER-B"]
+        return {
+            "ran": True,
+            "results": [
+                {
+                    "gpu_type": "TIER-A", "ok": True, "elapsed_seconds": 12.3,
+                    "cost_usd": 0.01, "cost_per_1000_combinations": 0.5,
+                    "teardown_clean": True, "error": "",
+                },
+            ],
+            "recommendation": "TIER-A ($0.5000 per 1,000 combinations)",
+        }
+
+    monkeypatch.setattr("solbot.wfmc.run_benchmark", fake_run_benchmark)
+
+    rc = manage_module.cmd_benchmark_runpod(_Args(tiers="TIER-A,TIER-B"))
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "TIER-A" in out
+    assert "Recommendation" in out
+    assert "does NOT change runpod_gpu_type automatically" in out
+
+
+def test_benchmark_runpod_reports_failure_to_run(manage_module, workspace, capsys, monkeypatch):
+    manage_module.cmd_init_db(None)
+    monkeypatch.setattr(
+        "solbot.wfmc.run_benchmark",
+        lambda cfg, store, secrets, **kw: {"ran": False, "reason": "RUNPOD_API_KEY is not configured"},
+    )
+
+    rc = manage_module.cmd_benchmark_runpod(_Args())
+
+    assert rc == 1
+    assert "did not run" in capsys.readouterr().out

@@ -363,3 +363,115 @@ def run_monthly(
         conn=conn,
     )
     return {"ran": True, "jobs": jobs, "errors": errors, "teardown": teardown}
+
+
+# --------------------------------------------------------------------------
+# GPU-tier benchmark (gap-closure item 7)
+# --------------------------------------------------------------------------
+RUNPOD_BENCHMARK_KEY = "runpod_benchmark_results"
+
+
+def run_benchmark(
+    cfg: dict[str, Any],
+    store: Any,
+    secrets: Any,
+    *,
+    conn: sqlite3.Connection | None = None,
+    runpod_client: Any = None,
+    tiers: list[str] | None = None,
+    max_seconds: float | None = None,
+) -> dict[str, Any]:
+    """Benchmark 2-3 GPU tiers on a small representative slice and report
+    cost-per-run for each - on demand (`manage.py benchmark-runpod`, or the
+    dashboard button next to the RunPod settings), never automatically.
+
+    Stores the result and a recommendation under RUNPOD_BENCHMARK_KEY for the
+    settings page to show; it never changes `runpod_gpu_type` itself - the
+    operator confirms that from the numbers, same as every other setting.
+    """
+    from .runpod import BENCHMARK_TIMEOUT_SECONDS, DEFAULT_BENCHMARK_TIERS, RunPodClient, RunPodError
+
+    conn = conn or db.connect()
+    if not secrets.runpod_api_key:
+        return {"ran": False, "reason": "RUNPOD_API_KEY is not configured"}
+
+    mints = list(store.pair_map(conn))
+    if not mints:
+        return {"ran": False, "reason": "no routed universe tokens to test"}
+
+    client = runpod_client or RunPodClient(secrets.runpod_api_key)
+    run_id_start = next_run_id(conn)
+
+    db.log_event(
+        f"RunPod GPU-tier benchmark started: {', '.join(tiers or DEFAULT_BENCHMARK_TIERS)}.",
+        category="system", conn=conn,
+    )
+
+    try:
+        results = client.benchmark_tiers(
+            tiers,
+            mints=mints,
+            candles=store.candles,
+            interval=candles_interval(),
+            report_run_id_start=run_id_start,
+            droplet_url=str(cfg.get("runpod_callback_url") or ""),
+            droplet_token=getattr(secrets, "bulk_data_token", ""),
+            s3_access_key=getattr(secrets, "runpod_s3_access_key", ""),
+            s3_secret_key=getattr(secrets, "runpod_s3_secret_key", ""),
+            max_seconds=BENCHMARK_TIMEOUT_SECONDS if max_seconds is None else max_seconds,
+        )
+    except RunPodError as exc:
+        db.log_event(
+            f"RunPod GPU-tier benchmark could not start: {exc}",
+            level="alert", category="system", conn=conn,
+        )
+        return {"ran": False, "reason": str(exc)}
+
+    recommendation = _recommend_tier(results)
+    payload = {
+        "ts": db.now(),
+        "results": [r.as_dict() for r in results],
+        "recommendation": recommendation,
+    }
+    db.kv_set(RUNPOD_BENCHMARK_KEY, payload, conn)
+
+    failed = [r.gpu_type for r in results if not r.ok]
+    dirty = [r.gpu_type for r in results if r.teardown_clean is False]
+    db.log_event(
+        "RunPod GPU-tier benchmark finished: "
+        + "; ".join(
+            f"{r.gpu_type} {r.elapsed_seconds:.0f}s"
+            + (f" (${r.cost_usd:.4f})" if r.cost_usd is not None else " (cost unknown)")
+            for r in results
+        )
+        + (f". Recommendation: {recommendation}." if recommendation else "")
+        + (f" FAILED: {', '.join(failed)}." if failed else "")
+        + (f" NOT CLEANLY TORN DOWN: {', '.join(dirty)}." if dirty else ""),
+        level="alert" if (failed or dirty) else "info",
+        category="system",
+        detail=payload,
+        conn=conn,
+    )
+    return {"ran": True, **payload}
+
+
+def _recommend_tier(results: list[Any]) -> str:
+    """Cheapest $/1000-combinations among tiers that actually completed and
+    tore down cleanly - a recommendation to show, never applied automatically."""
+    candidates = [
+        r for r in results
+        if r.ok and r.teardown_clean is not False and r.cost_per_1000_combinations is not None
+    ]
+    if candidates:
+        best = min(candidates, key=lambda r: r.cost_per_1000_combinations)
+        return (
+            f"{best.gpu_type} (${best.cost_per_1000_combinations:.4f} per 1,000 combinations)"
+        )
+    # No combination counts made it back (e.g. the report round-trip did not
+    # complete in this benchmark window) - fall back to raw $/hr among tiers
+    # that at least completed cleanly, rather than recommending nothing.
+    priced = [r for r in results if r.ok and r.teardown_clean is not False and r.price_per_hour]
+    if priced:
+        best = min(priced, key=lambda r: r.price_per_hour)
+        return f"{best.gpu_type} (${best.price_per_hour:.2f}/hr - no combination count to compare cost-per-run)"
+    return ""

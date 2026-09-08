@@ -22,6 +22,10 @@ class FakeTransport:
         # Test knobs: pods finish (stop being RUNNING) after this many status polls.
         self.pod_polls_until_stopped: dict[str, int] = {}
         self._poll_counts: dict[str, int] = {}
+        # gap-closure item 7: {gpu_type: $/hr}, and whether /gputypes itself
+        # is reachable at all.
+        self.gpu_prices: dict[str, float] = {}
+        self.gputypes_fails: bool = False
 
     def _id(self, prefix: str) -> str:
         value = f"{prefix}-{self._next_id}"
@@ -75,6 +79,16 @@ class FakeTransport:
             pod_id = path.rsplit("/", 1)[-1]
             self.pods.pop(pod_id, None)
             return {}
+
+        if method == "GET" and path == "/gputypes":
+            if self.gputypes_fails:
+                raise RunPodError("simulated /gputypes outage")
+            return {
+                "gpuTypes": [
+                    {"id": name, "communityPrice": price}
+                    for name, price in self.gpu_prices.items()
+                ]
+            }
 
         raise RunPodError(f"unhandled fake request: {method} {path}")
 
@@ -161,3 +175,155 @@ def test_verify_teardown_reports_not_clean_when_a_volume_survives(client, transp
 
     assert result["clean"] is False
     assert volume["id"] in result["detail"]
+
+
+# --------------------------------------------------------------------------
+# GPU-tier benchmark (gap-closure item 7)
+# --------------------------------------------------------------------------
+class FakeCandles:
+    """A no-op stand-in for solbot.candlestore.ParquetCandleStore - the
+    benchmark's own orchestration logic is what these tests pin, not the
+    data-materialization path (already covered in test_wfmc.py)."""
+
+    def materialize_bundle(self, mints, interval, out_dir):
+        pass
+
+
+def test_gpu_price_per_hour_reads_the_matching_tier(client, transport):
+    transport.gpu_prices = {"NVIDIA RTX 4090": 0.79, "NVIDIA RTX 3090": 0.5}
+    assert client.gpu_price_per_hour("NVIDIA RTX 4090") == 0.79
+    assert client.gpu_price_per_hour("NVIDIA RTX 3090") == 0.5
+
+
+def test_gpu_price_per_hour_is_none_for_an_unlisted_tier(client, transport):
+    transport.gpu_prices = {"NVIDIA RTX 4090": 0.79}
+    assert client.gpu_price_per_hour("NVIDIA H100") is None
+
+
+def test_gpu_price_per_hour_is_none_when_the_catalog_is_unreachable(client, transport):
+    transport.gputypes_fails = True
+    assert client.gpu_price_per_hour("NVIDIA RTX 4090") is None
+
+
+def test_benchmark_tier_reports_time_cost_and_clean_teardown(client, transport):
+    transport.gpu_prices = {"NVIDIA RTX 4090": 0.79}
+
+    # Wire the pod's self-termination to the poll count so verify_teardown's
+    # wait actually observes it finish rather than force-stopping it.
+    orig_create_pod = client.create_pod
+
+    def create_pod_and_arm(*a, **kw):
+        pod = orig_create_pod(*a, **kw)
+        transport.pod_polls_until_stopped[pod["id"]] = 1
+        return pod
+
+    client.create_pod = create_pod_and_arm
+
+    result = client.benchmark_tier(
+        "NVIDIA RTX 4090", mints=["AAA", "BBB"], candles=FakeCandles(),
+        interval="1m", report_run_id=1,
+    )
+
+    assert result.ok is True
+    assert result.gpu_type == "NVIDIA RTX 4090"
+    assert result.price_per_hour == 0.79
+    assert result.cost_usd is not None and result.cost_usd >= 0
+    assert result.teardown_clean is True
+    # A self-exited pod's record can remain (stopped, not billing); its
+    # volume must actually be gone.
+    assert not transport.volumes
+    assert all(p["status"] != "RUNNING" for p in transport.pods.values())
+
+
+def test_benchmark_tier_still_tears_down_when_the_run_never_completes(client, transport):
+    """A pod that never self-terminates within the poll window must still be
+    force-stopped and its volume removed - the whole point of item 7's
+    'teardown on every tier including a failure mid-benchmark' requirement."""
+    transport.gpu_prices = {"NVIDIA RTX 4090": 0.79}
+    orig_create_pod = client.create_pod
+
+    def create_pod_never_stops(*a, **kw):
+        pod = orig_create_pod(*a, **kw)
+        transport.pod_polls_until_stopped[pod["id"]] = None
+        return pod
+
+    client.create_pod = create_pod_never_stops
+
+    result = client.benchmark_tier(
+        "NVIDIA RTX 4090", mints=["AAA"], candles=FakeCandles(), interval="1m", report_run_id=2,
+    )
+
+    assert result.ok is True   # the run itself launched and was waited on
+    assert result.teardown_clean is True   # force-stopped by the safety net
+    assert not transport.pods and not transport.volumes
+
+
+def test_benchmark_tier_reports_failure_and_still_tears_down_on_a_launch_error(client, transport, monkeypatch):
+    def broken_create_pod(*a, **kw):
+        raise RunPodError("simulated launch failure")
+
+    monkeypatch.setattr(client, "create_pod", broken_create_pod)
+
+    result = client.benchmark_tier(
+        "NVIDIA RTX 4090", mints=["AAA"], candles=FakeCandles(), interval="1m", report_run_id=3,
+    )
+
+    assert result.ok is False
+    assert "simulated launch failure" in result.error
+    assert result.cost_usd is None
+    # The volume was created before the pod launch failed - it must still be
+    # gone, even though there is no job dict for a pod that never existed.
+
+
+def test_benchmark_tiers_continues_past_a_failed_tier(client, transport, monkeypatch):
+    transport.gpu_prices = {"TIER-A": 1.0, "TIER-B": 2.0}
+    original_create_pod = client.create_pod
+    state = {"calls": 0}
+
+    def flaky_create_pod(*a, **kw):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            raise RunPodError("first tier fails to launch")
+        pod = original_create_pod(*a, **kw)
+        transport.pod_polls_until_stopped[pod["id"]] = 1
+        return pod
+
+    monkeypatch.setattr(client, "create_pod", flaky_create_pod)
+
+    results = client.benchmark_tiers(
+        ["TIER-A", "TIER-B"], mints=["AAA"], candles=FakeCandles(), interval="1m",
+    )
+
+    assert [r.gpu_type for r in results] == ["TIER-A", "TIER-B"]
+    assert results[0].ok is False
+    assert results[1].ok is True
+    assert results[1].price_per_hour == 2.0
+
+
+def test_benchmark_tier_uses_the_run_summary_lookup_when_given(client, transport):
+    transport.gpu_prices = {"NVIDIA RTX 4090": 0.79}
+    orig_create_pod = client.create_pod
+
+    def create_pod_and_arm(*a, **kw):
+        pod = orig_create_pod(*a, **kw)
+        transport.pod_polls_until_stopped[pod["id"]] = 1
+        return pod
+
+    client.create_pod = create_pod_and_arm
+
+    result = client.benchmark_tier(
+        "NVIDIA RTX 4090", mints=["AAA"], candles=FakeCandles(), interval="1m",
+        report_run_id=9, run_summary_lookup=lambda run_id: {"evaluated": 450},
+    )
+
+    assert result.combinations_evaluated == 450
+
+
+def test_cost_per_1000_combinations_is_none_without_both_numbers():
+    from solbot.runpod import BenchmarkResult
+
+    assert BenchmarkResult("t", ok=True, cost_usd=1.0).cost_per_1000_combinations is None
+    assert BenchmarkResult("t", ok=True, combinations_evaluated=10).cost_per_1000_combinations is None
+    assert BenchmarkResult(
+        "t", ok=True, cost_usd=2.0, combinations_evaluated=1000
+    ).cost_per_1000_combinations == pytest.approx(2.0)

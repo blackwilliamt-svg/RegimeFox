@@ -35,9 +35,62 @@ DEFAULT_IMAGE = "ghcr.io/example-org/solopt-worker:latest"
 MAX_POLL_SECONDS = 4 * 3600
 POLL_INTERVAL_SECONDS = 30
 
+# Candidate tiers for manage.py benchmark-runpod, in the price band this bot's
+# job size actually needs - the same "believed correct, verify against
+# RunPod's live catalog before trusting it" caveat as the module docstring
+# applies to these three names as much as to anything else here.
+DEFAULT_BENCHMARK_TIERS = ["NVIDIA RTX 4090", "NVIDIA RTX 3090", "NVIDIA RTX A5000"]
+# A representative slice, not the real monthly job - enough to compare
+# per-tier throughput without paying for (or waiting through) the genuine
+# multi-hour run on three GPUs just to benchmark them.
+BENCHMARK_MINT_LIMIT = 5
+BENCHMARK_MAX_EVALUATIONS = 100
+BENCHMARK_TIMEOUT_SECONDS = 20 * 60
+
 
 class RunPodError(RuntimeError):
     """RunPod refused a request or could not be reached."""
+
+
+@dataclass(slots=True)
+class BenchmarkResult:
+    """One GPU tier's showing in `manage.py benchmark-runpod` (gap-closure
+    item 7): wall-clock time and cost from RunPod's own billing API, not an
+    estimate - and, when the worker's run summary made it back, how many
+    combinations that time bought."""
+
+    gpu_type: str
+    ok: bool
+    elapsed_seconds: float = 0.0
+    price_per_hour: float | None = None
+    cost_usd: float | None = None
+    combinations_evaluated: int | None = None
+    teardown_clean: bool | None = None
+    error: str = ""
+
+    @property
+    def cost_per_1000_combinations(self) -> float | None:
+        """The number worth comparing tiers on - raw cost alone favours
+        whichever GPU is simply slowest to burn through the same money."""
+        if not self.cost_usd or not self.combinations_evaluated:
+            return None
+        return self.cost_usd / self.combinations_evaluated * 1000.0
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "gpu_type": self.gpu_type,
+            "ok": self.ok,
+            "elapsed_seconds": round(self.elapsed_seconds, 1),
+            "price_per_hour": self.price_per_hour,
+            "cost_usd": round(self.cost_usd, 4) if self.cost_usd is not None else None,
+            "combinations_evaluated": self.combinations_evaluated,
+            "cost_per_1000_combinations": (
+                round(self.cost_per_1000_combinations, 4)
+                if self.cost_per_1000_combinations is not None else None
+            ),
+            "teardown_clean": self.teardown_clean,
+            "error": self.error,
+        }
 
 
 class Transport(Protocol):
@@ -133,6 +186,41 @@ class RunPodClient:
                 s3.upload_file(str(path), bucket, path.name)
 
     # ------------------------------------------------------------------
+    # Pricing
+    # ------------------------------------------------------------------
+    def gpu_price_per_hour(self, gpu_type: str) -> float | None:
+        """This tier's current $/hr from RunPod's own catalog - never a
+        hardcoded guess, since GPU pricing moves and a stale number here
+        would silently mislead the cost comparison it exists to inform.
+
+        Returns None (rather than raising) when the tier can't be found or
+        the catalog can't be reached - the caller reports cost as unknown
+        rather than failing the whole benchmark over one lookup.
+        """
+        try:
+            data = self.transport.request("GET", "/gputypes")
+        except RunPodError:
+            return None
+        types = data if isinstance(data, list) else data.get("gpuTypes") or data.get("data") or []
+        for entry in types:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("id") or entry.get("displayName") or entry.get("name")
+            if name != gpu_type:
+                continue
+            price = (
+                entry.get("communityPrice")
+                or entry.get("securePrice")
+                or entry.get("lowestPrice")
+                or entry.get("pricePerHour")
+            )
+            try:
+                return float(price) if price is not None else None
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    # ------------------------------------------------------------------
     # Pods
     # ------------------------------------------------------------------
     def create_pod(
@@ -187,11 +275,15 @@ class RunPodClient:
         data_center_id: str = "US-CA-1",
         s3_access_key: str = "",
         s3_secret_key: str = "",
+        extra_env: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Ship one coin batch's data up and start its worker.
 
         Returns ``{"pod_id", "volume_id", "mints"}`` so the caller can poll
-        and, later, verify teardown.
+        and, later, verify teardown. `extra_env` layers on top of the
+        standard reporting env - benchmark_tier (gap-closure item 7) uses it
+        to cap the search to a small representative slice rather than a full
+        monthly-sized run.
         """
         import tempfile
 
@@ -222,6 +314,7 @@ class RunPodClient:
                 "SOLOPT_TOKEN": droplet_token,
                 "SOLOPT_REPORT_RUN_ID": str(report_run_id),
                 "SOLOPT_CONFIG": "/data/solopt.json",
+                **(extra_env or {}),
             },
         )
         return {"pod_id": pod["id"], "volume_id": volume_id, "mints": mints}
@@ -274,3 +367,127 @@ class RunPodClient:
             else f"pods still running: {still_running}; volumes still present: {still_volumed}"
         )
         return {"clean": clean, "detail": detail, "pods_checked": len(jobs)}
+
+    # ------------------------------------------------------------------
+    # GPU-tier benchmark (gap-closure item 7)
+    # ------------------------------------------------------------------
+    def benchmark_tier(
+        self,
+        gpu_type: str,
+        *,
+        mints: list[str],
+        candles: Any,
+        interval: str,
+        report_run_id: int,
+        droplet_url: str = "",
+        droplet_token: str = "",
+        data_center_id: str = "US-CA-1",
+        s3_access_key: str = "",
+        s3_secret_key: str = "",
+        max_seconds: float | None = None,
+        run_summary_lookup: Callable[[int], dict[str, Any] | None] | None = None,
+    ) -> BenchmarkResult:
+        """Run the fixed representative slice on one tier and report wall-
+        clock time, $/hr, and cost - never guessed, and never left running.
+
+        Every failure mode - launch, wait, teardown, pricing lookup - is
+        caught here rather than propagated, so one bad tier cannot abort the
+        rest of a multi-tier benchmark: teardown is always attempted in a
+        `finally`, even for a tier that failed to launch or never reported
+        back, and the tier is recorded with `ok=False` and its error rather
+        than raised.
+        """
+        started = time.monotonic()
+        job: dict[str, Any] | None = None
+        ok = False
+        error = ""
+        try:
+            job = self.launch_batch(
+                batch_index=0,
+                mints=mints[:BENCHMARK_MINT_LIMIT],
+                candles=candles,
+                interval=interval,
+                gpu_type=gpu_type,
+                report_run_id=report_run_id,
+                droplet_url=droplet_url,
+                droplet_token=droplet_token,
+                data_center_id=data_center_id,
+                s3_access_key=s3_access_key,
+                s3_secret_key=s3_secret_key,
+                extra_env={
+                    "SOLOPT_BENCHMARK": "1",
+                    "SOLOPT_MAX_EVALUATIONS": str(BENCHMARK_MAX_EVALUATIONS),
+                },
+            )
+            self.wait_for_completion([job], max_seconds=max_seconds)
+            ok = True
+        except Exception as exc:
+            log.warning("benchmark of tier %s failed: %s", gpu_type, exc)
+            error = str(exc)[:300]
+
+        elapsed = time.monotonic() - started
+
+        # Teardown is attempted regardless of whether the run above succeeded
+        # - a tier that failed mid-launch may still have left a pod or volume
+        # behind, and that is exactly the case this must not skip.
+        teardown_clean: bool | None = None
+        if job is not None:
+            try:
+                teardown_clean = bool(self.verify_teardown([job])["clean"])
+                if not teardown_clean:
+                    log.warning("benchmark tier %s did not tear down cleanly", gpu_type)
+            except Exception:
+                log.exception("teardown verification itself failed for tier %s", gpu_type)
+                teardown_clean = False
+
+        if not ok:
+            return BenchmarkResult(
+                gpu_type=gpu_type, ok=False, elapsed_seconds=elapsed,
+                teardown_clean=teardown_clean, error=error,
+            )
+
+        price = self.gpu_price_per_hour(gpu_type)
+        cost = price * elapsed / 3600.0 if price is not None else None
+
+        evaluated = None
+        if run_summary_lookup is not None:
+            try:
+                summary = run_summary_lookup(report_run_id)
+                if summary:
+                    evaluated = summary.get("evaluated") or summary.get("candidates_considered")
+            except Exception:
+                log.debug("run summary lookup failed for tier %s", gpu_type, exc_info=True)
+
+        return BenchmarkResult(
+            gpu_type=gpu_type, ok=True, elapsed_seconds=elapsed,
+            price_per_hour=price, cost_usd=cost, combinations_evaluated=evaluated,
+            teardown_clean=teardown_clean,
+        )
+
+    def benchmark_tiers(
+        self,
+        tiers: list[str] | None = None,
+        *,
+        mints: list[str],
+        candles: Any,
+        interval: str,
+        report_run_id_start: int = 1,
+        **kwargs: Any,
+    ) -> list[BenchmarkResult]:
+        """Benchmark each tier in turn, one at a time - concurrent tiers
+        would confound wall-clock time with however this droplet's own
+        upload bandwidth happened to be shared between them.
+        """
+        tiers = tiers or DEFAULT_BENCHMARK_TIERS
+        results = []
+        for i, gpu_type in enumerate(tiers):
+            result = self.benchmark_tier(
+                gpu_type,
+                mints=mints,
+                candles=candles,
+                interval=interval,
+                report_run_id=report_run_id_start + i,
+                **kwargs,
+            )
+            results.append(result)
+        return results

@@ -50,6 +50,49 @@
     <span class="hint" id="bulkTokenStatus"></span>
   </div>
   <p class="mono" id="bulkTokenValue" style="word-break:break-all;margin-top:8px"></p>
+
+  <hr style="border:none;border-top:1px solid var(--border);margin:16px 0">
+  <h2 style="font-size:14px">RunPod GPU-tier benchmark</h2>
+  <p class="hint" style="margin-top:0">
+    Launches real, billed pods on 2-3 GPU tiers, runs a small representative walk-forward
+    slice on each, and reports wall-clock time and cost from RunPod's own billing API — not
+    an estimate. This never changes <code>runpod_gpu_type</code> automatically; confirm a
+    recommendation yourself once you've seen the numbers.
+  </p>
+  <form method="post" action="{{ url_for('dashboard.benchmark_runpod') }}">
+    <button class="btn-ghost">Run benchmark now</button>
+  </form>
+  {% if runpod_benchmark and runpod_benchmark.get('results') %}
+  <div class="table-scroll" style="margin-top:12px">
+    <table>
+      <thead>
+        <tr><th>Tier</th><th class="num">Time</th><th class="num">Cost</th>
+          <th class="num">$/1000 combos</th><th>Teardown</th></tr>
+      </thead>
+      <tbody>
+        {% for r in runpod_benchmark['results'] %}
+        <tr>
+          <td>{{ r.gpu_type }}{% if not r.ok %} <span class="neg">failed</span>{% endif %}</td>
+          <td class="num">{{ '%.0f'|format(r.elapsed_seconds) }}s</td>
+          <td class="num">{{ '$%.4f'|format(r.cost_usd) if r.cost_usd is not none else '—' }}</td>
+          <td class="num">{{ '$%.4f'|format(r.cost_per_1000_combinations) if r.cost_per_1000_combinations is not none else '—' }}</td>
+          <td>
+            {% if r.teardown_clean == true %}clean
+            {% elif r.teardown_clean == false %}<span class="neg">NOT CLEAN</span>
+            {% else %}—{% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if runpod_benchmark.get('recommendation') %}
+  <p class="hint" style="margin-top:8px">
+    <strong>Recommendation:</strong> {{ runpod_benchmark['recommendation'] }} —
+    update <code>runpod_gpu_type</code> below yourself if you agree.
+  </p>
+  {% endif %}
+  {% endif %}
 </div>
 
 <form method="post" action="{{ url_for('dashboard.save_settings') }}">

@@ -200,3 +200,108 @@ def test_run_monthly_launches_a_batch_per_chunk_and_verifies_teardown(workspace,
 
     events = conn.execute("SELECT message FROM events ORDER BY id").fetchall()
     assert any("teardown check" in e["message"].lower() for e in events)
+
+
+# --------------------------------------------------------------------------
+# GPU-tier benchmark (gap-closure item 7)
+# --------------------------------------------------------------------------
+def test_run_benchmark_requires_a_runpod_api_key(workspace, settings):
+    store = DataStore(binance=None, cfg=settings)
+
+    class NoKey:
+        runpod_api_key = ""
+
+    result = wfmc.run_benchmark(settings, store, NoKey(), conn=workspace["conn"])
+    assert not result["ran"]
+    assert "RUNPOD_API_KEY" in result["reason"]
+
+
+def test_run_benchmark_requires_a_routed_universe(workspace, settings):
+    store = DataStore(binance=None, cfg=settings)
+    result = wfmc.run_benchmark(settings, store, _Secrets(), conn=workspace["conn"])
+    assert not result["ran"]
+    assert "universe" in result["reason"]
+
+
+def test_run_benchmark_reports_and_stores_results_without_touching_runpod_gpu_type(
+    workspace, settings
+):
+    from tests.test_runpod import FakeTransport
+
+    conn = workspace["conn"]
+    _seed_universe(conn, {MINT_A: "AAAUSDT"})
+    _seed_minutes(MINT_A, days=1)
+
+    transport = FakeTransport()
+    transport.gpu_prices = {"TIER-CHEAP": 0.3, "TIER-PRICEY": 1.2}
+    orig_create_pod = None
+
+    client = RunPodClient(
+        api_key="test-key", transport=transport,
+        poll_interval_seconds=0.01, max_poll_seconds=0.05,
+    )
+    orig_create_pod = client.create_pod
+
+    def create_pod_and_arm(*a, **kw):
+        pod = orig_create_pod(*a, **kw)
+        transport.pod_polls_until_stopped[pod["id"]] = 1
+        return pod
+
+    client.create_pod = create_pod_and_arm
+    store = DataStore(binance=None, cfg=settings)
+
+    original_gpu_type = settings["runpod_gpu_type"]
+    result = wfmc.run_benchmark(
+        settings, store, _Secrets(), conn=conn, runpod_client=client,
+        tiers=["TIER-CHEAP", "TIER-PRICEY"], max_seconds=0.05,
+    )
+
+    assert result["ran"]
+    assert len(result["results"]) == 2
+    assert all(r["ok"] for r in result["results"])
+    assert result["recommendation"]   # a recommendation string, not applied
+
+    # Never touches the live setting - only surfaces a recommendation.
+    assert settings["runpod_gpu_type"] == original_gpu_type
+
+    stored = db.kv_get(wfmc.RUNPOD_BENCHMARK_KEY, conn=conn)
+    assert stored["results"][0]["gpu_type"] == "TIER-CHEAP"
+    assert stored["recommendation"]
+
+    events = conn.execute("SELECT message, level FROM events ORDER BY id").fetchall()
+    assert any("benchmark finished" in e["message"].lower() for e in events)
+
+
+def test_run_benchmark_flags_a_tier_that_failed_to_tear_down_cleanly(workspace, settings):
+    from tests.test_runpod import FakeTransport, RunPodError
+
+    conn = workspace["conn"]
+    _seed_universe(conn, {MINT_A: "AAAUSDT"})
+    _seed_minutes(MINT_A, days=1)
+
+    transport = FakeTransport()
+    transport.gpu_prices = {"TIER-A": 0.5}
+    client = RunPodClient(
+        api_key="test-key", transport=transport,
+        poll_interval_seconds=0.01, max_poll_seconds=0.02,
+    )
+    store = DataStore(binance=None, cfg=settings)
+
+    def fail_delete(volume_id: str) -> None:
+        raise RunPodError("simulated failure")
+
+    client.delete_network_volume = fail_delete
+
+    result = wfmc.run_benchmark(
+        settings, store, _Secrets(), conn=conn, runpod_client=client, tiers=["TIER-A"],
+        max_seconds=0.05,
+    )
+
+    assert result["ran"]
+    assert result["results"][0]["teardown_clean"] is False
+
+    events = conn.execute("SELECT message, level FROM events ORDER BY id").fetchall()
+    assert any(
+        "not cleanly torn down" in e["message"].lower() and e["level"] == "alert"
+        for e in events
+    )

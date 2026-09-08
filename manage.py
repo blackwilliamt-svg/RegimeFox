@@ -13,6 +13,7 @@
     python manage.py status
     python manage.py check-apis
     python manage.py check-deploy     (warns if config.json/db are missing)
+    python manage.py benchmark-runpod (compares GPU tiers, launches real pods)
     python manage.py go-live          (guarded checklist)
 """
 from __future__ import annotations
@@ -309,6 +310,46 @@ def cmd_check_apis(_args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+def cmd_benchmark_runpod(args: argparse.Namespace) -> int:
+    """Benchmark 2-3 GPU tiers on a small representative slice (gap-closure
+    item 7) and report cost-per-run for each - the dashboard's RunPod
+    settings panel has the same button, backed by the same function."""
+    from solbot.wfmc import run_benchmark
+
+    cfg = get_config()
+    db.init_db()
+    clients = build_clients(cfg)
+    store = DataStore(clients.binance, cfg.as_dict())
+    tiers = args.tiers.split(",") if args.tiers else None
+
+    print("Benchmarking RunPod GPU tiers - this launches real (billed) pods and can take a while.")
+    result = run_benchmark(cfg.as_dict(), store, cfg.secrets, tiers=tiers)
+    clients.close()
+
+    if not result.get("ran"):
+        print(f"  did not run: {result.get('reason')}")
+        return 1
+
+    print()
+    for r in result["results"]:
+        status = "ok" if r["ok"] else f"FAILED: {r['error']}"
+        cost = f"${r['cost_usd']:.4f}" if r["cost_usd"] is not None else "cost unknown"
+        per1k = (
+            f", ${r['cost_per_1000_combinations']:.4f}/1000 combos"
+            if r["cost_per_1000_combinations"] is not None else ""
+        )
+        teardown = "clean" if r["teardown_clean"] else "NOT CLEAN" if r["teardown_clean"] is False else "unknown"
+        print(f"  [{status}] {r['gpu_type']}: {r['elapsed_seconds']:.0f}s, {cost}{per1k}, teardown {teardown}")
+
+    if result.get("recommendation"):
+        print(f"\n  Recommendation: {result['recommendation']}")
+        print(
+            "  This does NOT change runpod_gpu_type automatically - update it "
+            "from the settings page if you agree with it."
+        )
+    return 0
+
+
 def cmd_go_live(args: argparse.Namespace) -> int:
     """Switch to live trading, but only after the checklist actually passes."""
     from solbot.web.auth import user_count
@@ -429,6 +470,16 @@ def main() -> int:
         "check-deploy",
         help="warn if config.json/the database are missing (systemd bind-mount bug)",
     ).set_defaults(fn=cmd_check_deploy)
+
+    p = sub.add_parser(
+        "benchmark-runpod",
+        help="benchmark 2-3 GPU tiers and report cost-per-run (launches real, billed pods)",
+    )
+    p.add_argument(
+        "--tiers", default=None,
+        help="comma-separated GPU tier names to test (default: a built-in shortlist)",
+    )
+    p.set_defaults(fn=cmd_benchmark_runpod)
 
     p = sub.add_parser("go-live", help="switch to live trading after the checklist")
     p.add_argument("--force", action="store_true")

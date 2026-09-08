@@ -105,6 +105,8 @@ def walkforward():
 
 @bp.route("/settings")
 def settings():
+    from ..wfmc import RUNPOD_BENCHMARK_KEY
+
     config = cfg()
     return render_template(
         "settings.html",
@@ -114,6 +116,7 @@ def settings():
         audit=db.connect()
         .execute("SELECT * FROM settings_audit ORDER BY id DESC LIMIT 40")
         .fetchall(),
+        runpod_benchmark=db.kv_get(RUNPOD_BENCHMARK_KEY, {}),
     )
 
 
@@ -235,6 +238,20 @@ def run_wfmc(kind: str):
         "success",
     )
     return redirect(url_for("dashboard.walkforward"))
+
+
+@bp.route("/settings/benchmark-runpod", methods=["POST"])
+def benchmark_runpod():
+    """gap-closure item 7: launches real, billed RunPod pods on 2-3 GPU
+    tiers to compare cost-per-run. Never changes runpod_gpu_type itself -
+    only records a recommendation for the operator to confirm."""
+    _enqueue("run_runpod_benchmark")
+    flash(
+        "RunPod GPU-tier benchmark queued - this launches real, billed pods "
+        "and can take a few minutes. Results will appear below once done.",
+        "success",
+    )
+    return redirect(url_for("dashboard.settings"))
 
 
 @bp.route("/backtest/pull", methods=["POST"])

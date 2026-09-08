@@ -866,6 +866,13 @@ class Engine:
             ).start()
             return "monthly RunPod retest started"
 
+        if command == "run_runpod_benchmark":
+            threading.Thread(
+                target=lambda: wfmc.run_benchmark(self.cfg, self.store, self.config.secrets),
+                name="runpod-benchmark-manual", daemon=True,
+            ).start()
+            return "RunPod GPU-tier benchmark started"
+
         return f"unknown command: {command}"
 
     def _manual_close(self, position_id: int, who: str, conn: sqlite3.Connection) -> str:
