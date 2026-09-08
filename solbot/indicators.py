@@ -103,6 +103,17 @@ def volume_ratio(df: pd.DataFrame, lookback: int = 20) -> pd.Series:
     return df["volume"] / avg.replace(0.0, np.nan)
 
 
+def volume_zscore(df: pd.DataFrame, period: int = 20) -> pd.Series:
+    """Rolling z-score of volume against its own trailing mean/std - one of
+    the fuzzy-regime section's three per-bar discovery features (trend
+    strength, volatility, volume behaviour)."""
+    period = max(2, int(period))
+    window = df["volume"].rolling(period, min_periods=period)
+    mean = window.mean()
+    std = window.std(ddof=0)
+    return (df["volume"] - mean) / std.replace(0.0, np.nan)
+
+
 def momentum_pct(df: pd.DataFrame, bars: int) -> pd.Series:
     bars = max(1, int(bars))
     base = df["close"].shift(bars)

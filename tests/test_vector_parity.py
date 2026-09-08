@@ -235,6 +235,13 @@ def test_adx_matches_pandas(series, period):
 
 
 @pytest.mark.parametrize("period", [10, 20])
+def test_volume_zscore_matches_pandas(series, period):
+    expected = scalar.volume_zscore(series, period)
+    got = vector.volume_zscore_stack(_block(series, "volume"), [period])[0]
+    assert_matches(got, expected, f"volume_zscore{period}")
+
+
+@pytest.mark.parametrize("period", [10, 20])
 def test_vwap_matches_pandas(series, period):
     expected = scalar.vwap(series, period)
     got = vector.vwap_stack(

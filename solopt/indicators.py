@@ -332,6 +332,33 @@ def bollinger_stack(
     return mean_out, std_out
 
 
+def volume_zscore_stack(volume: np.ndarray, periods: Sequence[int]) -> np.ndarray:
+    """``[len(periods), symbols, bars]`` rolling z-score of volume against its
+    own trailing mean/std - one of the fuzzy-regime section's three discovery
+    features (trend/volatility/volume behaviour), via the same prefix-sum
+    mean/std pattern bollinger_stack already uses."""
+    volume = np.asarray(volume, dtype=np.float64)
+    n_symbols, n_bars = volume.shape
+    cum = _prefix_sum(volume)
+    cum2 = _prefix_sum(volume * volume)
+    idx = np.arange(n_bars, dtype=np.int64)
+
+    out = np.full((len(periods), n_symbols, n_bars), NAN, dtype=np.float32)
+    for i, raw in enumerate(periods):
+        p = max(2, int(raw))
+        lo_c = np.maximum(idx - p, -1) + 1
+        enough = idx >= p - 1
+        total = cum[:, idx + 1] - cum[:, lo_c]
+        total2 = cum2[:, idx + 1] - cum2[:, lo_c]
+        mean = total / p
+        var = np.maximum(total2 / p - mean * mean, 0.0)
+        std = np.sqrt(var)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            z = (volume - mean) / np.where(std == 0.0, np.nan, std)
+        out[i] = np.where(enough[None, :], z, np.nan).astype(np.float32)
+    return out
+
+
 def stochastic_k_stack(
     high: np.ndarray, low: np.ndarray, close: np.ndarray, k_periods: Sequence[int]
 ) -> np.ndarray:
