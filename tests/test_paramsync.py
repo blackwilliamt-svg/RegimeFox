@@ -364,3 +364,87 @@ def test_bootstrap_confidence_separates_a_real_edge_from_noise():
 
 def test_bootstrap_needs_a_sample_before_it_will_say_anything():
     assert paramsync.bootstrap_confidence([1.0, 2.0], [0.0, 0.0]) == 0.0
+
+
+# --------------------------------------------------------------------------
+# regime-scoped promoted sets (gap-closure item 5)
+# --------------------------------------------------------------------------
+class _FakeLibraryStore:
+    """Stands in for solopt.store.RunStore's regime lookup, so this can be
+    tested without a real wfmc.db on disk."""
+
+    def __init__(self, entries: dict[str, list[dict]] | None = None) -> None:
+        self.entries = entries or {}
+        self.calls: list[tuple[str, float]] = []
+
+    def nearest_regime_entries(self, symbol, target, *, n=1):
+        self.calls.append((symbol, target))
+        rows = sorted(
+            self.entries.get(symbol, []),
+            key=lambda e: abs(e["symbol_regime_score"] - target),
+        )
+        return rows[:n]
+
+
+def _regime_entry(fingerprint, score, **params):
+    return {"fingerprint": fingerprint, "symbol_regime_score": score, "params": params}
+
+
+def test_selects_the_nearest_regime_entry_and_merges_its_params(settings):
+    store = _FakeLibraryStore({"AAA": [
+        _regime_entry("far", 0.9, volume_spike_multiple=9.0),
+        _regime_entry("near", 0.42, volume_spike_multiple=3.5),
+    ]})
+    result = paramsync.select_regime_scoped_params(settings, "AAA", 0.40, store=store)
+
+    assert result.applied is True
+    assert result.fingerprint == "near"
+    assert result.params["volume_spike_multiple"] == 3.5
+    # everything else from the global config passes through untouched
+    assert result.params["rr_min"] == settings["rr_min"]
+
+
+def test_falls_back_when_the_nearest_entry_is_too_far(settings):
+    store = _FakeLibraryStore({"AAA": [_regime_entry("far", 0.95, volume_spike_multiple=9.0)]})
+    result = paramsync.select_regime_scoped_params(
+        {**settings, "regime_scoped_max_distance": 0.1}, "AAA", 0.40, store=store
+    )
+
+    assert result.applied is False
+    assert result.params is settings or result.params.get("volume_spike_multiple") == settings["volume_spike_multiple"]
+    assert "beyond" in result.reason
+
+
+def test_falls_back_when_the_symbol_has_no_library_entries(settings):
+    store = _FakeLibraryStore({})
+    result = paramsync.select_regime_scoped_params(settings, "ZZZ", 0.40, store=store)
+
+    assert result.applied is False
+    assert result.params == settings
+
+
+def test_falls_back_when_disabled(settings):
+    store = _FakeLibraryStore({"AAA": [_regime_entry("near", 0.40, volume_spike_multiple=3.5)]})
+    cfg = {**settings, "regime_scoped_promotion_enabled": False}
+    result = paramsync.select_regime_scoped_params(cfg, "AAA", 0.40, store=store)
+
+    assert result.applied is False
+    assert store.calls == []   # never even queries the library when disabled
+
+
+def test_falls_back_when_the_current_regime_score_is_unavailable(settings):
+    store = _FakeLibraryStore({"AAA": [_regime_entry("near", 0.40, volume_spike_multiple=3.5)]})
+    result = paramsync.select_regime_scoped_params(settings, "AAA", None, store=store)
+
+    assert result.applied is False
+    assert result.reason == "regime score unavailable"
+
+
+def test_a_library_lookup_failure_falls_back_rather_than_raising(settings):
+    class BrokenStore:
+        def nearest_regime_entries(self, *a, **kw):
+            raise RuntimeError("disk full")
+
+    result = paramsync.select_regime_scoped_params(settings, "AAA", 0.4, store=BrokenStore())
+    assert result.applied is False
+    assert result.params == settings

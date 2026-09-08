@@ -108,6 +108,15 @@ DEFAULTS: dict[str, Any] = {
     # is where the overtrading in the earlier backtest came from.
     "regime_allowed": 3,
     "regime_gate_enabled": True,
+    # Regime-scoped promoted sets (gap-closure item 5): besides the single
+    # global live/shadow config, a symbol with its own validated per-regime
+    # library entries can trade *those* instead for a new entry, chosen by
+    # nearest-neighbour match in continuous regime-score space - never a
+    # hard bucket boundary. Distance is |current efficiency ratio - the
+    # entry's own|, both 0-1, so 0.15 is "close enough to trust", not an
+    # arbitrary-feeling number on some other scale.
+    "regime_scoped_promotion_enabled": True,
+    "regime_scoped_max_distance": 0.15,
 
     # --- multi-timeframe confluence (spec 4.2) ----------------------------
     # Aggregate timeframes as multiples of the base candle. At the 10-minute
@@ -342,6 +351,7 @@ SPEC: dict[str, Bound] = {
     "regime_trend_er": (float, 0.05, 0.95),
     "regime_chop_atr_pct": (float, 0.001, 0.50),
     "regime_allowed": (int, 1, 7),
+    "regime_scoped_max_distance": (float, 0.01, 1.0),
     "confluence_required": (int, 0, 4),
     "indicator_mask": (int, 0, 511),
     "indicator_min_agree": (int, 0, 9),
@@ -422,6 +432,7 @@ ENUMS: dict[str, set[str]] = {
 BOOLS = {
     "congestion_check_enabled",
     "mev_protection_enabled",
+    "regime_scoped_promotion_enabled",
     "rugcheck_enabled",
     "rugcheck_require_mint_revoked",
     "rugcheck_require_freeze_revoked",

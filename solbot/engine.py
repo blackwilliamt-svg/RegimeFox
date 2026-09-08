@@ -52,6 +52,14 @@ SHADOW_KEY = "shadow_overrides"
 LAST_BACKTEST_KEY = "last_backtest_day"
 
 
+class _EmptyLibraryStore:
+    """Regime-scoped selection's fallback when the local WFMC store can't be
+    opened - always reports no entries, never raises."""
+
+    def nearest_regime_entries(self, *_args: Any, **_kwargs: Any) -> list[dict[str, Any]]:
+        return []
+
+
 @dataclass
 class InstanceRunner:
     """One trading instance: its portfolio, its executor, its settings overrides."""
@@ -91,6 +99,11 @@ class Engine:
         self._last_prune = 0.0
         self._last_budget_warning = 0.0
         self._candle_cache: dict[str, tuple[int, pd.DataFrame]] = {}
+        # (instance, mint) -> the regime-scoped fingerprint currently in
+        # effect for new entries, or None - tracked only so a change of
+        # choice logs once rather than every cycle it stays the same.
+        self._regime_selection: dict[tuple[str, str], str | None] = {}
+        self._library_store: Any = None  # lazily opened once, not per entry check
         self._backtest_hook = None  # set by run_worker so a daily run can fire
         # Off by default so constructing an Engine for a test or a script never
         # spawns a real WFMC run purely because the wall clock happens to match
@@ -364,9 +377,17 @@ class Engine:
             if not sizing.ok:
                 continue
 
+            # Regime-scoped promoted sets (gap-closure item 5): a symbol with
+            # its own validated per-regime library entries trades *those* for
+            # this one new-entry decision when the current regime is a close
+            # enough match - never for sizing/risk/correlation above, and
+            # never retroactively for a position already open (those keep
+            # whatever stop/target their own entry fixed).
+            entry_cfg = self._regime_scoped_cfg(inst, mint, token.symbol or mint, cfg, df, conn)
+
             signal = evaluate_entry(
                 df,
-                cfg,
+                entry_cfg,
                 mint=mint,
                 liquidity_usd=token.liquidity,
                 intended_size_usd=sizing.size_usd,
@@ -502,6 +523,72 @@ class Engine:
             risk.correlation_gate(candidate, held_closes, cfg) if held_closes else None
         )
         return book, gate
+
+    def _get_library_store(self) -> Any:
+        """The local WFMC library store, opened once and reused - a fresh
+        sqlite3 connection per entry candidate would be needless overhead in
+        a loop that already runs on one shared vCPU. If it can't be opened
+        (not yet on disk on a fresh install, or genuinely unopenable), an
+        always-empty stand-in is cached instead, so a failure is diagnosed
+        once rather than retried every cycle."""
+        if self._library_store is None:
+            try:
+                from .wfmc import DAILY_STORE_PATH
+                from solopt.store import RunStore
+
+                self._library_store = RunStore(DAILY_STORE_PATH)
+            except Exception:
+                self._library_store = _EmptyLibraryStore()
+        return self._library_store
+
+    def _regime_scoped_cfg(
+        self,
+        inst: "InstanceRunner",
+        mint: str,
+        symbol: str,
+        cfg: dict[str, Any],
+        df: pd.DataFrame,
+        conn: sqlite3.Connection,
+    ) -> dict[str, Any]:
+        """This one entry decision's effective config (gap-closure item 5).
+
+        Falls back to `cfg` unchanged whenever no regime-scoped set qualifies
+        - see paramsync.select_regime_scoped_params for the distance gate.
+        Logs a plain-language event only when the *choice itself* changes for
+        this mint (not on every cycle it stays the same), so the feed shows
+        switches rather than repeating itself every poll.
+        """
+        snap = snapshot_at(df, -1)
+        current_regime = snap.efficiency if snap is not None else None
+        selection = paramsync.select_regime_scoped_params(
+            cfg, symbol, current_regime, store=self._get_library_store()
+        )
+
+        key = (inst.name, mint)
+        previous = self._regime_selection.get(key)
+        chosen = selection.fingerprint if selection.applied else None
+        if chosen != previous:
+            self._regime_selection[key] = chosen
+            if selection.applied:
+                db.log_event(
+                    f"{symbol}: switched to a regime-scoped parameter set "
+                    f"({selection.reason}) for new entries.",
+                    category="system",
+                    instance=inst.name,
+                    mint=mint,
+                    detail={"fingerprint": selection.fingerprint, "distance": selection.distance},
+                    conn=conn,
+                )
+            elif previous is not None:
+                db.log_event(
+                    f"{symbol}: reverted to the global parameter set for new entries "
+                    f"({selection.reason}).",
+                    category="system",
+                    instance=inst.name,
+                    mint=mint,
+                    conn=conn,
+                )
+        return selection.params
 
     # ------------------------------------------------------------------
     # The entry review gate

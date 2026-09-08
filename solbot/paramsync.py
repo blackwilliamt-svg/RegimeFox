@@ -531,3 +531,80 @@ def status(conn: sqlite3.Connection | None = None) -> dict[str, Any]:
         "promotions": [dict(r) for r in promotions],
         "shadow_overrides": db.kv_get(SHADOW_KEY, {}, conn) or {},
     }
+
+
+# --------------------------------------------------------------------------
+# Regime-scoped promoted sets (gap-closure item 5)
+#
+# Not a third promotion tier alongside shadow/live - it reads the same
+# persistent library gap-closure item 4 already writes to (every entry there
+# already cleared the walk-forward/Monte Carlo/stress gates at insert time,
+# so there is no separate acceptance step to invent here) and picks, per
+# symbol per entry decision, whichever of that symbol's own validated
+# combinations is the nearest continuous regime match - never a hard bucket
+# boundary. It never touches config.json and never replaces the single
+# global live/shadow set; it only ever widens or narrows the parameters one
+# *new* entry is evaluated against. An open position's stop/target/trailing
+# levels were fixed at its own entry and this has no path back to them.
+# --------------------------------------------------------------------------
+@dataclass(slots=True)
+class RegimeSelection:
+    """What (if anything) regime-scoped selection chose for one entry
+    decision, and why - the detail an event log / explainability panel
+    needs, not just the merged params themselves."""
+
+    applied: bool
+    params: dict[str, Any]
+    fingerprint: str | None = None
+    distance: float | None = None
+    reason: str = ""
+
+
+def select_regime_scoped_params(
+    cfg: dict[str, Any],
+    symbol: str,
+    current_regime_score: float | None,
+    *,
+    store: Any = None,
+) -> RegimeSelection:
+    """The effective params one entry decision for `symbol` should use.
+
+    Falls back to `cfg` unchanged - `RegimeSelection(applied=False, params=cfg)`
+    - whenever: the feature is off, this symbol has no library entries yet,
+    or the nearest one is farther than `regime_scoped_max_distance` away.
+    Never raises - a library lookup failing is a reason to trade the global
+    set, not a reason to skip the cycle.
+    """
+    if not cfg.get("regime_scoped_promotion_enabled", True):
+        return RegimeSelection(False, cfg, reason="disabled")
+    if current_regime_score is None or not np.isfinite(current_regime_score):
+        return RegimeSelection(False, cfg, reason="regime score unavailable")
+
+    try:
+        if store is None:
+            from .wfmc import DAILY_STORE_PATH
+            from solopt.store import RunStore
+
+            store = RunStore(DAILY_STORE_PATH)
+        nearest = store.nearest_regime_entries(symbol, float(current_regime_score), n=1)
+    except Exception:
+        log.debug("regime-scoped library lookup failed for %s", symbol, exc_info=True)
+        return RegimeSelection(False, cfg, reason="library unavailable")
+
+    if not nearest:
+        return RegimeSelection(False, cfg, reason="no library entry for this symbol yet")
+
+    entry = nearest[0]
+    distance = abs(float(entry["symbol_regime_score"]) - float(current_regime_score))
+    max_distance = float(cfg.get("regime_scoped_max_distance", 0.15))
+    if distance > max_distance:
+        return RegimeSelection(
+            False, cfg, distance=distance,
+            reason=f"nearest match {distance:.3f} away, beyond {max_distance:.3f}",
+        )
+
+    merged = {**cfg, **entry.get("params", {})}
+    return RegimeSelection(
+        True, merged, fingerprint=entry["fingerprint"], distance=distance,
+        reason=f"regime match within {distance:.3f}",
+    )
