@@ -4,9 +4,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from solbot.clients import Clients, PriceInfo, TokenInfo
+from solbot.clients import BinanceAsset, Clients, PriceInfo, TokenInfo
 from solbot.clients.rugcheck import RugReport
-from solbot.ratelimit import MonthlyBudget, TokenBucket
+from solbot.ratelimit import TokenBucket
 
 
 class FakeJupiter:
@@ -35,6 +35,11 @@ class FakeJupiter:
         self.calls += 1
         return list(self._tokens)
 
+    def search(self, query: str, *, priority: str = "low") -> list[TokenInfo]:
+        self.calls += 1
+        q = query.strip().upper()
+        return [t for t in self._tokens if q in t.symbol.strip().upper()]
+
     def order(self, *a: Any, **kw: Any):
         raise NotImplementedError
 
@@ -43,6 +48,45 @@ class FakeJupiter:
 
     def set_api_key(self, key: str) -> None:
         pass
+
+
+class FakeBinance:
+    """Stands in for Binance.US's top-coin ranking and candle history (spec 2/3)."""
+
+    def __init__(
+        self,
+        assets: list[BinanceAsset] | None = None,
+        *,
+        klines_fn: Any = None,
+    ) -> None:
+        self._assets = list(assets or [])
+        # (pair, since, until) -> list[Candle]; default is "nothing on record",
+        # which is what most callers of this fake actually want.
+        self._klines_fn = klines_fn or (lambda pair, since, until: [])
+        self.calls = 0
+        self.klines_calls: list[tuple[str, int, int]] = []
+
+    def top_bases(self, limit: int = 100) -> list[BinanceAsset]:
+        self.calls += 1
+        ranked = sorted(self._assets, key=lambda a: a.quote_volume_24h, reverse=True)
+        return ranked[: max(0, int(limit))]
+
+    def klines_range(self, pair: str, *, since: int, until: int):
+        self.calls += 1
+        self.klines_calls.append((pair, since, until))
+        return self._klines_fn(pair, since, until)
+
+    def close(self) -> None:
+        pass
+
+    def ping(self) -> bool:
+        return True
+
+
+def binance_asset(symbol: str, volume_24h: float = 1_000_000.0, **kw: Any) -> BinanceAsset:
+    return BinanceAsset(
+        symbol=symbol, quote_volume_24h=volume_24h, pair=f"{symbol}USDT", **kw
+    )
 
 
 class FakeRugCheck:
@@ -107,27 +151,11 @@ class FakeRpc:
         pass
 
 
-class FakeBirdeye:
-    def __init__(self) -> None:
-        self.budget = MonthlyBudget(0)
-
-    def ohlcv_range(self, *a: Any, **kw: Any):
-        return []
-
-    def calls_needed(self, interval: str, days: int) -> int:
-        return 1
-
-    def close(self) -> None:
-        pass
-
-    def set_api_key(self, key: str) -> None:
-        pass
-
-
 def fake_clients(
     *,
     prices: dict[str, float] | None = None,
     tokens: list[TokenInfo] | None = None,
+    binance_assets: list[BinanceAsset] | None = None,
     clean_safety: bool = True,
     sol: float = 1.0,
     wallet_tokens: dict[str, float] | None = None,
@@ -135,14 +163,13 @@ def fake_clients(
     bucket = lambda name: TokenBucket(1000.0, 100, reserve=0.0, name=name)
     return Clients(
         jupiter=FakeJupiter(prices, tokens),
-        birdeye=FakeBirdeye(),
         rugcheck=FakeRugCheck(clean_safety),
         rpc=FakeRpc(sol, wallet_tokens),
+        binance=FakeBinance(binance_assets),
         jupiter_bucket=bucket("jupiter"),
-        birdeye_bucket=bucket("birdeye"),
         rugcheck_bucket=bucket("rugcheck"),
         rpc_bucket=bucket("rpc"),
-        birdeye_budget=MonthlyBudget(0),
+        binance_bucket=bucket("binance"),
     )
 
 

@@ -14,7 +14,7 @@ from solbot.engine import Engine
 from solbot.execution import PaperExecutor
 from solbot.universe import UniverseBuilder
 
-from fakes import fake_clients, token
+from fakes import binance_asset, fake_clients, token
 from test_backtest_and_exports import seed_candles
 
 MINT = "SmokeTokenMintAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
@@ -26,6 +26,7 @@ def engine(workspace, monkeypatch):
     clients = fake_clients(
         prices={MINT: 1.0},
         tokens=[token(MINT, "SMOKE", liquidity=800_000.0, volume_24h=2_000_000.0)],
+        binance_assets=[binance_asset("SMOKE")],
     )
     eng = Engine(cfg, clients)
     eng.build_instances()
@@ -36,34 +37,58 @@ def engine(workspace, monkeypatch):
 # universe
 # --------------------------------------------------------------------------
 def test_universe_applies_the_floors(workspace, settings):
-    clients = fake_clients(tokens=[
-        token("GoodMint" + "A" * 36, "GOOD", liquidity=200_000.0, volume_24h=500_000.0),
-        token("ThinMint" + "A" * 36, "THIN", liquidity=1_000.0, volume_24h=500_000.0),
-        token("QuietMint" + "A" * 35, "QUIET", liquidity=200_000.0, volume_24h=1_000.0),
-    ])
-    builder = UniverseBuilder(clients.jupiter, settings)
+    clients = fake_clients(
+        tokens=[
+            token("GoodMint" + "A" * 36, "GOOD", liquidity=200_000.0, volume_24h=500_000.0),
+            token("ThinMint" + "A" * 36, "THIN", liquidity=1_000.0, volume_24h=500_000.0),
+            token("QuietMint" + "A" * 35, "QUIET", liquidity=200_000.0, volume_24h=1_000.0),
+        ],
+        binance_assets=[
+            binance_asset("GOOD"), binance_asset("THIN"), binance_asset("QUIET"),
+        ],
+    )
+    builder = UniverseBuilder(clients.binance, clients.jupiter, settings)
     stats = builder.refresh(conn=workspace["conn"])
 
+    assert stats.considered == 3
+    assert stats.routable == 3
     assert stats.passed == 1
     assert stats.rejected_liquidity == 1
     assert stats.rejected_volume == 1
     assert "GOOD" in [t.symbol for t in builder.tokens.values()]
 
 
+def test_universe_drops_a_binance_coin_with_no_solana_route(workspace, settings):
+    clients = fake_clients(
+        tokens=[token("M" + "A" * 43, "OK", liquidity=200_000.0, volume_24h=500_000.0)],
+        binance_assets=[binance_asset("OK"), binance_asset("NOWHERE")],
+    )
+    builder = UniverseBuilder(clients.binance, clients.jupiter, settings)
+    stats = builder.refresh(conn=workspace["conn"])
+
+    assert stats.considered == 2
+    assert stats.routable == 1
+    assert stats.rejected_not_routable == 1
+
+
 def test_universe_survives_a_restart(workspace, settings):
-    clients = fake_clients(tokens=[token("M" + "A" * 43, "OK", liquidity=200_000.0,
-                                         volume_24h=500_000.0)])
-    builder = UniverseBuilder(clients.jupiter, settings)
+    clients = fake_clients(
+        tokens=[token("M" + "A" * 43, "OK", liquidity=200_000.0, volume_24h=500_000.0)],
+        binance_assets=[binance_asset("OK")],
+    )
+    builder = UniverseBuilder(clients.binance, clients.jupiter, settings)
     builder.refresh(conn=workspace["conn"])
 
-    fresh = UniverseBuilder(clients.jupiter, settings)
+    fresh = UniverseBuilder(clients.binance, clients.jupiter, settings)
     assert len(fresh.load_persisted(workspace["conn"])) == 1
 
 
 def test_universe_snapshot_is_recorded_for_backtests(workspace, settings):
-    clients = fake_clients(tokens=[token("M" + "A" * 43, "OK", liquidity=200_000.0,
-                                         volume_24h=500_000.0)])
-    UniverseBuilder(clients.jupiter, settings).refresh(conn=workspace["conn"])
+    clients = fake_clients(
+        tokens=[token("M" + "A" * 43, "OK", liquidity=200_000.0, volume_24h=500_000.0)],
+        binance_assets=[binance_asset("OK")],
+    )
+    UniverseBuilder(clients.binance, clients.jupiter, settings).refresh(conn=workspace["conn"])
     rows = workspace["conn"].execute("SELECT * FROM universe_history").fetchall()
     assert len(rows) == 1
 
@@ -84,7 +109,7 @@ def test_engine_starts_and_ticks(engine, workspace):
 def test_engine_opens_and_manages_a_position(engine, workspace):
     """A full path: candles -> safety -> signal -> size -> fill -> persisted."""
     conn = workspace["conn"]
-    seed_candles(conn, MINT, bars=400, trend=0.0006)
+    seed_candles(MINT, bars=400, trend=0.0006)
     engine.startup()
 
     # Force the entry path directly with a known-good candle history.

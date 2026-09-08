@@ -1,0 +1,30 @@
+# Dependencies for the LOCAL optimizer (your PC), not the trading droplet.
+#
+# The droplet installs requirements.txt and never needs any of this. Keeping the
+# two lists apart is deliberate: the droplet is a 1 vCPU / 2GB box running the
+# trading loop, and it has no business carrying a GPU array library.
+
+# The only hard requirement. Everything in solopt runs on NumPy alone.
+numpy==2.1.3
+
+# ---------------------------------------------------------------------------
+# Optional, in rough order of how much they buy you.
+# ---------------------------------------------------------------------------
+
+# GPU acceleration. Install the wheel matching your CUDA runtime - cupy-cuda12x
+# for CUDA 12.x, which is what a current RTX 3060 driver ships. Without it the
+# engine runs on NumPy and simply takes longer; nothing else changes.
+#
+#   pip install cupy-cuda12x
+#
+# Verify with:  python -c "import cupy; print(cupy.cuda.runtime.getDeviceCount())"
+
+# Parquet bundles. Without pyarrow the optimizer reads gzipped CSV, which is
+# what the droplet's download endpoint serves by default, so this is only worth
+# installing if you are producing Parquet yourself.
+#
+#   pip install pyarrow
+
+# Running the test suite locally.
+#
+#   pip install pytest pandas

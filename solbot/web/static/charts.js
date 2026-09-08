@@ -284,5 +284,154 @@
     }
   }
 
-  global.SolChart = { candles: candles, lines: lines, theme: theme };
+  /* ---------- histogram ----------
+   * Used for the Monte Carlo drawdown distribution. The point of the chart is
+   * the tail, not the mode, so the 5%-worst-case marker is drawn on top of the
+   * bars rather than left to a legend.
+   */
+  function histogram(canvas, data, opts) {
+    opts = opts || {};
+    var t = theme();
+    var height = opts.height || 220;
+    var s = setupCanvas(canvas, height);
+    var ctx = s.ctx;
+
+    var edges = (data && data.edges) || [];
+    var counts = (data && data.counts) || [];
+    if (edges.length < 2 || !counts.length) {
+      ctx.fillStyle = t.muted;
+      ctx.font = "13px system-ui, sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText(opts.empty || "No distribution yet", s.width / 2, height / 2);
+      return;
+    }
+
+    var padL = 8, padR = 8, padT = 10, padB = 26;
+    var plotW = s.width - padL - padR;
+    var plotH = height - padT - padB;
+    var maxCount = 0;
+    counts.forEach(function (c) { if (c > maxCount) maxCount = c; });
+    if (!maxCount) maxCount = 1;
+
+    var lo = edges[0], hi = edges[edges.length - 1];
+    if (hi === lo) hi = lo + 1;
+    function x(v) { return padL + ((v - lo) / (hi - lo)) * plotW; }
+
+    var barW = Math.max(1, plotW / counts.length - 1);
+    for (var i = 0; i < counts.length; i++) {
+      var h = (counts[i] / maxCount) * plotH;
+      var past = opts.marker !== undefined && edges[i] >= opts.marker;
+      ctx.fillStyle = past ? t.red : t.accent;
+      ctx.globalAlpha = past ? 0.85 : 0.55;
+      ctx.fillRect(x(edges[i]), padT + plotH - h, barW, h);
+    }
+    ctx.globalAlpha = 1;
+
+    [["median", opts.median, t.green], ["p5", opts.marker, t.red]].forEach(function (m) {
+      if (m[1] === undefined || m[1] === null) return;
+      var px = x(m[1]);
+      if (px < padL || px > padL + plotW) return;
+      ctx.strokeStyle = m[2];
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([4, 3]);
+      ctx.beginPath();
+      ctx.moveTo(px, padT);
+      ctx.lineTo(px, padT + plotH);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    });
+
+    ctx.fillStyle = t.muted;
+    ctx.font = "11px system-ui, sans-serif";
+    ctx.textBaseline = "top";
+    var fmt = opts.format || function (v) { return v.toFixed(2); };
+    for (var k = 0; k <= 4; k++) {
+      var v = lo + (hi - lo) * (k / 4);
+      ctx.textAlign = k === 0 ? "left" : (k === 4 ? "right" : "center");
+      ctx.fillText(fmt(v), x(v), height - padB + 8);
+    }
+  }
+
+  /* ---------- paths ----------
+   * Several equity curves over a shared step axis (trade index, not wall-clock
+   * time) - the Monte Carlo worst-case drawdown-curve view (spec 6a). The
+   * worst path is drawn last and thickest so it reads clearly on top of the
+   * others rather than getting lost among nine similar lines.
+   */
+  function paths(canvas, series, opts) {
+    opts = opts || {};
+    var t = theme();
+    var height = opts.height || 200;
+    var s = setupCanvas(canvas, height);
+    var ctx = s.ctx;
+
+    if (!series || !series.length) {
+      ctx.fillStyle = t.muted;
+      ctx.font = "13px system-ui, sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText(opts.empty || "No simulated paths yet", s.width / 2, height / 2);
+      return;
+    }
+
+    var padL = 8, padR = 46, padT = 10, padB = 20;
+    var plotW = s.width - padL - padR;
+    var plotH = height - padT - padB;
+    var steps = series[0].length;
+
+    var vMin = Infinity, vMax = -Infinity;
+    series.forEach(function (path) {
+      path.forEach(function (v) { if (v < vMin) vMin = v; if (v > vMax) vMax = v; });
+    });
+    if (vMax === vMin) vMax = vMin + 0.01;
+    var pad = (vMax - vMin) * 0.06;
+    vMin -= pad; vMax += pad;
+
+    function x(i) { return padL + (i / Math.max(1, steps - 1)) * plotW; }
+    function y(v) { return padT + plotH - ((v - vMin) / (vMax - vMin)) * plotH; }
+
+    ctx.font = "10px ui-monospace, monospace";
+    ctx.textBaseline = "middle";
+    niceTicks(vMin, vMax, 4).forEach(function (v) {
+      var py = y(v);
+      ctx.strokeStyle = t.border;
+      ctx.globalAlpha = 0.5;
+      ctx.beginPath(); ctx.moveTo(padL, py); ctx.lineTo(padL + plotW, py); ctx.stroke();
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = t.muted;
+      ctx.textAlign = "left";
+      ctx.fillText((v * 100).toFixed(0) + "%", padL + plotW + 6, py);
+    });
+
+    // Baseline at 100% (starting balance), so a path's dip below it is visible
+    // at a glance rather than inferred from the axis labels.
+    if (vMin < 1 && vMax > 1) {
+      ctx.strokeStyle = t.muted;
+      ctx.globalAlpha = 0.6;
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath(); ctx.moveTo(padL, y(1)); ctx.lineTo(padL + plotW, y(1)); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.globalAlpha = 1;
+    }
+
+    // Backend sorts worst-first; draw it last (on top) so it reads clearly
+    // over the other nine rather than getting drawn-under and obscured.
+    var ordered = series.slice(1).map(function (path) { return { path: path, worst: false }; });
+    ordered.push({ path: series[0], worst: true });
+    ordered.forEach(function (entry) {
+      ctx.strokeStyle = entry.worst ? t.red : t.amber;
+      ctx.globalAlpha = entry.worst ? 1 : 0.45;
+      ctx.lineWidth = entry.worst ? 2 : 1;
+      ctx.beginPath();
+      entry.path.forEach(function (v, k) {
+        var px = x(k), py = y(v);
+        if (k === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      });
+      ctx.stroke();
+    });
+    ctx.globalAlpha = 1;
+  }
+
+  global.SolChart = {
+    candles: candles, lines: lines, histogram: histogram, paths: paths, theme: theme
+  };
 })(window);

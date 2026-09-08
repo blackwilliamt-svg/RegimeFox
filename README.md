@@ -25,6 +25,34 @@ The dashboard never opens or closes a position. It enqueues a row in the
 `commands` table that the worker executes on its next cycle. One writer on the
 trading path, so a dashboard crash cannot touch an open position.
 
+### Walk-forward / Monte Carlo: on the droplet, not on a PC
+
+A focused daily re-score runs on the droplet's own CPU, inside the trading
+worker's own process, during a low-activity window (~5-10 minutes). Once a
+month, a full parameter sweep runs on a GPU worker rented from RunPod for the
+duration of the job: the droplet ships it the candle data it needs, pulls the
+results back, and tears the worker down — verified afterward, not assumed.
+
+```
+┌─────────────────────┐                          ┌──────────────────────┐
+│       droplet        │                          │  RunPod GPU worker    │
+│   solbot-worker       │   daily, in-process      │  (monthly only,       │
+│   walk-forward        │   CPU, ~5-10 min/day     │   rented per job)     │
+│   Monte Carlo         │                          │                       │
+│   crash replay        │   monthly: ship data ───▶│  solopt engine        │
+│                       │◀──── pull results ───────┤  (CuPy/NumPy)         │
+│   SQLite: trades,     │   teardown verified       └──────────────────────┘
+│   settings, audit,    │
+│   WF/MC results       │
+└─────────────────────┘
+```
+
+A parameter bundle that passes lands straight in SQLite's shadow-instance
+tables — re-checked against the same bounds the settings page enforces, never
+just trusted. There is no git hand-off repository and no operator PC in the
+loop; `solopt`'s vectorized engine does not change between the two runs, only
+where it is invoked from. Full detail in [docs/OPTIMIZER.md](docs/OPTIMIZER.md).
+
 ---
 
 ## Quick start (paper mode)
@@ -67,11 +95,17 @@ For the droplet, see [deploy/DEPLOY.md](deploy/DEPLOY.md).
 
 ## What it does
 
-**Universe.** Built from a liquidity floor and a volume floor ($50k / $75k by
-default), not a fixed token count, so it grows and shrinks with what is actually
-tradeable. Those defaults deliberately exclude micro-caps, which move too
-erratically for a rules-based approach. Refreshed every 15 minutes from Jupiter's
-token rankings. On live data that currently yields ~90 tradeable tokens.
+**Universe.** Binance.US's top ~100 coins by 24h quote volume (`binance_top_n`),
+intersected with what is actually routable on Solana via Jupiter — established
+coins, not a pure liquidity/volume floor over Jupiter's entire token list. The
+liquidity and volume floors ($50k / $75k by default) still apply as a shortlist
+filter on top of that, and every candidate still has to clear Rug Check before
+it is ever considered for entry. Refreshed every 15 minutes.
+
+It is **Binance.US** (`api.binance.us`), not global Binance — global Binance
+geo-blocks US-origin traffic (HTTP 451), which would refuse a droplet hosted
+in a US region outright. Binance.US mirrors the same public REST API but with
+a smaller listed universe (~150 coins vs. global Binance's thousands).
 
 **Scanning.** Two tiers, both served exclusively by the Jupiter Price API:
 
@@ -79,16 +113,29 @@ token rankings. On live data that currently yields ~90 tradeable tokens.
 - ~1s poll of "tokens of interest" — those already showing a volume spike or
   building momentum, plus every open position
 
-Birdeye is never in this path. Its free tier is 1 request/second in total and
-would be exhausted immediately; it is used only for historical backfill.
+Binance.US is never in this path — it builds the universe shortlist and backs the
+candle history (see below), but the live scan is Jupiter Price API only.
 
-**Entry** requires all four to hold at once:
+**Entry** requires all six to hold at once:
 
 1. volume spike well above the token's *own* rolling average
 2. momentum confirmed across several candles, not one noisy print
 3. enough pool depth for the intended position size
 4. a clean Rug Check result — evaluated *before* the signal, so no scan budget
    is spent reasoning about something that cannot be traded
+5. a permitted **market regime**. The efficiency ratio separates a trend from a
+   drift; volatility then splits the rest into an orderly range and genuine
+   chop. Chop is excluded by default: a volume spike inside a whipsaw looks
+   identical to one starting a move, and paying the spread to find out which is
+   what produced the earlier fee bill
+6. **multi-timeframe agreement**. At the 10-minute default, the 30-minute and
+   hourly views must confirm the trend — and only their *closed* bars are read,
+   never the one still forming, because a signal that repaints is a signal the
+   live bot could never have acted on
+
+Above that sits a **review gate** (below) and hard brakes on trade frequency:
+a daily cap, a minimum gap between entries, and a longer cooldown before the
+same token can be re-entered.
 
 **Exit** checks three independent conditions every cycle; the first to fire
 closes the position:
@@ -103,6 +150,30 @@ closes the position:
 **Risk.** Volatility-scaled sizing, a correlation check before a second position
 (so it is not just riding the first one's move), a portfolio circuit breaker,
 congestion awareness, and a gas reserve that position sizing can never dip into.
+
+**Portfolio sizing.** On top of the per-position volatility scaling, `portfolio`
+mode solves for the weight that holds *portfolio* volatility at target given
+what is already open and how correlated the candidate is with it — a position
+riding an open one gets a smaller slice because its marginal contribution to
+portfolio risk is larger, not because a heuristic said so. It only ever sizes
+down, and stays inside the 45%-per-position and 90%-total caps. The risk budget
+itself is scaled by the Monte Carlo **5%-worst-case drawdown**, not the
+historical one, which is a single draw from that distribution.
+
+**Entry gate.** Every entry is judged against a short rubric before it executes:
+weigh the whole market rather than the single token, favour strong signals over
+frequent ones, and prefer capturing a large move with gains locked in over
+scalping. Ride-versus-lock-in is decided per trade from the metrics and sets
+that position's trailing distance. The rubric is enforced directly by rules —
+deterministic, free, instant, auditable, no network call anywhere in the loop.
+`entry_gate_min_strength` tunes how demanding it is; turning `entry_gate_enabled`
+off approves everything that reaches the gate.
+
+**Drift monitoring.** Live and paper performance is compared continuously
+against backtest expectation, on win rate and on expectancy per trade. It is the
+earliest warning available: strategies rarely fail loudly, they fail by winning
+a little less often than they used to while every individual trade still looks
+reasonable.
 
 **Kill switch.** Separate from the circuit breaker. Two-click confirmation, halts
 all new entries immediately, never auto-resumes. Open positions are left for
@@ -202,13 +273,22 @@ its next cycle via an mtime check. No SSH, no restart.
 | `max_slippage_pct` | 0.5 | Trades whose quote exceeds this are skipped entirely |
 | `circuit_daily_drawdown_pct` | 0.09 | Daily loss that halts trading until reset |
 | `broad_scan_seconds` | 15 | Raise if the dashboard says the cadence is unsustainable |
+| `max_trades_per_day` | 8 | The hard brake on overtrading; the other levers are soft |
+| `regime_allowed` | 3 | Bitmask: 1 trending, 2 ranging, 4 choppy. Default excludes chop |
+| `confluence_required` | 1 | How many higher timeframes must agree before an entry |
+| `stop_atr_mult` | 1.2 | Stop distance in ATRs — was hardcoded, now tunable |
+| `sizing_mode` | portfolio | `flat` restores per-position volatility scaling alone |
+| `drawdown_tolerance` | 0.25 | The 5%-worst-case drawdown you will tolerate; sizing shrinks to fit |
+| `shadow_min_days` | 15 | Clean days in shadow before auto-promotion is even considered |
+| `entry_gate_min_strength` | 0.0 | Raise to demand a stronger rubric score before an entry is approved |
+| `max_total_deployed_pct` | 0.90 | Total wallet exposure cap; there is no cap on *how many* positions make it up |
 
 ---
 
 ## Backtesting
 
 ```bash
-python manage.py pull --days 90       # one-time historical fetch (budget-checked)
+python manage.py pull --months 12     # one-time historical fetch from Binance.US
 ```
 
 ```bash
@@ -230,9 +310,10 @@ falls back to today's universe and says so in the log; treat those first results
 as biased until real snapshots build up.
 
 The whole timeline across every token is walked in chronological order so the
-concurrent-position cap is respected *across* tokens. Simulating each token in
-isolation would let the backtest hold far more positions than the live bot can,
-which is its own flattering distortion.
+total-deployed cap is respected *across* tokens — there is no cap on how many
+positions can be open at once, only on how much of the wallet they can add up
+to. Simulating each token in isolation would let the backtest hold more capital
+than the live bot ever could, which is its own flattering distortion.
 
 Fees and slippage are charged on both sides. A simulation that ignores costs is
 the main way a strategy looks profitable on paper and is not.
@@ -242,7 +323,40 @@ metrics next to live and paper performance, so drift between what the rules are
 expected to do and what they are actually doing shows up passively.
 
 Use it to sanity-check thresholds — not to hunt for a curve-fit historical
-return.
+return. Hunting for good parameters is the walk-forward optimizer's job, and it
+runs on its own schedule for a reason.
+
+After each daily backtest a **review** proposes at most three parameter
+adjustments, backtests the proposed set over the same window, and shadows it
+only if it measurably improves on the current one — better return *and* not
+materially deeper drawdown. Both sets of numbers are logged either way. Nothing
+a review proposes is ever applied to live.
+
+---
+
+## The walk-forward optimizer
+
+The daily backtest tells you whether the current rules are working. The
+walk-forward optimizer is what finds better ones — it runs on the droplet
+itself every day, and on a rented RunPod GPU once a month for a full sweep.
+There is nothing to install or run by hand; the walk-forward tab has manual
+trigger buttons if you want either run on demand instead of waiting for its
+schedule.
+
+Parameters are tuned on an in-sample window, tested on the next window the
+search has never seen, and the whole thing rolls forward. A set is accepted only
+if every window that counted produced at least 30 trades, at least 70% of them
+were profitable out of sample, and the returns do not swing more than they
+average. It is then resampled thousands of times against *observed* execution
+costs and replayed through the worst stretches in the history.
+
+An accepted bundle lands straight in SQLite's shadow-instance tables — checked
+against the same bounds the settings page enforces, never just trusted because
+it came from a run. Promotion to live is automatic after 15 clean days and a
+decisive margin — see below.
+
+Everything about it, including how the monthly RunPod worker is provisioned and
+torn down, is in [docs/OPTIMIZER.md](docs/OPTIMIZER.md).
 
 ---
 
@@ -258,7 +372,29 @@ executor differs.
   running alongside so live performance can be compared against expected
   performance on an ongoing basis.
 - **shadow** — a candidate rule set running in paper next to the live bot. Set
-  overrides from the settings page. Nothing is ever promoted automatically.
+  overrides by hand from the settings page, or let a daily/monthly walk-forward
+  run fill them in.
+
+### Automatic promotion
+
+A shadow set is promoted to live with no manual approval step, but only once
+**all** of these hold:
+
+| gate | default | why |
+| --- | --- | --- |
+| clean days in shadow | 15 | short runs measure luck |
+| closed shadow trades | 30 | the same floor a walk-forward window has to clear |
+| expectancy margin over live | +25% | "decisive, not marginal" |
+| drawdown against live | ≤ 1.15× | extra return bought with extra risk is not free |
+| bootstrap confidence | 90% | resampling both trade populations, shadow has to keep winning |
+| drift status | not `drifting` | 15 days that stopped meeting expectation are not 15 clean days |
+
+The bootstrap is the one that matters. Comparing two averages says which is
+bigger; it does not say whether the difference would survive a different run of
+the same two strategies. Every decision is recorded on the walk-forward tab,
+including the refusals.
+
+Auto-promotion can be switched off entirely (`auto_promote_enabled`).
 
 The dashboard labels all three distinctly, and the trade journal tags every row
 with its instance.
@@ -308,6 +444,33 @@ Dark mode by default, with a light toggle.
 - API key rotation with a validation spinner that test-pings the new key and
   says explicitly which key is now in effect — a failed rotation neither
   silently keeps the old key nor silently discards the new one
+- progress bars for the historical pull and the daily incremental runs
+
+### Walk-forward tab
+
+Mirrors the daily on-droplet run and the monthly RunPod retest, updated live
+over the optimizer endpoints, with buttons to trigger either one on demand:
+
+- the **plain-language run feed** — what the search is discovering as it goes,
+  not a percentage bar. "Window 7 out-of-sample: -3.1% from 33 trades, did not
+  hold up" is the thing worth knowing four hours in
+- a completion notice in the event feed when a run finishes, saying whether it
+  produced a promotable set and why not if it did not
+- **walk-forward efficiency** as the headline robustness number, alongside how
+  many windows were profitable and how far the returns swung
+- **OVERFIT** and **FRAGILE** flags, with the failing stress windows named
+- per-window pass/fail, including windows that did not reach the trade floor and
+  therefore count as neither
+- the **Monte Carlo drawdown distribution** as a chart, with the median and the
+  5%-worst-case marked, and a second chart plotting the equity curves of the ten
+  worst simulated runs directly, not just their depth as a number — saying
+  whether execution costs were measured or assumed
+- the **drift panel**: live and paper against backtest expectation over time
+- the parameter pipeline: every bundle received, its status, and every promotion
+  decision with its reasoning
+- a **stored WF/MC runs** panel, browsable by date, that ages out past its own
+  retention window (`wfmc_result_retention_days`) — unlike raw candle history,
+  kept indefinitely
 
 Charts are drawn by a small local canvas renderer (`static/charts.js`) rather
 than a CDN library: the dashboard ships a strict CSP that forbids third-party
@@ -392,11 +555,39 @@ This is a summary of your own trade record, not tax advice.
 python -m pytest
 ```
 
-153 tests, no network access — every API client is faked. Coverage concentrates
-on the things that lose money when they break: entry/exit rules, position
-sizing, the circuit breaker, crash recovery, on-chain reconciliation, the safety
-gate's fail-closed behaviour, rate-limit headroom, and the survivorship-bias
-handling in the backtest.
+321 tests, no network access — every API client (Jupiter, Binance, RugCheck,
+Solana RPC, RunPod) is faked. A test that needs an API key is a test that does
+not run, and there is no live model call anywhere in this bot to stub out in
+the first place — the entry gate is pure rules, so it is exercised the same way
+any other deterministic function is.
+
+Coverage concentrates on what loses money when it breaks: entry/exit rules,
+position sizing, the circuit breaker, crash recovery, on-chain reconciliation,
+the safety gate's fail-closed behaviour, rate-limit headroom, and the
+survivorship-bias handling in the backtest.
+
+Four groups are worth calling out:
+
+- **`test_vector_parity.py`** asserts the optimizer computes exactly what the
+  live bot computes — every indicator bar for bar against pandas, and the
+  vectorized engine trade for trade against the shipped backtester on identical
+  data. The whole value of the optimizer rests on that claim.
+- **`test_review_layer.py`** pins what the entry gate approves and rejects
+  under the rubric, and that the gate can be switched off entirely
+  (`entry_gate_enabled`) without touching the rules engine.
+- **`test_candlestore.py`** pins the Parquet append path — incremental writes
+  merge and dedupe against what is already on disk rather than duplicating it,
+  and never touch the still-forming bar.
+- **`test_runpod.py`** pins the monthly-retest orchestration against a fake
+  transport: volume and pod lifecycle, and — the one that actually matters —
+  that teardown verification catches a worker that did not self-terminate and
+  force-stops it rather than leaving a GPU billing in the background. No test
+  here ever makes a live RunPod call.
+
+**`test_optimizer_api.py`** covers the parameter-bundle ingest endpoint that
+replaced the old bulk-download API — including that a logged-in dashboard
+session grants no special access to it, so a RunPod worker's bearer token and
+an operator's session stay two separate privilege levels.
 
 ---
 
@@ -405,24 +596,53 @@ handling in the backtest.
 ```
 solbot/
   config.py        settings, bounds validation, hot reload
-  db.py            SQLite schema and helpers
+  db.py            SQLite schema and helpers (trades/positions/settings/audit/WF-MC)
   ratelimit.py     token bucket with a reserved lane for high-priority calls
-  clients/         jupiter, birdeye, rugcheck, solana rpc
+  clients/         jupiter, binance, rugcheck, solana rpc
+  candlestore.py   Parquet candle store - append, read, coverage, disk usage
   indicators.py    EMA, RSI, ATR, volume ratio, resampling
   strategy.py      entry and exit rules (pure functions)
   risk.py          sizing, correlation, circuit breaker, kill switch
   safety.py        Rug Check gate with cooldown-based re-testing
-  universe.py      universe building + point-in-time snapshots
+  universe.py      Binance top-N -> Jupiter routing + point-in-time snapshots
   scanner.py       two-tier polling and the cadence budget
-  datastore.py     candle storage, backfill, retention
+  datastore.py     Binance backfill (bulk + daily incremental), live tick roll-up
   execution.py     paper and live executors
   portfolio.py     positions, balances, journal, performance
   recovery.py      startup recovery and on-chain reconciliation
   engine.py        the trading loop
   backtest.py      offline simulation
+  regime + confluence live in indicators.py; the gates are in strategy.py
+  drift.py         live vs backtest drift monitoring
+  review.py        the rules-based entry gate
+  daily_review.py  post-backtest parameter proposals (shadow only)
+  wfmc.py          daily on-droplet run, monthly RunPod orchestration
+  runpod.py        RunPod volume/pod lifecycle + teardown verification
+  paramsync.py     bundle validation, shadow install, auto-promotion
   exports.py       CSV and tax exports
   web/             Flask dashboard, auth, JSON API, templates
+                   optimizer.py = parameter-bundle ingest + run-feed ingest
+
+solopt/            the vectorized engine - imports no solbot, invoked from two
+                   places: solbot/wfmc.py (daily, in-process) and a RunPod
+                   worker (monthly, via cli.py)
+  arrays.py        CuPy/NumPy backend and the utilization throttle
+  schema.py        asset-class description and cost model (crypto/equity/fx)
+  dataset.py       bundle loading, roll-up, point-in-time eligibility
+  frames.py        compaction into per-symbol bar sequences
+  indicators.py    batched indicator math, parity-tested against solbot
+  params.py        search space, plateau and cap stopping rules
+  engine.py        the vectorized backtest engine
+  walkforward.py   rolling windows, thresholds, per-coin params, resume
+  montecarlo.py    resampling the out-of-sample trades, worst-path tracking
+  stress.py        crash and flash-crash discovery and replay
+  promotion.py     parameter bundle assembly and its gates
+  pipeline.py      shared run_pipeline() - the one orchestration both call sites use
+  report.py        pushing feed/run/bundle back to the droplet over HTTP
+  cli.py           python -m solopt {run,status,feed} - the RunPod worker's entry point
+
 deploy/            systemd units, nginx config, deployment guide
+docs/OPTIMIZER.md  how the optimizer works and how to run it
 tests/
 ```
 

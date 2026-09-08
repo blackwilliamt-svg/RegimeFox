@@ -53,6 +53,17 @@ def with_spike(df: pd.DataFrame, *, bars: int = 3, pump: float = 0.004, vol_mult
     return pd.concat([df, pd.DataFrame(rows)], ignore_index=True)
 
 
+def core_only(settings: dict) -> dict:
+    """Settings with the regime and confluence gates off.
+
+    Those two gates are separate rules with their own tests below. Tests that
+    exist to pin the volume/momentum/RSI behaviour switch them off so a change
+    in regime classification cannot silently make them pass or fail for an
+    unrelated reason.
+    """
+    return {**settings, "regime_gate_enabled": False, "confluence_enabled": False}
+
+
 # --------------------------------------------------------------------------
 # indicators
 # --------------------------------------------------------------------------
@@ -109,7 +120,7 @@ def test_entry_requires_all_conditions(settings):
 
 def test_entry_fires_on_volume_spike_with_momentum(settings):
     df = with_spike(make_candles(60))
-    signal = evaluate_entry(df, settings, mint="X", liquidity_usd=500_000)
+    signal = evaluate_entry(df, core_only(settings), mint="X", liquidity_usd=500_000)
     assert signal.ok, signal.reasons
     assert signal.stop < signal.price < signal.target
     assert settings["rr_min"] <= signal.rr <= settings["rr_max"]
@@ -265,11 +276,12 @@ def test_rsi_ceiling_leaves_a_workable_entry_window(settings):
         for p in (0.003, 0.004, 0.005)
     ]
 
+    base = core_only(settings)
     at_78 = sum(
         1 for df in setups
-        if evaluate_entry(df, settings, mint="X", liquidity_usd=500_000).ok
+        if evaluate_entry(df, base, mint="X", liquidity_usd=500_000).ok
     )
-    tight = {**settings, "rsi_max_entry": 72.0}
+    tight = {**base, "rsi_max_entry": 72.0}
     at_72 = sum(
         1 for df in setups
         if evaluate_entry(df, tight, mint="X", liquidity_usd=500_000).ok

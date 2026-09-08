@@ -23,7 +23,10 @@ from . import db
 
 log = logging.getLogger(__name__)
 
-PROVIDERS = ("jupiter", "birdeye", "rugcheck")
+# "bulk_data" is the bearer token a RunPod worker presents to report a run's
+# progress back. Every provider is rotatable from the settings page and falls
+# back to the environment.
+PROVIDERS = ("jupiter", "rugcheck", "bulk_data")
 
 
 class SecretsUnavailable(RuntimeError):
@@ -108,14 +111,19 @@ def delete_key(provider: str, conn: sqlite3.Connection | None = None) -> None:
     conn.execute("DELETE FROM api_keys WHERE provider = ?", (provider,))
 
 
+def _env_keys(secrets: Any) -> dict[str, str]:
+    """The environment-supplied value for each provider, empty where unset."""
+    return {
+        "jupiter": secrets.jupiter_api_key,
+        "rugcheck": secrets.rugcheck_api_key,
+        "bulk_data": getattr(secrets, "bulk_data_token", ""),
+    }
+
+
 def effective_keys(secrets: Any, encryption_key: str, conn: sqlite3.Connection | None = None) -> dict[str, str]:
     """Resolve every provider key: a stored rotation wins over the environment."""
     conn = conn or db.connect()
-    env = {
-        "jupiter": secrets.jupiter_api_key,
-        "birdeye": secrets.birdeye_api_key,
-        "rugcheck": secrets.rugcheck_api_key,
-    }
+    env = _env_keys(secrets)
     out = dict(env)
     for provider in PROVIDERS:
         try:
@@ -132,11 +140,7 @@ def key_status(
 ) -> list[KeyStatus]:
     """What the settings page shows: masked values and where each one came from."""
     conn = conn or db.connect()
-    env = {
-        "jupiter": secrets.jupiter_api_key,
-        "birdeye": secrets.birdeye_api_key,
-        "rugcheck": secrets.rugcheck_api_key,
-    }
+    env = _env_keys(secrets)
     rows = {
         r["provider"]: r
         for r in conn.execute("SELECT * FROM api_keys").fetchall()

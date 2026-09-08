@@ -236,6 +236,12 @@ def install_guard(app: Any) -> None:
             return None
         if endpoint.startswith("static"):
             return None
+        # The optimizer endpoints are for a headless client on another machine
+        # with no browser and no TOTP device. They enforce their own bearer-token
+        # auth in solbot.web.optimizer.token_required and are exempt from the
+        # session guard rather than from authentication.
+        if endpoint.startswith("optimizer."):
+            return None
 
         if not current_user():
             if request.path.startswith("/api/"):

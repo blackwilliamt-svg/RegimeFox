@@ -5,9 +5,8 @@ Tier 1 sweeps the whole eligible universe about every 15 seconds. Tier 2 polls
 momentum - about every second, so the entry window is not missed while the
 signal is still being confirmed.
 
-Neither tier touches Birdeye. Birdeye's free tier allows one request per second
-in total and would be exhausted immediately; it is reserved for historical
-backfill.
+Neither tier touches Binance - it builds the universe shortlist and backs the
+candle history, but the live scan is Jupiter Price API only.
 
 **Cadence is budgeted, not assumed.** One sweep of N tokens costs ceil(N/50)
 requests. At Jupiter's free-tier 1 rps a 300-token universe needs 6 requests per

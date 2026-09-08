@@ -28,6 +28,12 @@ StartLimitBurst=5
 KillSignal=SIGTERM
 TimeoutStopSec=30
 
+# The daily walk-forward/Monte Carlo re-score (spec 5) also runs in this
+# process, on this same vCPU, during its configured low-activity window
+# (wfmc_daily_hour_utc) - roughly 5-10 minutes against a focused parameter
+# set. The monthly full-space retest instead runs on a rented RunPod GPU
+# worker; this process only orchestrates it (ship data, poll, tear down).
+
 # Hardening. The bot needs outbound HTTPS and its own directory, nothing else.
 NoNewPrivileges=true
 PrivateTmp=true

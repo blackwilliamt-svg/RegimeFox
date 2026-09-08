@@ -9,6 +9,10 @@ __pycache__/
 .venv/
 venv/
 config.json
+
+# Optimizer PC only: holds the droplet URL and possibly the bulk-data token.
+solopt.json
+
 *.log
 .pytest_cache/
 

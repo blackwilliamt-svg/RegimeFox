@@ -9,6 +9,7 @@ import pytest
 
 from solbot import db, exports
 from solbot.backtest import Backtester
+from solbot.candlestore import ParquetCandleStore
 from solbot.datastore import DataStore
 from solbot.execution import Fill
 from solbot.portfolio import Portfolio
@@ -20,27 +21,36 @@ DEAD = "DeadTokenMintAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 ALIVE = "AliveTokenMintAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 
 
-def seed_candles(conn, mint: str, *, bars: int = 300, interval: str = "5m",
+def seed_candles(mint: str, *, bars: int = 300, candle_minutes: int = 10,
                  trend: float = 0.0, seed: int = 1, end: int | None = None):
-    """Write synthetic candles with periodic volume spikes so entries can fire."""
+    """Write synthetic 1-minute candles with periodic volume spikes.
+
+    ``bars`` is the number of candles at the *configured* timeframe
+    (``candle_minutes``, 10 by default) - internally this writes
+    ``bars * candle_minutes`` one-minute rows to the Parquet store, since that
+    is the fixed base interval candle history is stored at (spec 3b), and the
+    live/backtest code aggregates it up from there exactly as it would live
+    data.
+    """
     rng = np.random.default_rng(seed)
-    step = 300
+    step = 60
+    total_minutes = bars * candle_minutes
     end = end or db.now()
-    start = end - bars * step
+    start = end - total_minutes * step
     price = 1.0
     rows = []
-    for i in range(bars):
-        drift = trend + rng.normal(0, 0.003)
-        # A spike every 40 bars, gentle enough to clear the RSI ceiling.
-        spike = (i % 40) in (0, 1, 2)
+    spike_every = 40 * candle_minutes   # one spike per ~40 aggregated candles
+    for i in range(total_minutes):
+        drift = (trend + rng.normal(0, 0.003)) / candle_minutes
+        spike = (i % spike_every) < 3
         if spike:
-            drift = abs(drift) + 0.004
+            drift = abs(drift) + 0.004 / candle_minutes
         price = max(1e-6, price * (1 + drift))
         volume = 5000.0 * (6.0 if spike else 1.0)
         rows.append(
             (start + i * step, price * 0.999, price * 1.004, price * 0.996, price, volume)
         )
-    db.upsert_candles(mint, interval, rows, conn=conn)
+    ParquetCandleStore().append(mint, "1m", rows)
     return rows
 
 
@@ -79,7 +89,7 @@ def test_basket_falls_back_to_today_when_no_history(workspace, settings):
         (ALIVE, "ALIVE", db.now()),
     )
     clients = fake_clients()
-    tester = Backtester(DataStore(clients.birdeye, settings), settings)
+    tester = Backtester(DataStore(clients.binance, settings), settings)
     assert tester.basket(30, conn) == [ALIVE]
 
 
@@ -88,14 +98,14 @@ def test_basket_falls_back_to_today_when_no_history(workspace, settings):
 # --------------------------------------------------------------------------
 def test_backtest_runs_and_reports_metrics(workspace, settings):
     conn = workspace["conn"]
-    seed_candles(conn, ALIVE, bars=400, trend=0.0005)
+    seed_candles(ALIVE, bars=400, trend=0.0005)
     conn.execute(
         "INSERT INTO universe(mint, symbol, liquidity_usd, updated_at) VALUES (?,?,?,?)",
         (ALIVE, "ALIVE", 1_000_000.0, db.now()),
     )
 
     clients = fake_clients()
-    tester = Backtester(DataStore(clients.birdeye, settings), settings)
+    tester = Backtester(DataStore(clients.binance, settings), settings)
     result = tester.run(days=40, mints=[ALIVE], conn=conn)
 
     assert result.tokens_with_data == 1
@@ -106,13 +116,19 @@ def test_backtest_runs_and_reports_metrics(workspace, settings):
     assert result.ending_balance > 0
 
 
-def test_backtest_respects_the_concurrent_position_cap(workspace, settings):
-    """Simulating tokens in isolation would let it hold more than the live bot can."""
+def test_backtest_respects_the_total_deployed_cap(workspace, settings):
+    """Simulating tokens in isolation would let it deploy more than the live bot can.
+
+    There is no fixed position-count cap any more (spec 4): concurrency is
+    whatever the total-deployed budget allows, which the live bot's sizing
+    already enforces per position. This checks the budget itself holds across
+    multiple simultaneously-open positions, not a count.
+    """
     conn = workspace["conn"]
     mints = []
     for i in range(5):
         mint = f"Mint{i}" + "X" * 38
-        seed_candles(conn, mint, bars=400, trend=0.0006, seed=i + 2)
+        seed_candles(mint, bars=400, trend=0.0006, seed=i + 2)
         conn.execute(
             "INSERT INTO universe(mint, symbol, liquidity_usd, updated_at) VALUES (?,?,?,?)",
             (mint, f"T{i}", 1_000_000.0, db.now()),
@@ -120,32 +136,34 @@ def test_backtest_respects_the_concurrent_position_cap(workspace, settings):
         mints.append(mint)
 
     clients = fake_clients()
-    tester = Backtester(DataStore(clients.birdeye, settings), settings)
+    tester = Backtester(DataStore(clients.binance, settings), settings)
     result = tester.run(days=40, mints=mints, conn=conn)
 
-    # Reconstruct concurrency from the trade timeline.
+    # Reconstruct deployed capital from the trade timeline.
     events = []
     for t in result.trades:
-        events.append((t.entry_ts, 1))
-        events.append((t.exit_ts, -1))
+        events.append((t.entry_ts, t.size_usd))
+        events.append((t.exit_ts, -t.size_usd))
     events.sort()
-    concurrent = peak = 0
+    deployed = peak = 0.0
     for _, delta in events:
-        concurrent += delta
-        peak = max(peak, concurrent)
-    assert peak <= settings["max_concurrent_positions"]
+        deployed += delta
+        peak = max(peak, deployed)
+    # Generous headroom for wallet growth from realised profit along the way;
+    # the point is that it is *bounded*, not pinned to the starting balance.
+    assert peak <= result.starting_balance * 2 * settings["max_total_deployed_pct"] + 1e-6
 
 
 def test_backtest_charges_fees_and_slippage(workspace, settings):
     """A simulation that ignores costs is the main way paper flatters itself."""
     conn = workspace["conn"]
-    seed_candles(conn, ALIVE, bars=400, trend=0.0005)
+    seed_candles(ALIVE, bars=400, trend=0.0005)
     conn.execute(
         "INSERT INTO universe(mint, symbol, liquidity_usd, updated_at) VALUES (?,?,?,?)",
         (ALIVE, "ALIVE", 1_000_000.0, db.now()),
     )
     clients = fake_clients()
-    tester = Backtester(DataStore(clients.birdeye, settings), settings)
+    tester = Backtester(DataStore(clients.binance, settings), settings)
     result = tester.run(days=40, mints=[ALIVE], conn=conn)
     if result.trades:
         assert result.total_fees > 0
@@ -154,7 +172,7 @@ def test_backtest_charges_fees_and_slippage(workspace, settings):
 
 def test_backtest_with_no_data_returns_empty(workspace, settings):
     clients = fake_clients()
-    tester = Backtester(DataStore(clients.birdeye, settings), settings)
+    tester = Backtester(DataStore(clients.binance, settings), settings)
     result = tester.run(days=30, mints=["NoSuchMint"], conn=workspace["conn"])
     assert result.trades == []
     assert result.tokens_with_data == 0

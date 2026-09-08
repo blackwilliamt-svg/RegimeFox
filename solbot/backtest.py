@@ -2,7 +2,7 @@
 
 Runs the identical entry/exit functions the live engine uses, against candles
 already stored locally. Nothing here touches the network - re-fetching live data
-per run would make results irreproducible and would burn the Birdeye budget.
+per run would make results irreproducible for no benefit.
 
 **Survivorship bias is handled at the basket level, not the simulation level.**
 The basket comes from ``universe_history`` - what actually passed the filters on
@@ -22,6 +22,7 @@ import logging
 import sqlite3
 import time
 from dataclasses import dataclass, field
+from itertools import groupby
 from typing import Any, Callable, Sequence
 
 import pandas as pd
@@ -213,7 +214,7 @@ class Backtester:
                     "momentum_candles", "momentum_min_pct", "rr_min", "rr_max",
                     "trailing_activate_r", "trailing_distance_atr", "max_slippage_pct",
                     "taker_fee_pct", "max_position_pct_of_wallet",
-                    "max_concurrent_positions", "signal_invalidation_bars",
+                    "max_total_deployed_pct", "signal_invalidation_bars",
                 )
             },
         )
@@ -258,28 +259,36 @@ class Backtester:
         slip_pct = float(cfg["max_slippage_pct"]) / 2.0 / 100.0  # expected, not worst case
         min_bars = int(cfg["min_candles_required"])
 
-        for ts, mint, idx in timeline:
-            df = frames[mint]
-            if idx < min_bars:
-                continue
-            result.bars_evaluated += 1
-            row = df.iloc[idx]
-            price = float(row["close"])
-            if price <= 0:
-                continue
+        # Each timestamp is processed in two passes: every open position is
+        # managed first, then entries are considered. That is exactly what the
+        # live engine does on every cycle (manage_positions, then
+        # look_for_entries), and it matters at ties: walking a single merged
+        # timeline sorted by (ts, mint) would let a token whose name sorts early
+        # take an entry while a position exiting on the same bar was still
+        # counted as deployed, sizing that entry against capital the live bot
+        # would already have released.
+        for ts, group in groupby(timeline, key=lambda row: row[0]):
+            events = list(group)
 
-            # --- manage an open position first ---------------------------
-            position = open_positions.get(mint)
-            if position is not None:
+            # --- pass one: manage open positions -------------------------
+            for _ts, mint, idx in events:
+                position = open_positions.get(mint)
+                if position is None or idx < min_bars:
+                    continue
+                df = frames[mint]
+                row = df.iloc[idx]
+                price = float(row["close"])
+                if price <= 0:
+                    continue
+                result.bars_evaluated += 1
                 window = df.iloc[: idx + 1]
-                bar_low = float(row["low"])
 
                 # Intrabar stop: if the bar's low pierced the stop, that is
                 # where the exit happened, not at the close.
                 stop_level = max(
                     float(position["hard_stop"]), float(position.get("trailing_stop") or 0.0)
                 )
-                if bar_low <= stop_level:
+                if float(row["low"]) <= stop_level:
                     balance = self._close(
                         result, position, stop_level, ts, "stop hit intrabar",
                         balance, cost_pct, slip_pct,
@@ -306,63 +315,69 @@ class Backtester:
                 changes = update_trailing_stop(position, price, atr_value, cfg)
                 changes.pop("_armed_now", None)
                 position.update(changes)
-                continue
 
-            # --- look for an entry ---------------------------------------
-            if len(open_positions) >= int(cfg["max_concurrent_positions"]):
-                continue
+            # --- pass two: look for entries ------------------------------
+            for _ts, mint, idx in events:
+                if mint in open_positions or idx < min_bars:
+                    continue
+                deployed = sum(p["size_usd"] for p in open_positions.values())
+                wallet = balance + deployed
+                if deployed >= wallet * float(cfg["max_total_deployed_pct"]):
+                    break
+                df = frames[mint]
+                row = df.iloc[idx]
+                price = float(row["close"])
+                if price <= 0:
+                    continue
+                result.bars_evaluated += 1
 
-            deployed = sum(p["size_usd"] for p in open_positions.values())
-            wallet = balance + deployed
-            atr_pct = float(row.get("atr_pct") or 0.0)
-            token_liquidity = liquidity.get(mint, 0.0)
+                token_liquidity = liquidity.get(mint, 0.0)
 
-            sizing = size_position(
-                wallet_usd=wallet,
-                liquidity_usd=token_liquidity,
-                price=price,
-                atr_pct=atr_pct,
-                cfg=cfg,
-                deployed_usd=deployed,
-            )
-            if not sizing.ok or sizing.size_usd > balance:
-                continue
+                sizing = size_position(
+                    wallet_usd=wallet,
+                    liquidity_usd=token_liquidity,
+                    price=price,
+                    atr_pct=float(row.get("atr_pct") or 0.0),
+                    cfg=cfg,
+                    deployed_usd=deployed,
+                )
+                if not sizing.ok or sizing.size_usd > balance:
+                    continue
 
-            window = df.iloc[: idx + 1]
-            signal = evaluate_entry(
-                window, cfg, mint=mint,
-                liquidity_usd=token_liquidity,
-                intended_size_usd=sizing.size_usd,
-                precomputed=True,
-            )
-            if not signal.ok:
-                continue
+                signal = evaluate_entry(
+                    df.iloc[: idx + 1], cfg, mint=mint,
+                    liquidity_usd=token_liquidity,
+                    intended_size_usd=sizing.size_usd,
+                    precomputed=True,
+                )
+                if not signal.ok:
+                    continue
 
-            entry_price = price * (1.0 + slip_pct)
-            fee = sizing.size_usd * cost_pct
-            qty = (sizing.size_usd - fee) / entry_price
-            risk_per_unit = signal.price - signal.stop
-            balance -= sizing.size_usd
+                entry_price = price * (1.0 + slip_pct)
+                fee = sizing.size_usd * cost_pct
+                qty = (sizing.size_usd - fee) / entry_price
+                risk_per_unit = signal.price - signal.stop
+                balance -= sizing.size_usd
 
-            open_positions[mint] = {
-                "mint": mint,
-                "symbol": mint[:6],
-                "entry_price": entry_price,
-                "entry_ts": ts,
-                "qty": qty,
-                "size_usd": sizing.size_usd,
-                "hard_stop": entry_price - risk_per_unit,
-                "take_profit": entry_price + risk_per_unit * signal.rr,
-                "trailing_stop": None,
-                "trailing_armed": 0,
-                "high_water_price": entry_price,
-                "initial_risk": risk_per_unit,
-                "rr_target": signal.rr,
-                "entry_reason": signal.summary(),
-                "entry_fee_usd": fee,
-                "invalidation_count": 0,
-            }
-            result.equity_curve.append((ts, balance + sizing.size_usd))
+                open_positions[mint] = {
+                    "mint": mint,
+                    "symbol": mint[:6],
+                    "entry_price": entry_price,
+                    "entry_ts": ts,
+                    "qty": qty,
+                    "size_usd": sizing.size_usd,
+                    "hard_stop": entry_price - risk_per_unit,
+                    "take_profit": entry_price + risk_per_unit * signal.rr,
+                    "trailing_stop": None,
+                    "trailing_armed": 0,
+                    "high_water_price": entry_price,
+                    "initial_risk": risk_per_unit,
+                    "rr_target": signal.rr,
+                    "entry_reason": signal.summary(),
+                    "entry_fee_usd": fee,
+                    "invalidation_count": 0,
+                }
+                result.equity_curve.append((ts, balance + sizing.size_usd))
 
         # Close anything still open at the final price it traded at.
         for mint, position in list(open_positions.items()):

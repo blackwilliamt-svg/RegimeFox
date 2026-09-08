@@ -30,7 +30,7 @@ from typing import Any
 
 import pandas as pd
 
-from . import db, risk
+from . import db, drift, paramsync, review, risk, wfmc
 from .clients import Clients, PriceInfo, build_clients
 from .config import Config
 from .datastore import DataStore
@@ -72,15 +72,19 @@ class Engine:
         self.clients = clients or build_clients(config)
         self.clients.apply_config(config)
 
-        self.store = DataStore(self.clients.birdeye, self.cfg)
-        self.universe = UniverseBuilder(self.clients.jupiter, self.cfg)
+        self.store = DataStore(self.clients.binance, self.cfg)
+        self.universe = UniverseBuilder(self.clients.binance, self.clients.jupiter, self.cfg)
         self.scanner = Scanner(self.clients.jupiter, self.cfg)
         self.safety = SafetyGate(self.clients.rugcheck, self.cfg)
+
+        self.reviewer = review.EntryGate(self.cfg)
 
         self.instances: list[InstanceRunner] = []
         self.primary: InstanceRunner | None = None
 
         self._stop = threading.Event()
+        self._last_drift_check = 0.0
+        self._last_promotion_check = 0.0
         self._running = False
         self._cycle = 0
         self._last_equity_record = 0.0
@@ -88,6 +92,10 @@ class Engine:
         self._last_budget_warning = 0.0
         self._candle_cache: dict[str, tuple[int, pd.DataFrame]] = {}
         self._backtest_hook = None  # set by run_worker so a daily run can fire
+        # Off by default so constructing an Engine for a test or a script never
+        # spawns a real WFMC run purely because the wall clock happens to match
+        # the configured hour; run_worker.py turns this on for the real process.
+        self._wfmc_hook_enabled = False
 
     # ------------------------------------------------------------------
     # setup
@@ -292,23 +300,31 @@ class Engine:
         cfg = inst.cfg(self.cfg)
         conn = db.connect()
 
-        gate = risk.can_open_position(
-            open_count=inst.portfolio.open_count(conn), cfg=cfg, conn=conn
-        )
+        gate = risk.can_open_position(cfg=cfg, conn=conn)
         if not gate.allowed:
             return
 
-        balance = inst.portfolio.balance(conn)
-        deployed = inst.portfolio.deployed_usd(conn)
-        wallet_usd = balance + deployed
+        throttle = self._throttle(inst, cfg, conn)
+        if throttle:
+            return
 
+        # No fixed position-count cap: how many positions may be open at once
+        # is decided by the total-deployed budget below, re-read every
+        # iteration so capital committed earlier in this same scan counts
+        # against it immediately.
+        max_deployed_pct = float(cfg["max_total_deployed_pct"])
         for mint, price_info in prices.items():
-            if inst.portfolio.open_count(conn) >= int(cfg["max_concurrent_positions"]):
+            balance = inst.portfolio.balance(conn)
+            deployed = inst.portfolio.deployed_usd(conn)
+            wallet_usd = balance + deployed
+            if deployed >= wallet_usd * max_deployed_pct:
                 break
             if inst.portfolio.position_for(mint, conn) is not None:
                 continue
             token = self.universe.tokens.get(mint)
             if token is None:
+                continue
+            if self._cooling_off(inst, mint, cfg, conn):
                 continue
 
             # 4. Safety gate runs BEFORE the signal is evaluated.
@@ -321,6 +337,21 @@ class Engine:
             if df.empty:
                 continue
 
+            # Correlation first: it is cheap, it is a hard refusal, and it also
+            # feeds the sizing below, so computing it once up front saves doing
+            # the work twice.
+            open_positions = inst.portfolio.open_positions(conn)
+            open_book, corr = self._exposure(df, open_positions, cfg)
+            if corr is not None and not corr.allowed:
+                db.log_event(
+                    f"Skipped {token.symbol or mint[:8]}: {corr.reason}",
+                    category="risk",
+                    instance=inst.name,
+                    mint=mint,
+                    conn=conn,
+                )
+                continue
+
             sizing = risk.size_position(
                 wallet_usd=wallet_usd,
                 liquidity_usd=token.liquidity,
@@ -328,6 +359,7 @@ class Engine:
                 atr_pct=self._atr_pct(df),
                 cfg=cfg,
                 deployed_usd=deployed,
+                open_book=open_book,
             )
             if not sizing.ok:
                 continue
@@ -345,33 +377,168 @@ class Engine:
             if not signal.ok:
                 continue
 
-            # Correlation: do not open a second position riding the same move.
-            open_positions = inst.portfolio.open_positions(conn)
-            if open_positions:
-                held_closes = {
-                    p["mint"]: self._candles(p["mint"])["close"].tolist()[
-                        -int(cfg["correlation_lookback"]) :
-                    ]
-                    for p in open_positions
-                }
-                held_closes = {k: v for k, v in held_closes.items() if len(v) >= 10}
-                if held_closes:
-                    corr = risk.correlation_gate(
-                        df["close"].tolist()[-int(cfg["correlation_lookback"]) :],
-                        held_closes,
-                        cfg,
-                    )
-                    if not corr.allowed:
-                        db.log_event(
-                            f"Skipped {token.symbol or mint[:8]}: {corr.reason}",
-                            category="risk",
-                            instance=inst.name,
-                            mint=mint,
-                            conn=conn,
-                        )
-                        continue
+            # 5. The entry review gate has the last word on borderline entries.
+            decision = self._review(inst, cfg, token, signal, sizing, conn)
+            if decision is not None and not decision.approve:
+                db.log_event(
+                    f"Review declined {token.symbol or mint[:8]}: {decision.rationale}",
+                    category="signal",
+                    instance=inst.name,
+                    mint=mint,
+                    detail=decision.as_dict(),
+                    conn=conn,
+                )
+                self.scanner.cool(mint)
+                continue
 
-            self._open(inst, cfg, token, price_info, signal, sizing, tier, conn)
+            self._open(
+                inst, cfg, token, price_info, signal, sizing, tier, conn,
+                decision=decision,
+            )
+
+    # ------------------------------------------------------------------
+    # Overtrading brakes (spec 5)
+    # ------------------------------------------------------------------
+    def _throttle(
+        self, inst: InstanceRunner, cfg: dict[str, Any], conn: sqlite3.Connection
+    ) -> str:
+        """Refuse to look for entries at all when the day's budget is spent.
+
+        Overtrading is the failure mode the spec names: 244 trades in seven days
+        cost $449 in fees. The regime and confluence gates raise the bar for an
+        individual entry; this caps the total regardless of how good each one
+        looked in isolation.
+        """
+        cap = int(cfg.get("max_trades_per_day", 0))
+        if cap <= 0:
+            return ""
+        day_start = (db.now() // 86400) * 86400
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM positions WHERE instance = ? AND entry_ts >= ?",
+            (inst.name, day_start),
+        ).fetchone()
+        taken = int(row["n"] or 0)
+        if taken >= cap:
+            if self._cycle % 600 == 0:
+                db.log_event(
+                    f"{inst.name} has opened {taken} positions today, at the "
+                    f"{cap}-trade cap. No further entries until the UTC day rolls.",
+                    category="risk",
+                    instance=inst.name,
+                    conn=conn,
+                )
+            return f"daily cap of {cap} trades reached"
+
+        gap = int(cfg.get("min_seconds_between_entries", 0))
+        if gap > 0:
+            row = conn.execute(
+                "SELECT MAX(entry_ts) AS t FROM positions WHERE instance = ?",
+                (inst.name,),
+            ).fetchone()
+            last = int(row["t"] or 0)
+            if last and db.now() - last < gap:
+                return "still inside the minimum gap between entries"
+        return ""
+
+    def _cooling_off(
+        self, inst: InstanceRunner, mint: str, cfg: dict[str, Any], conn: sqlite3.Connection
+    ) -> bool:
+        """Has this token been traded too recently to try again?
+
+        Re-entering the same token minutes after exiting it is the shape
+        overtrading usually takes: the signal that fired once tends to keep
+        firing while the bar prints.
+        """
+        gap = int(cfg.get("min_seconds_between_entries_same_mint", 0))
+        if gap <= 0:
+            return False
+        row = conn.execute(
+            "SELECT MAX(entry_ts) AS t FROM positions WHERE instance = ? AND mint = ?",
+            (inst.name, mint),
+        ).fetchone()
+        last = int(row["t"] or 0)
+        return bool(last and db.now() - last < gap)
+
+    # ------------------------------------------------------------------
+    # Correlation-aware exposure (spec 4.4)
+    # ------------------------------------------------------------------
+    def _exposure(
+        self,
+        df: pd.DataFrame,
+        open_positions: list[sqlite3.Row],
+        cfg: dict[str, Any],
+    ) -> tuple[list[risk.OpenExposure], risk.GateResult | None]:
+        """The open book as the sizing maths sees it, plus the hard gate result.
+
+        The correlation is computed once and used twice: to refuse a position
+        that is merely riding an open one, and to shrink one that is partly
+        riding it. The gate is the cliff; the sizing is the slope.
+        """
+        if not open_positions:
+            return [], None
+
+        lookback = int(cfg["correlation_lookback"])
+        candidate = df["close"].tolist()[-lookback:]
+        held_closes: dict[str, list[float]] = {}
+        book: list[risk.OpenExposure] = []
+
+        for position in open_positions:
+            held = self._candles(position["mint"])
+            closes = held["close"].tolist()[-lookback:] if not held.empty else []
+            correlation = risk.correlation(candidate, closes) if len(closes) >= 10 else None
+            if closes and len(closes) >= 10:
+                held_closes[position["mint"]] = closes
+            book.append(
+                risk.OpenExposure(
+                    size_usd=float(position["size_usd"]),
+                    atr_pct=self._atr_pct(held),
+                    # An uncomputable correlation is treated as fully correlated:
+                    # sizing down on a token we cannot measure is the safe error.
+                    correlation=1.0 if correlation is None else float(correlation),
+                )
+            )
+
+        gate = (
+            risk.correlation_gate(candidate, held_closes, cfg) if held_closes else None
+        )
+        return book, gate
+
+    # ------------------------------------------------------------------
+    # The entry review gate
+    # ------------------------------------------------------------------
+    def _review(
+        self,
+        inst: InstanceRunner,
+        cfg: dict[str, Any],
+        token: Any,
+        signal: Any,
+        sizing: Any,
+        conn: sqlite3.Connection,
+    ) -> Any:
+        """Put an entry to the review gate. Returns None when it is switched off."""
+        if self.reviewer is None or not cfg.get("entry_gate_enabled", True):
+            return None
+        day_start = (db.now() // 86400) * 86400
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM positions WHERE instance = ? AND entry_ts >= ?",
+            (inst.name, day_start),
+        ).fetchone()
+
+        request = review.EntryRequest(
+            mint=token.mint,
+            symbol=token.symbol,
+            instance=inst.name,
+            price=signal.price,
+            size_usd=sizing.size_usd,
+            liquidity_usd=token.liquidity,
+            rr=signal.rr,
+            strength=signal.strength,
+            entry_reason=signal.summary(),
+            snapshot=signal.snapshot.to_dict() if signal.snapshot else {},
+            market=review.build_market_context(conn=conn),
+            trades_today=int(row["n"] or 0),
+        )
+        return self.reviewer.review_entry(request, conn=conn)
 
     def _open(
         self,
@@ -383,6 +550,8 @@ class Engine:
         sizing: Any,
         tier: str,
         conn: sqlite3.Connection,
+        *,
+        decision: Any = None,
     ) -> None:
         fill: Fill = inst.executor.buy(
             token.mint,
@@ -408,6 +577,8 @@ class Engine:
         target = fill.price + risk_per_unit * signal.rr
 
         reason = f"[{tier}] " + signal.summary() + f"; sized {', '.join(sizing.reasons)}"
+        if decision is not None:
+            reason += f"; review: {decision.rationale}"
         inst.portfolio.open_position(
             mint=token.mint,
             symbol=token.symbol,
@@ -417,6 +588,7 @@ class Engine:
             rr=signal.rr,
             entry_reason=reason,
             snapshot=signal.snapshot.to_dict() if signal.snapshot else {},
+            review=decision.as_dict() if decision is not None else None,
             conn=conn,
         )
         self.scanner.mark_interesting(token.mint)
@@ -443,8 +615,16 @@ class Engine:
             df = self._candles(pos["mint"])
 
             position = dict(pos)
+            # The review gate decides ride-versus-lock-in per trade, so the
+            # trailing distance can differ from the configured default for this
+            # position and only this position.
+            pos_cfg = cfg
+            override = position.get("trail_override_atr")
+            if override:
+                pos_cfg = {**cfg, "trailing_distance_atr": float(override)}
+
             exit_signal = evaluate_exit(
-                position, price, df if not df.empty else None, cfg,
+                position, price, df if not df.empty else None, pos_cfg,
                 now_ts=now, precomputed=True,
             )
 
@@ -461,7 +641,7 @@ class Engine:
                     changes["invalidation_count"] = count
 
             atr_value = self._atr(df) or price * 0.01
-            trail = update_trailing_stop(position, price, atr_value, cfg)
+            trail = update_trailing_stop(position, price, atr_value, pos_cfg)
             armed_now = trail.pop("_armed_now", False)
             changes.update(trail)
 
@@ -585,6 +765,20 @@ class Engine:
             self._start_backtest(payload, conn)
             return "backtest started"
 
+        if command == "run_wfmc_daily":
+            threading.Thread(
+                target=lambda: wfmc.run_daily(self.cfg, self.store),
+                name="wfmc-daily-manual", daemon=True,
+            ).start()
+            return "daily walk-forward run started"
+
+        if command == "run_wfmc_monthly":
+            threading.Thread(
+                target=lambda: wfmc.run_monthly(self.cfg, self.store, self.config.secrets),
+                name="wfmc-monthly-manual", daemon=True,
+            ).start()
+            return "monthly RunPod retest started"
+
         return f"unknown command: {command}"
 
     def _manual_close(self, position_id: int, who: str, conn: sqlite3.Connection) -> str:
@@ -608,12 +802,15 @@ class Engine:
         return f"position {position_id} is not open"
 
     def _start_pull(self, payload: dict[str, Any], conn: sqlite3.Connection) -> None:
-        mints = payload.get("mints") or self.universe.mints
-        days = int(payload.get("days") or self.cfg["backtest_lookback_days"])
+        pairs = self.store.pair_map(conn)
+        wanted = payload.get("mints")
+        if wanted:
+            pairs = {m: p for m, p in pairs.items() if m in wanted}
+        months = int(payload.get("months") or self.cfg["bulk_backfill_months"])
 
         def worker() -> None:
             try:
-                self.store.run_initial_pull(mints, days=days)
+                self.store.run_initial_pull(pairs, months=months)
             except Exception:
                 log.exception("historical pull failed")
 
@@ -648,7 +845,101 @@ class Engine:
                 log.info("pruned %s", deleted)
 
         self._maybe_daily_backtest()
+        self._maybe_daily_wfmc()
+        self._maybe_monthly_wfmc()
         self._check_safety_alerts()
+        self._check_drift(now)
+        self._check_promotion(now)
+
+    def _check_drift(self, now: float) -> None:
+        """Compare live/paper performance against backtest expectation (4.5)."""
+        interval = float(self.cfg.get("drift_check_seconds", 900))
+        if now - self._last_drift_check < interval:
+            return
+        self._last_drift_check = now
+        try:
+            drift.check_all(self.cfg)
+        except Exception as exc:
+            log.warning("drift check failed: %s", exc)
+
+    def _check_promotion(self, now: float) -> None:
+        """Consider promoting the shadow parameter set to live.
+
+        Bundles no longer arrive by being pulled from anywhere - the daily
+        WFMC run installs one directly, and a RunPod worker's report lands via
+        the dashboard's ingest endpoint - so this is promotion-only now.
+        Guarded: a promotion that cannot be evaluated must never take the
+        trading loop down with it.
+        """
+        interval = float(self.cfg.get("promotion_check_interval_seconds", 3600))
+        if now - self._last_promotion_check < interval:
+            return
+        self._last_promotion_check = now
+
+        try:
+            verdict = paramsync.evaluate_promotion(self.cfg)
+            if verdict.promoted:
+                paramsync.promote(self.config, verdict)
+                self._apply_config()
+                self.build_instances()
+        except Exception as exc:
+            log.warning("promotion check failed: %s", exc)
+
+    def _maybe_daily_wfmc(self) -> None:
+        """Fire the daily on-droplet walk-forward/Monte Carlo run (spec 5)."""
+        if not self._wfmc_hook_enabled or not self.cfg.get("wfmc_daily_enabled", True):
+            return
+        now = time.gmtime()
+        if now.tm_hour != int(self.cfg.get("wfmc_daily_hour_utc", 3)):
+            return
+        today = time.strftime("%Y-%m-%d", now)
+        if db.kv_get(wfmc.LAST_DAILY_KEY) == today:
+            return
+        db.kv_set(wfmc.LAST_DAILY_KEY, today)
+        db.log_event("Daily walk-forward/Monte Carlo run starting.", category="system")
+
+        def worker() -> None:
+            try:
+                self.store.run_daily_incremental(self.store.pair_map())
+            except Exception:
+                log.warning("daily incremental candle pull failed", exc_info=True)
+            try:
+                wfmc.run_daily(self.cfg, self.store)
+            except Exception:
+                log.exception("daily WFMC run failed")
+                db.log_event(
+                    "Daily walk-forward run failed; see the worker log.",
+                    level="alert", category="system",
+                )
+
+        threading.Thread(target=worker, name="wfmc-daily", daemon=True).start()
+
+    def _maybe_monthly_wfmc(self) -> None:
+        """Fire the monthly RunPod-orchestrated full retest (spec 5)."""
+        if not self._wfmc_hook_enabled or not self.cfg.get("wfmc_monthly_enabled", False):
+            return
+        now = time.gmtime()
+        if now.tm_mday != int(self.cfg.get("wfmc_monthly_day_utc", 1)):
+            return
+        if now.tm_hour != int(self.cfg.get("wfmc_monthly_hour_utc", 3)):
+            return
+        month = time.strftime("%Y-%m", now)
+        if db.kv_get(wfmc.LAST_MONTHLY_KEY) == month:
+            return
+        db.kv_set(wfmc.LAST_MONTHLY_KEY, month)
+        db.log_event("Monthly RunPod walk-forward retest starting.", category="system")
+
+        def worker() -> None:
+            try:
+                wfmc.run_monthly(self.cfg, self.store, self.config.secrets)
+            except Exception:
+                log.exception("monthly WFMC run failed")
+                db.log_event(
+                    "Monthly RunPod retest failed; see the worker log.",
+                    level="alert", category="system",
+                )
+
+        threading.Thread(target=worker, name="wfmc-monthly", daemon=True).start()
 
     def _maybe_daily_backtest(self) -> None:
         """Fire the scheduled backtest once per day, at the configured hour."""
@@ -732,6 +1023,7 @@ class Engine:
         self.clients.apply_config(self.config)
         for component in (self.store, self.universe, self.scanner, self.safety):
             component.update_config(self.cfg)
+        self.reviewer.update_config(self.cfg)
         for inst in self.instances:
             inst.portfolio.update_config(self.cfg)
             inst.executor.update_config(self.cfg)

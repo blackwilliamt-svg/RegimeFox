@@ -7,26 +7,27 @@
   <div class="panel">
     <h2>Historical data pull</h2>
     <p class="hint" style="margin-top:0">
-      The first pull is heavy and rate limited, so it is started manually rather than
-      running on boot. Later runs are incremental — only newly elapsed days are fetched.
+      Pulls a trailing window of 1-minute candles per coin from Binance.US (spec 3b) into
+      the local Parquet store — heavy and one-time, so it is started manually rather than
+      running on boot. A separate daily incremental pull (below) keeps every coin current
+      after that, against the same Binance.US REST API.
     </p>
     <div id="pullProgress" style="margin:12px 0">
       <div class="progress"><div id="pullBar" style="width:0%"></div></div>
       <p class="hint" id="pullLabel">{{ pull.message or 'Not run yet' }}</p>
     </div>
     <form method="post" action="{{ url_for('dashboard.historical_pull') }}" class="btn-row">
-      <input type="number" name="days" value="90" min="7" max="365" style="width:100px">
+      <input type="number" name="months" value="12" min="1" max="24" style="width:100px">
       <button class="btn-primary">Start historical pull</button>
     </form>
-    <div class="kv" style="margin-top:14px">
-      <span>Birdeye budget used this month</span>
-      <span id="budgetUsed">{{ budget.units }} / {{ budget_limit }} CU</span>
+    <div id="dailyPullProgress" style="margin:14px 0 0">
+      <div class="progress"><div id="dailyPullBar" style="width:0%"></div></div>
+      <p class="hint" id="dailyPullLabel">Daily incremental pull: not run yet</p>
     </div>
-    <p class="hint">
-      An OHLCV call costs 35 CU and returns up to 1000 candles. The free Standard tier's
-      30,000 CU is roughly 857 calls per month, so a large first pull needs planning —
-      or the Starter plan.
-    </p>
+    <div class="kv" style="margin-top:14px">
+      <span>Candle history on disk</span>
+      <span id="candleCoverage">—</span>
+    </div>
   </div>
 
   <div class="panel">

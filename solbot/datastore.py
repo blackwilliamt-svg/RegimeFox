@@ -1,39 +1,57 @@
-"""Candle storage: Birdeye backfill, live tick roll-up, and retention.
+"""Candle storage: Binance.US backfill, live tick roll-up, and the Parquet store.
 
-Two sources feed the same ``candles`` table:
+Candle history lives entirely in :class:`~solbot.candlestore.ParquetCandleStore`
+(spec 3) - never as SQLite rows. Two Binance.US-sourced feeds populate it:
 
-* **Birdeye**, pulled once per token and then extended incrementally. This is
-  the backtest's data and the indicator warm-up on a cold start.
-* **Live ticks**, rolled up locally into candles at the configured timeframe.
-  This is what keeps the current bar moving between Birdeye pulls, and it costs
-  nothing extra - the ticks are already being collected by the scanner.
+* **The one-time bulk backfill** (spec 3b), pulling a trailing year of
+  1-minute candles per coin by paging the ordinary klines REST endpoint
+  month by month. Global Binance publishes pre-built monthly zip archives
+  (``data.binance.vision``) for this; Binance.US - which this bot uses
+  instead, since global Binance geo-blocks US-origin traffic - has no
+  documented equivalent, so this pages the rate-limited REST API instead.
+  More requests for a one-time job, but still comfortably inside
+  ``binance_rps``.
+* **The daily incremental pull**, against the same klines endpoint, cheap
+  enough at daily-request volume to run on a schedule with no special budget
+  tracking.
 
-Birdeye does not serve a 10-minute interval, so the base interval stored is the
-largest one that divides the configured timeframe (5m for the 10m default) and
-:func:`candles_for` aggregates it up. Trading a timeframe that merely resembles
-the configured one would quietly invalidate every backtest.
-
-Retention is enforced on a schedule because the target box is a 1 vCPU / 2GB
-droplet; an unbounded candle table is the thing most likely to fill it.
+Live ticks are rolled up locally into 1-minute candles between daily pulls, so
+the current trading day is never stale by a full day - but only *closed*
+minute buckets are ever written; the still-forming bar is never persisted; the
+live engine drops it before computing indicators, same as before.
 """
 from __future__ import annotations
 
+import calendar
 import logging
 import sqlite3
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Sequence
 
 import pandas as pd
 
 from . import db
-from .clients import ApiError, BirdeyeClient, BudgetExhausted
-from .clients.birdeye import OHLCV_CU_COST, SUPPORTED_INTERVALS, nearest_interval
+from .candlestore import ParquetCandleStore
+from .clients import ApiError, BinanceClient
+from .clients.binance import KLINE_INTERVAL, MAX_KLINES_PER_CALL
 from .indicators import resample, to_frame
 
 log = logging.getLogger(__name__)
 
 JOB_INITIAL_PULL = "historical_pull"
+JOB_DAILY_INCREMENTAL = "daily_incremental_pull"
+
+BASE_INTERVAL = KLINE_INTERVAL   # "1m" - fixed, spec 3b
+BASE_SECONDS = 60
+
+
+def _month_bounds(year: int, month: int) -> tuple[int, int]:
+    """``[start, end)`` unix seconds spanning a calendar month, in UTC."""
+    start = calendar.timegm((year, month, 1, 0, 0, 0))
+    next_year, next_month = (year + 1, 1) if month == 12 else (year, month + 1)
+    end = calendar.timegm((next_year, next_month, 1, 0, 0, 0))
+    return start, end
 
 
 @dataclass(slots=True)
@@ -43,7 +61,6 @@ class PullReport:
     tokens_failed: int = 0
     candles_written: int = 0
     calls: int = 0
-    cu_spent: int = 0
     stopped_early: str = ""
 
     def as_dict(self) -> dict[str, Any]:
@@ -53,15 +70,21 @@ class PullReport:
             "tokens_failed": self.tokens_failed,
             "candles_written": self.candles_written,
             "calls": self.calls,
-            "cu_spent": self.cu_spent,
             "stopped_early": self.stopped_early,
         }
 
 
 class DataStore:
-    def __init__(self, birdeye: BirdeyeClient, cfg: dict[str, Any]) -> None:
-        self.birdeye = birdeye
+    def __init__(
+        self,
+        binance: BinanceClient,
+        cfg: dict[str, Any],
+        *,
+        candles: ParquetCandleStore | None = None,
+    ) -> None:
+        self.binance = binance
         self.cfg = cfg
+        self.candles = candles or ParquetCandleStore()
 
     def update_config(self, cfg: dict[str, Any]) -> None:
         self.cfg = cfg
@@ -69,15 +92,14 @@ class DataStore:
     # ------------------------------------------------------------------
     @property
     def base_interval(self) -> str:
-        """The interval actually fetched and stored."""
-        return nearest_interval(int(self.cfg["candle_minutes"]))
+        return BASE_INTERVAL
 
     @property
     def target_seconds(self) -> int:
         return int(self.cfg["candle_minutes"]) * 60
 
     def needs_aggregation(self) -> bool:
-        return SUPPORTED_INTERVALS[self.base_interval] != self.target_seconds
+        return self.target_seconds != BASE_SECONDS
 
     # ------------------------------------------------------------------
     # reading
@@ -89,19 +111,17 @@ class DataStore:
         limit: int | None = None,
         since: int | None = None,
         until: int | None = None,
-        conn: sqlite3.Connection | None = None,
+        conn: sqlite3.Connection | None = None,   # kept for call-site symmetry; unused
     ) -> pd.DataFrame:
-        """Candles at the configured timeframe, aggregating the base interval up."""
-        interval = self.base_interval
-        # Over-fetch so aggregation still yields `limit` finished bars.
+        """Candles at the configured timeframe, aggregating the 1m base up."""
         raw_limit = None
         if limit:
-            factor = max(1, self.target_seconds // SUPPORTED_INTERVALS[interval])
+            factor = max(1, self.target_seconds // BASE_SECONDS)
             raw_limit = limit * factor + factor
-        rows = db.load_candles(
-            mint, interval, limit=raw_limit, since=since, until=until, conn=conn
+        raw = self.candles.read_range(
+            mint, self.base_interval, since=since, until=until, limit=raw_limit
         )
-        df = to_frame(rows)
+        df = to_frame(raw)
         if df.empty:
             return df
         if self.needs_aggregation():
@@ -124,22 +144,25 @@ class DataStore:
         return df[df["ts"] < current_open].reset_index(drop=True)
 
     # ------------------------------------------------------------------
-    # live tick roll-up
+    # live tick roll-up - only ever writes CLOSED minute buckets
     # ------------------------------------------------------------------
     def rollup_ticks(
         self, *, lookback_seconds: int | None = None, conn: sqlite3.Connection | None = None
     ) -> int:
-        """Fold recent price ticks into candles at the base interval.
+        """Fold recently-closed minute buckets of price ticks into the store.
 
         Volume is not available from the price feed, so a tick-built candle
-        carries zero volume and is marked ``source='ticks'``. The volume-spike
-        rule tolerates this: the rolling average skips NaN, and a zero-volume
-        bar simply fails the spike test rather than producing a false one.
+        carries zero volume; the volume-spike rule tolerates this (a
+        zero-volume bar simply fails the spike test rather than producing a
+        false one). Only buckets that have fully closed are written - the
+        forming bucket is never persisted, matching what the live engine
+        already discards via :meth:`drop_forming_bar`, so a call made
+        mid-minute costs nothing more than a metadata read per mint.
         """
         conn = conn or db.connect()
-        interval = self.base_interval
-        seconds = SUPPORTED_INTERVALS[interval]
-        since = db.now() - (lookback_seconds or seconds * 4)
+        now = db.now()
+        current_bucket = (now // BASE_SECONDS) * BASE_SECONDS
+        since = now - (lookback_seconds or BASE_SECONDS * 10)
 
         rows = conn.execute(
             "SELECT mint, ts, price FROM price_ticks WHERE ts >= ? ORDER BY mint, ts",
@@ -150,164 +173,184 @@ class DataStore:
 
         buckets: dict[tuple[str, int], list[float]] = {}
         for r in rows:
-            key = (r["mint"], (int(r["ts"]) // seconds) * seconds)
-            buckets.setdefault(key, []).append(float(r["price"]))
+            bucket_ts = (int(r["ts"]) // BASE_SECONDS) * BASE_SECONDS
+            if bucket_ts >= current_bucket:
+                continue  # still forming; never persisted
+            buckets.setdefault((r["mint"], bucket_ts), []).append(float(r["price"]))
 
-        # Never overwrite a Birdeye candle with a thinner tick-built one.
-        written = 0
-        payload: list[tuple[Any, ...]] = []
+        per_mint: dict[str, list[tuple[Any, ...]]] = {}
         for (mint, bucket_ts), prices in buckets.items():
             if not prices:
                 continue
-            payload.append(
-                (mint, interval, bucket_ts, prices[0], max(prices), min(prices), prices[-1], 0.0)
+            per_mint.setdefault(mint, []).append(
+                (bucket_ts, prices[0], max(prices), min(prices), prices[-1], 0.0)
             )
-        if payload:
-            conn.executemany(
-                "INSERT INTO candles(mint, interval, ts, open, high, low, close, volume, source) "
-                "VALUES (?,?,?,?,?,?,?,?, 'ticks') "
-                "ON CONFLICT(mint, interval, ts) DO UPDATE SET "
-                "high = MAX(candles.high, excluded.high), "
-                "low  = MIN(candles.low,  excluded.low), "
-                "close = excluded.close "
-                "WHERE candles.source = 'ticks'",
-                payload,
-            )
-            written = len(payload)
+
+        written = 0
+        for mint, mint_rows in per_mint.items():
+            written += self.candles.append(mint, self.base_interval, mint_rows, incremental=True)
         return written
 
     # ------------------------------------------------------------------
-    # Birdeye backfill
+    # Binance backfill
     # ------------------------------------------------------------------
-    def estimate_pull(self, token_count: int, days: int) -> dict[str, Any]:
-        """Cost of a pull before running it, so the budget is visible up front."""
-        interval = self.base_interval
-        per_token = self.birdeye.calls_needed(interval, days)
-        calls = per_token * max(0, token_count)
-        cu = calls * OHLCV_CU_COST
-        stats = self.birdeye.budget.stats()
-        remaining = stats["remaining"]
+    def estimate_pull(self, token_count: int, months: int) -> dict[str, Any]:
+        """Rough cost of a bulk pull before running it, for the dashboard."""
         return {
-            "interval": interval,
             "tokens": token_count,
-            "days": days,
-            "calls_per_token": per_token,
-            "total_calls": calls,
-            "cu_required": cu,
-            "cu_remaining": remaining,
-            "affordable": remaining < 0 or cu <= remaining,
-            "seconds_estimate": int(calls / max(0.1, float(self.cfg["birdeye_rps"]))),
+            "months": months,
+            "archives": token_count * months,
+            "seconds_estimate": int(token_count * months * 1.5),
         }
 
-    def backfill(
+    def bulk_backfill(
         self,
-        mints: Sequence[str],
+        pairs: dict[str, str],
         *,
-        days: int,
+        months: int,
         conn: sqlite3.Connection | None = None,
         progress: Callable[[int, int, str], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
-        incremental: bool = True,
     ) -> PullReport:
-        """Pull history for each mint, resuming from what is already stored.
+        """One-time setup: pull a trailing ``months`` of history per coin.
 
-        `incremental=True` starts each token from its newest stored candle
-        rather than re-pulling the whole window, which is what makes the daily
-        run cheap enough to schedule.
+        ``pairs`` maps mint -> Binance pair (e.g. "BTCUSDT"), from the
+        universe table. Pages the klines REST endpoint month by month rather
+        than downloading a pre-built archive - Binance.US has no documented
+        equivalent of global Binance's monthly zip archives (spec 3b).
         """
         conn = conn or db.connect()
-        report = PullReport(tokens_requested=len(mints))
-        interval = self.base_interval
+        report = PullReport(tokens_requested=len(pairs))
         now = db.now()
-        window_start = now - days * 86400
+        now_struct = time.gmtime(now)
 
-        for idx, mint in enumerate(mints, start=1):
+        month_list: list[tuple[int, int]] = []
+        year, month = now_struct.tm_year, now_struct.tm_mon
+        for _ in range(months):
+            month_list.append((year, month))
+            month -= 1
+            if month == 0:
+                month, year = 12, year - 1
+
+        for idx, (mint, pair) in enumerate(pairs.items(), start=1):
             if should_stop and should_stop():
                 report.stopped_early = "cancelled"
                 break
+            written_for_mint = 0
+            for y, m in month_list:
+                start, end = _month_bounds(y, m)
+                end = min(end, now)
+                if start >= end:
+                    continue
+                try:
+                    candles = self.binance.klines_range(pair, since=start, until=end)
+                except ApiError as exc:
+                    log.warning(
+                        "bulk backfill failed for %s %04d-%02d: %s", pair, y, m, exc
+                    )
+                    continue
+                report.calls += max(1, -(-(end - start) // (MAX_KLINES_PER_CALL * BASE_SECONDS)))
+                if candles:
+                    # Not incremental: months are walked newest-first, so an
+                    # older month's rows would otherwise all be older than the
+                    # latest timestamp already written and get silently
+                    # dropped. _merge_month() already dedupes by ts on its
+                    # own, so this stays safe to re-run.
+                    written_for_mint += self.candles.append(
+                        mint, self.base_interval, [c.as_row() for c in candles],
+                        incremental=False,
+                    )
+            report.candles_written += written_for_mint
+            report.tokens_done += 1
+            if progress:
+                progress(idx, len(pairs), pair)
 
-            start = window_start
-            if incremental:
-                latest = db.latest_candle_ts(mint, interval, conn=conn)
-                if latest:
-                    start = max(window_start, latest - SUPPORTED_INTERVALS[interval])
-            if start >= now:
+        return report
+
+    def daily_incremental_pull(
+        self,
+        pairs: dict[str, str],
+        *,
+        conn: sqlite3.Connection | None = None,
+        progress: Callable[[int, int, str], None] | None = None,
+    ) -> PullReport:
+        """Catch each coin up from its newest stored candle to now, via REST.
+
+        Safe from rate limits at daily-request volume (spec 3b) - one klines
+        call per coin covers a whole day of 1-minute bars in a single page.
+        """
+        conn = conn or db.connect()
+        report = PullReport(tokens_requested=len(pairs))
+        now = db.now()
+
+        for idx, (mint, pair) in enumerate(pairs.items(), start=1):
+            latest = self.candles.latest_ts(mint, self.base_interval)
+            since = (latest + BASE_SECONDS) if latest else (now - 7 * 86400)
+            if since >= now:
                 report.tokens_done += 1
                 if progress:
-                    progress(idx, len(mints), mint)
+                    progress(idx, len(pairs), pair)
                 continue
-
             try:
-                candles = self.birdeye.ohlcv_range(mint, interval, start, now)
-            except BudgetExhausted as exc:
-                report.stopped_early = str(exc)
-                log.warning("backfill halted: %s", exc)
-                break
+                candles = self.binance.klines_range(pair, since=since, until=now)
             except ApiError as exc:
-                log.warning("backfill failed for %s: %s", mint, exc)
+                log.warning("daily incremental pull failed for %s: %s", pair, exc)
                 report.tokens_failed += 1
                 if progress:
-                    progress(idx, len(mints), mint)
+                    progress(idx, len(pairs), pair)
                 continue
 
             if candles:
-                written = db.upsert_candles(
-                    mint, interval, [c.as_row() for c in candles], conn=conn
+                report.candles_written += self.candles.append(
+                    mint, self.base_interval, [c.as_row() for c in candles]
                 )
-                report.candles_written += written
             report.tokens_done += 1
             if progress:
-                progress(idx, len(mints), mint)
-
-        report.cu_spent = self.birdeye.budget.stats()["spent"]
+                progress(idx, len(pairs), pair)
         return report
 
     def run_initial_pull(
         self,
-        mints: Sequence[str],
+        pairs: dict[str, str],
         *,
-        days: int | None = None,
+        months: int | None = None,
         conn: sqlite3.Connection | None = None,
         should_stop: Callable[[], bool] | None = None,
     ) -> PullReport:
-        """Backfill with dashboard progress reporting attached.
+        """The bulk backfill with dashboard progress reporting attached.
 
         Wired to the dashboard's manual button - the spec keeps this heavy,
-        rate-limited, one-time load under the user's control rather than firing
-        it automatically at startup.
+        one-time load under the user's control rather than firing it
+        automatically at startup.
         """
         conn = conn or db.connect()
-        days = days or int(self.cfg["backtest_lookback_days"])
-        total = len(mints)
+        months = months or int(self.cfg["bulk_backfill_months"])
+        total = len(pairs)
         db.set_progress(
             JOB_INITIAL_PULL,
             status="running",
             done=0,
             total=total,
-            message=f"Starting {days}-day pull for {total} tokens",
+            message=f"Starting a {months}-month pull for {total} tokens",
             conn=conn,
         )
 
-        def report_progress(done: int, tot: int, mint: str) -> None:
+        def report_progress(done: int, tot: int, pair: str) -> None:
             db.set_progress(
                 JOB_INITIAL_PULL,
                 status="running",
                 done=done,
                 total=tot,
-                message=f"{done}/{tot} tokens - {mint[:8]}…",
+                message=f"{done}/{tot} tokens - {pair}…",
                 conn=conn,
             )
 
         try:
-            result = self.backfill(
-                mints,
-                days=days,
-                conn=conn,
-                progress=report_progress,
-                should_stop=should_stop,
-                incremental=True,
+            result = self.bulk_backfill(
+                pairs, months=months, conn=conn,
+                progress=report_progress, should_stop=should_stop,
             )
-        except Exception as exc:  # surface the failure instead of a silent stall
+        except Exception as exc:
             db.set_progress(
                 JOB_INITIAL_PULL, status="failed", message=str(exc)[:300], conn=conn
             )
@@ -337,32 +380,73 @@ class DataStore:
         )
         return result
 
+    def run_daily_incremental(
+        self, pairs: dict[str, str], *, conn: sqlite3.Connection | None = None
+    ) -> PullReport:
+        conn = conn or db.connect()
+        db.set_progress(JOB_DAILY_INCREMENTAL, status="running", total=len(pairs), conn=conn)
+        try:
+            result = self.daily_incremental_pull(pairs, conn=conn)
+        except Exception as exc:
+            db.set_progress(
+                JOB_DAILY_INCREMENTAL, status="failed", message=str(exc)[:300], conn=conn
+            )
+            raise
+        db.set_progress(
+            JOB_DAILY_INCREMENTAL,
+            status="done",
+            done=result.tokens_done,
+            total=len(pairs),
+            message=f"{result.candles_written:,} candles across {result.tokens_done} tokens",
+            conn=conn,
+        )
+        db.log_event(
+            f"Daily incremental candle pull: {result.candles_written:,} candles across "
+            f"{result.tokens_done}/{len(pairs)} tokens.",
+            category="system",
+            detail=result.as_dict(),
+            conn=conn,
+        )
+        return result
+
     # ------------------------------------------------------------------
     def warm(self, mint: str, conn: sqlite3.Connection | None = None) -> bool:
         """Does this token have enough history for the strategy to evaluate it?"""
         df = self.candles_for(mint, limit=int(self.cfg["min_candles_required"]) + 2, conn=conn)
         return len(df) >= int(self.cfg["min_candles_required"])
 
-    def prune(self, conn: sqlite3.Connection | None = None) -> dict[str, int]:
-        return db.prune(
-            candle_days=int(self.cfg["candle_retention_days"]),
-            tick_hours=int(self.cfg["price_tick_retention_hours"]),
-            event_days=int(self.cfg["event_retention_days"]),
-            conn=conn,
-        )
-
     def coverage(self, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
         conn = conn or db.connect()
-        row = conn.execute(
-            "SELECT COUNT(*) AS candles, COUNT(DISTINCT mint) AS tokens, "
-            "MIN(ts) AS first_ts, MAX(ts) AS last_ts FROM candles WHERE interval = ?",
-            (self.base_interval,),
-        ).fetchone()
-        return {
-            "interval": self.base_interval,
-            "candles": int(row["candles"] or 0),
-            "tokens": int(row["tokens"] or 0),
-            "first_ts": row["first_ts"],
-            "last_ts": row["last_ts"],
-            "days": round(((row["last_ts"] or 0) - (row["first_ts"] or 0)) / 86400.0, 1),
-        }
+        mints = [r["mint"] for r in conn.execute("SELECT mint FROM universe").fetchall()]
+        cov = self.candles.universe_coverage(mints, self.base_interval)
+        cov["disk"] = self.candles.disk_usage()
+        return cov
+
+    def prune(self, conn: sqlite3.Connection | None = None) -> dict[str, int]:
+        """Retention for everything EXCEPT candles, which are kept indefinitely."""
+        deleted = db.prune(
+            tick_hours=int(self.cfg["price_tick_retention_hours"]),
+            event_days=int(self.cfg["event_retention_days"]),
+            wfmc_days=int(self.cfg.get("wfmc_result_retention_days", 180)),
+            conn=conn,
+        )
+        try:
+            from .wfmc import DAILY_STORE_PATH
+            from solopt.store import RunStore
+
+            local = RunStore(DAILY_STORE_PATH).purge_older_than(
+                int(self.cfg.get("wfmc_result_retention_days", 180))
+            )
+            deleted["wfmc_local_runs"] = local["runs"]
+        except Exception:
+            pass  # the local WFMC store may not exist yet on a fresh install
+        return deleted
+
+    def pair_map(self, conn: sqlite3.Connection | None = None) -> dict[str, str]:
+        """``{mint: binance_pair}`` for every routed universe token."""
+        conn = conn or db.connect()
+        rows = conn.execute(
+            "SELECT mint, binance_pair FROM universe WHERE binance_pair IS NOT NULL "
+            "AND binance_pair != ''"
+        ).fetchall()
+        return {r["mint"]: r["binance_pair"] for r in rows}

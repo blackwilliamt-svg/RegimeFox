@@ -77,6 +77,8 @@ def trades():
 
 @bp.route("/backtest")
 def backtest():
+    from ..datastore import JOB_DAILY_INCREMENTAL
+
     conn = db.connect()
     runs = conn.execute(
         "SELECT * FROM backtest_runs ORDER BY ts DESC LIMIT 30"
@@ -85,10 +87,20 @@ def backtest():
         "backtest.html",
         runs=runs,
         pull=db.get_progress("historical_pull"),
+        daily_pull=db.get_progress(JOB_DAILY_INCREMENTAL),
         backtest_progress=db.get_progress("backtest"),
-        budget=db.api_usage("birdeye"),
-        budget_limit=cfg()["birdeye_monthly_cu_budget"],
     )
+
+
+@bp.route("/walkforward")
+def walkforward():
+    """The walk-forward tab. Every panel on it is populated by the JSON API.
+
+    The run happens on the operator's PC and reports in over the optimizer
+    endpoints, so there is nothing to render server-side that would not be stale
+    by the time the page loaded.
+    """
+    return render_template("walkforward.html", mode=cfg()["trading_mode"])
 
 
 @bp.route("/settings")
@@ -106,7 +118,12 @@ def settings():
 
 
 def _spec_rows() -> list[dict[str, Any]]:
-    from ..config import BOOLS, SPEC
+    """Every editable setting, with the shape the settings page should render.
+
+    Kept derived from the config module rather than duplicated in the template,
+    so a new tunable appears on the page by virtue of existing.
+    """
+    from ..config import BOOLS, ENUMS, LISTS, SPEC, STRINGS
 
     rows = []
     for key, (typ, low, high) in sorted(SPEC.items()):
@@ -115,6 +132,28 @@ def _spec_rows() -> list[dict[str, Any]]:
         )
     for key in sorted(BOOLS):
         rows.append({"key": key, "type": "bool", "min": None, "max": None, "kind": "bool"})
+    for key, max_len in sorted(STRINGS.items()):
+        rows.append(
+            {"key": key, "type": "str", "min": None, "max": max_len, "kind": "text"}
+        )
+    for key, (typ, low, high, max_len) in sorted(LISTS.items()):
+        rows.append(
+            {
+                "key": key, "type": f"list[{typ.__name__}]", "min": low, "max": high,
+                "kind": "list", "max_items": max_len,
+            }
+        )
+    # trading_mode is excluded from EDITABLE on purpose - going live is a
+    # separate, guarded action, not a dropdown on the settings page.
+    for key, options in sorted(ENUMS.items()):
+        if key == "trading_mode":
+            continue
+        rows.append(
+            {
+                "key": key, "type": "enum", "min": None, "max": None,
+                "kind": "enum", "options": sorted(options),
+            }
+        )
     return rows
 
 
@@ -185,10 +224,23 @@ def run_backtest():
     return redirect(url_for("dashboard.backtest"))
 
 
+@bp.route("/walkforward/run/<kind>", methods=["POST"])
+def run_wfmc(kind: str):
+    if kind not in ("daily", "monthly"):
+        flash(f"Unknown WFMC run kind: {kind}", "error")
+        return redirect(url_for("dashboard.walkforward"))
+    _enqueue(f"run_wfmc_{kind}")
+    flash(
+        f"{'Daily' if kind == 'daily' else 'Monthly RunPod'} walk-forward run queued.",
+        "success",
+    )
+    return redirect(url_for("dashboard.walkforward"))
+
+
 @bp.route("/backtest/pull", methods=["POST"])
 def historical_pull():
-    days = request.form.get("days", type=int)
-    _enqueue("historical_pull", {"days": days} if days else {})
+    months = request.form.get("months", type=int)
+    _enqueue("historical_pull", {"months": months} if months else {})
     flash(
         "Historical pull queued. Progress will appear here; this is the heavy "
         "one-time load, so it is rate limited.",

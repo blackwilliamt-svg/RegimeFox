@@ -10,7 +10,7 @@ import time
 
 import pytest
 
-from solbot.ratelimit import MonthlyBudget, TokenBucket
+from solbot.ratelimit import TokenBucket
 from solbot.scanner import Scanner
 
 from fakes import FakeJupiter
@@ -81,31 +81,6 @@ def test_configure_updates_limits_live():
     bucket.configure(100.0, 10)
     time.sleep(0.05)
     assert bucket.try_acquire(1.0)
-
-
-# --------------------------------------------------------------------------
-# monthly budget
-# --------------------------------------------------------------------------
-def test_budget_blocks_when_exhausted():
-    budget = MonthlyBudget(100)
-    assert budget.can_spend(50)
-    budget.spend(60)
-    assert budget.can_spend(40)
-    budget.spend(40)
-    assert not budget.can_spend(1)
-    assert budget.remaining == 0
-
-
-def test_zero_limit_means_unmetered():
-    budget = MonthlyBudget(0)
-    budget.spend(10_000_000)
-    assert budget.can_spend(1)
-    assert budget.remaining == -1
-
-
-def test_budget_percent_used():
-    budget = MonthlyBudget(1000, spent=250)
-    assert budget.stats()["percent_used"] == pytest.approx(25.0)
 
 
 # --------------------------------------------------------------------------
@@ -181,7 +156,7 @@ def test_open_positions_stay_pinned_hot(settings):
 
 
 def test_scanner_uses_only_jupiter(settings):
-    """Neither tier may touch Birdeye - its free tier is 1 rps in total."""
+    """Neither scan tier may touch Binance - it is reserved for candle history."""
     jupiter = FakeJupiter(prices={"a": 1.0, "b": 2.0})
     scanner = Scanner(jupiter, settings)
     result = scanner.scan_broad(["a", "b"])

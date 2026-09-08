@@ -1,8 +1,11 @@
 """SQLite storage.
 
-One file holds everything: historical candles, the trade journal, live position
-state, the event feed, auth records, and the command queue the dashboard uses to
-talk to the worker.
+Everything *except* bulk candle history: the trade journal, live position
+state, the event feed, auth records, walk-forward/Monte Carlo run results, and
+the command queue the dashboard uses to talk to the worker. Candle history
+lives as per-coin Parquet files instead (spec 3; see solbot.candlestore) -
+a year of 1-minute candles across a hundred coins has no business going
+through the same write path as the trading loop's own state.
 
 Two design points worth knowing before editing:
 
@@ -25,7 +28,7 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Sequence
+from typing import Any, Iterator, Sequence
 
 INSTANCES = ("live", "paper", "shadow")
 
@@ -34,20 +37,11 @@ PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
 PRAGMA foreign_keys=ON;
 
--- Historical OHLCV pulled from Birdeye, plus candles rolled up from live ticks.
-CREATE TABLE IF NOT EXISTS candles (
-    mint        TEXT    NOT NULL,
-    interval    TEXT    NOT NULL,          -- e.g. '10m'
-    ts          INTEGER NOT NULL,          -- unix seconds, candle open
-    open        REAL    NOT NULL,
-    high        REAL    NOT NULL,
-    low         REAL    NOT NULL,
-    close       REAL    NOT NULL,
-    volume      REAL    NOT NULL,          -- USD volume
-    source      TEXT    NOT NULL DEFAULT 'birdeye',
-    PRIMARY KEY (mint, interval, ts)
-) WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS idx_candles_ts ON candles(ts);
+-- Candle history is NOT stored here (spec 3): it lives as per-coin Parquet
+-- files under solbot.candlestore, one file per coin per month, read directly
+-- by both the live bot and the walk-forward optimizer. Routing it through
+-- SQLite would put a year of 1-minute candles across a hundred coins through
+-- the same write path as the trading loop's own state.
 
 -- Rolling live prices; used for correlation checks and the live chart tail.
 CREATE TABLE IF NOT EXISTS price_ticks (
@@ -70,6 +64,9 @@ CREATE TABLE IF NOT EXISTS universe (
     organic_score   REAL,
     is_verified     INTEGER DEFAULT 0,
     first_pool_at   INTEGER,
+    -- The Binance trading pair this mint was routed from (spec 2), e.g.
+    -- "BTCUSDT" - candle history is pulled from Binance under this symbol.
+    binance_pair    TEXT,
     updated_at      INTEGER NOT NULL
 );
 
@@ -117,6 +114,11 @@ CREATE TABLE IF NOT EXISTS positions (
     rr_target           REAL    NOT NULL,
     entry_reason        TEXT,
     entry_snapshot      TEXT,              -- JSON indicator state that justified it
+    -- Set per trade by the review gate: ride the move, or lock the gain in.
+    exit_style          TEXT,
+    trail_override_atr  REAL,
+    review_source       TEXT,
+    review_conviction   REAL,
     invalidation_count  INTEGER NOT NULL DEFAULT 0,
     entry_fee_usd       REAL    NOT NULL DEFAULT 0,
     entry_tx            TEXT,
@@ -202,16 +204,21 @@ CREATE TABLE IF NOT EXISTS commands (
 CREATE INDEX IF NOT EXISTS idx_cmd_pending ON commands(status, id);
 
 -- Every settings change, timestamped, with who made it.
+-- Every parameter change, whether made by the operator from the dashboard or
+-- by the bot itself (a promoted walk-forward bundle) - spec 6b. `username` is
+-- "auto-promotion" for a bot-made change; `reason` names the run/evidence
+-- that triggered it, and is blank for an ordinary manual edit.
 CREATE TABLE IF NOT EXISTS settings_audit (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     ts        INTEGER NOT NULL,
     username  TEXT,
     key       TEXT NOT NULL,
     old_value TEXT,
-    new_value TEXT
+    new_value TEXT,
+    reason    TEXT
 );
 
--- Long-running job progress (initial Birdeye pull, daily backtest).
+-- Long-running job progress (historical candle pull, daily backtest).
 CREATE TABLE IF NOT EXISTS job_progress (
     job        TEXT PRIMARY KEY,
     status     TEXT NOT NULL,             -- idle|running|done|failed|cancelled
@@ -221,16 +228,6 @@ CREATE TABLE IF NOT EXISTS job_progress (
     started_at INTEGER,
     updated_at INTEGER
 );
-
--- Birdeye compute-unit spend, bucketed by month, so the free tier's budget
--- is visible before it is blown rather than after.
-CREATE TABLE IF NOT EXISTS api_budget (
-    provider  TEXT NOT NULL,
-    month     TEXT NOT NULL,              -- 'YYYY-MM'
-    units     INTEGER NOT NULL DEFAULT 0,
-    calls     INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (provider, month)
-) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS backtest_runs (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -247,6 +244,111 @@ CREATE TABLE IF NOT EXISTS backtest_runs (
     params         TEXT,
     detail         TEXT
 );
+
+-- Every fill, with what it actually cost. The Monte Carlo module resamples
+-- slippage and fees from THESE rather than from the configured constants, so a
+-- strategy whose edge is thinner than its real fill costs is caught.
+CREATE TABLE IF NOT EXISTS execution_fills (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts            INTEGER NOT NULL,
+    instance      TEXT    NOT NULL,
+    mint          TEXT    NOT NULL,
+    side          TEXT    NOT NULL,        -- buy | sell
+    notional_usd  REAL    NOT NULL,
+    slippage_pct  REAL    NOT NULL,
+    fee_usd       REAL    NOT NULL,
+    fee_pct       REAL    NOT NULL,
+    simulated     INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_fills_ts ON execution_fills(ts DESC);
+
+-- Walk-forward runs happening on the optimizer PC, mirrored here so the
+-- dashboard can show a live feed of a search running on another machine.
+CREATE TABLE IF NOT EXISTS optimizer_runs (
+    run_id       INTEGER PRIMARY KEY,      -- the optimizer's own run id
+    started_at   INTEGER NOT NULL,
+    updated_at   INTEGER NOT NULL,
+    status       TEXT    NOT NULL,         -- running|done|failed
+    label        TEXT,
+    coverage     TEXT,
+    summary      TEXT,
+    monte_carlo  TEXT,
+    stress       TEXT,
+    notified     INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS optimizer_feed (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id    INTEGER NOT NULL,
+    remote_id INTEGER NOT NULL,            -- the line's id on the optimizer
+    ts        INTEGER NOT NULL,
+    level     TEXT    NOT NULL,
+    message   TEXT    NOT NULL,
+    detail    TEXT,
+    UNIQUE (run_id, remote_id)
+);
+CREATE INDEX IF NOT EXISTS idx_optfeed ON optimizer_feed(run_id, id);
+
+-- Parameter bundles pulled from the hand-off repository.
+CREATE TABLE IF NOT EXISTS param_bundles (
+    fingerprint   TEXT PRIMARY KEY,
+    received_at   INTEGER NOT NULL,
+    generated_at  INTEGER,
+    source_commit TEXT,
+    payload       TEXT    NOT NULL,        -- the whole bundle JSON
+    status        TEXT    NOT NULL,        -- pending|shadow|promoted|rejected|superseded
+    shadow_since  INTEGER,
+    installed_at  INTEGER,
+    note          TEXT
+);
+
+-- Auto-promotion decisions, kept whether they promoted or declined; a refusal
+-- is as much a part of the record as a promotion.
+CREATE TABLE IF NOT EXISTS promotions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts           INTEGER NOT NULL,
+    fingerprint  TEXT,
+    promoted     INTEGER NOT NULL,
+    reason       TEXT    NOT NULL,
+    shadow_days  REAL,
+    margin       REAL,
+    confidence   REAL,
+    detail       TEXT
+);
+
+-- Live/paper performance against backtest expectation (spec 4.5).
+CREATE TABLE IF NOT EXISTS drift_samples (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts                    INTEGER NOT NULL,
+    instance              TEXT    NOT NULL,
+    window_days           INTEGER NOT NULL,
+    live_trades           INTEGER NOT NULL,
+    live_win_rate         REAL,
+    live_expectancy       REAL,
+    live_profit_factor    REAL,
+    expected_win_rate     REAL,
+    expected_expectancy   REAL,
+    expected_profit_factor REAL,
+    status                TEXT    NOT NULL,   -- ok|watch|drifting|insufficient
+    detail                TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_drift_ts ON drift_samples(instance, ts DESC);
+
+-- Every entry-gate and daily-review decision, from the deterministic rules
+-- engine. There is no model in this loop to compare against, so this is a
+-- record of what the rules decided and why, not a calibration log.
+CREATE TABLE IF NOT EXISTS entry_reviews (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts             INTEGER NOT NULL,
+    kind           TEXT    NOT NULL,       -- gate | daily
+    instance       TEXT,
+    mint           TEXT,
+    decision       TEXT    NOT NULL,       -- approve | reject | applied | no_change
+    conviction     REAL,
+    exit_style     TEXT,                   -- ride | lock_in
+    detail         TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_reviews_ts ON entry_reviews(ts DESC);
 
 -- Dashboard auth. Password is argon2/bcrypt hashed; TOTP secret sits alongside.
 CREATE TABLE IF NOT EXISTS users (
@@ -307,9 +409,55 @@ def connect(path: str | Path | None = None) -> sqlite3.Connection:
     return conn
 
 
+# Columns added to existing tables after the first release. ``CREATE TABLE IF
+# NOT EXISTS`` cannot add a column to a table that already exists, so these are
+# applied separately; an already-migrated database sees no writes at all.
+MIGRATIONS: dict[str, dict[str, str]] = {
+    "positions": {
+        # Set by the review gate, per trade: whether this position is being
+        # ridden for a larger move or trailed tightly to lock the gain in.
+        "exit_style": "TEXT",
+        "trail_override_atr": "REAL",
+        "review_source": "TEXT",
+        "review_conviction": "REAL",
+    },
+    "universe": {
+        "binance_pair": "TEXT",
+    },
+    "settings_audit": {
+        "reason": "TEXT",
+    },
+}
+
+
+def migrate(conn: sqlite3.Connection) -> list[str]:
+    """Add any columns this version expects but an older database lacks."""
+    applied: list[str] = []
+    for table, columns in MIGRATIONS.items():
+        try:
+            existing = {
+                row["name"] for row in conn.execute(f"PRAGMA table_info({table})")
+            }
+        except sqlite3.Error:
+            continue
+        if not existing:
+            continue
+        for name, decl in columns.items():
+            if name in existing:
+                continue
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+            applied.append(f"{table}.{name}")
+    return applied
+
+
 def init_db(path: str | Path | None = None) -> sqlite3.Connection:
     conn = connect(path)
     conn.executescript(SCHEMA)
+    applied = migrate(conn)
+    if applied:
+        import logging
+
+        logging.getLogger(__name__).info("schema migrated: %s", ", ".join(applied))
     return conn
 
 
@@ -503,111 +651,68 @@ def get_progress(job: str, conn: sqlite3.Connection | None = None) -> dict[str, 
     return d
 
 
+
 # --------------------------------------------------------------------------
-# API budget accounting
+# execution fills - the observed cost model the Monte Carlo resamples
 # --------------------------------------------------------------------------
-def add_api_usage(
-    provider: str, units: int, *, conn: sqlite3.Connection | None = None
+def record_fill(
+    *,
+    instance: str,
+    mint: str,
+    side: str,
+    notional_usd: float,
+    slippage_pct: float,
+    fee_usd: float,
+    simulated: bool,
+    conn: sqlite3.Connection | None = None,
 ) -> None:
     conn = conn or connect()
-    month = time.strftime("%Y-%m", time.gmtime())
+    fee_pct = (fee_usd / notional_usd * 100.0) if notional_usd > 0 else 0.0
     conn.execute(
-        "INSERT INTO api_budget(provider, month, units, calls) VALUES (?, ?, ?, 1) "
-        "ON CONFLICT(provider, month) DO UPDATE SET units = units + excluded.units, "
-        "calls = calls + 1",
-        (provider, month, units),
+        "INSERT INTO execution_fills(ts, instance, mint, side, notional_usd, "
+        "slippage_pct, fee_usd, fee_pct, simulated) VALUES (?,?,?,?,?,?,?,?,?)",
+        (
+            now(), instance, mint, side, float(notional_usd), float(slippage_pct),
+            float(fee_usd), fee_pct, 1 if simulated else 0,
+        ),
     )
 
 
-def api_usage(provider: str, conn: sqlite3.Connection | None = None) -> dict[str, int]:
-    conn = conn or connect()
-    month = time.strftime("%Y-%m", time.gmtime())
-    row = conn.execute(
-        "SELECT units, calls FROM api_budget WHERE provider = ? AND month = ?",
-        (provider, month),
-    ).fetchone()
-    return {"units": row["units"] if row else 0, "calls": row["calls"] if row else 0}
-
-
-# --------------------------------------------------------------------------
-# candles
-# --------------------------------------------------------------------------
-def upsert_candles(
-    mint: str,
-    interval: str,
-    rows: Iterable[Sequence[Any]],
+def execution_samples(
     *,
-    source: str = "birdeye",
+    days: int = 90,
+    instances: Sequence[str] = ("live", "paper"),
+    limit: int = 5000,
     conn: sqlite3.Connection | None = None,
-) -> int:
-    """rows: iterable of (ts, open, high, low, close, volume)."""
+) -> list[tuple[float, float]]:
+    """``(slippage_pct, fee_pct)`` per side, newest first."""
     conn = conn or connect()
-    payload = [(mint, interval, int(r[0]), *[float(x) for x in r[1:6]], source) for r in rows]
-    if not payload:
-        return 0
-    conn.executemany(
-        "INSERT INTO candles(mint, interval, ts, open, high, low, close, volume, source) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
-        "ON CONFLICT(mint, interval, ts) DO UPDATE SET "
-        "open=excluded.open, high=excluded.high, low=excluded.low, "
-        "close=excluded.close, volume=excluded.volume",
-        payload,
-    )
-    return len(payload)
-
-
-def load_candles(
-    mint: str,
-    interval: str,
-    *,
-    limit: int | None = None,
-    since: int | None = None,
-    until: int | None = None,
-    conn: sqlite3.Connection | None = None,
-) -> list[sqlite3.Row]:
-    conn = conn or connect()
-    sql = "SELECT ts, open, high, low, close, volume FROM candles WHERE mint=? AND interval=?"
-    args: list[Any] = [mint, interval]
-    if since is not None:
-        sql += " AND ts >= ?"
-        args.append(int(since))
-    if until is not None:
-        sql += " AND ts <= ?"
-        args.append(int(until))
-    if limit:
-        sql += " ORDER BY ts DESC LIMIT ?"
-        args.append(int(limit))
-        rows = conn.execute(sql, args).fetchall()
-        return list(reversed(rows))
-    sql += " ORDER BY ts"
-    return conn.execute(sql, args).fetchall()
-
-
-def latest_candle_ts(
-    mint: str, interval: str, conn: sqlite3.Connection | None = None
-) -> int | None:
-    conn = conn or connect()
-    row = conn.execute(
-        "SELECT MAX(ts) AS t FROM candles WHERE mint = ? AND interval = ?", (mint, interval)
-    ).fetchone()
-    return int(row["t"]) if row and row["t"] is not None else None
+    placeholders = ",".join("?" * len(instances))
+    rows = conn.execute(
+        f"SELECT slippage_pct, fee_pct FROM execution_fills "
+        f"WHERE ts >= ? AND instance IN ({placeholders}) AND notional_usd > 0 "
+        f"ORDER BY ts DESC LIMIT ?",
+        (now() - int(days) * 86400, *instances, int(limit)),
+    ).fetchall()
+    return [(float(r["slippage_pct"]), float(r["fee_pct"])) for r in rows]
 
 
 # --------------------------------------------------------------------------
 # retention - keeps the database small enough for a 2GB droplet
+#
+# Candle history is never pruned (spec 3a): it lives in Parquet, kept
+# indefinitely, and is not touched here at all.
 # --------------------------------------------------------------------------
 def prune(
     *,
-    candle_days: int,
     tick_hours: int,
     event_days: int,
+    wfmc_days: int | None = None,
     conn: sqlite3.Connection | None = None,
 ) -> dict[str, int]:
     conn = conn or connect()
     t = now()
     deleted = {}
-    cur = conn.execute("DELETE FROM candles WHERE ts < ?", (t - candle_days * 86400,))
-    deleted["candles"] = cur.rowcount
     cur = conn.execute("DELETE FROM price_ticks WHERE ts < ?", (t - tick_hours * 3600,))
     deleted["price_ticks"] = cur.rowcount
     cur = conn.execute("DELETE FROM events WHERE ts < ?", (t - event_days * 86400,))
@@ -619,6 +724,53 @@ def prune(
     deleted["commands"] = cur.rowcount
     cur = conn.execute("DELETE FROM login_attempts WHERE ts < ?", (t - 30 * 86400,))
     deleted["login_attempts"] = cur.rowcount
+
+    # The fill history is the Monte Carlo's execution model, so it is kept for a
+    # full year rather than the shorter event retention - a thin sample there
+    # quietly turns a measured cost model back into an assumed one.
+    cur = conn.execute("DELETE FROM execution_fills WHERE ts < ?", (t - 365 * 86400,))
+    deleted["execution_fills"] = cur.rowcount
+    cur = conn.execute(
+        "DELETE FROM drift_samples WHERE ts < ?", (t - event_days * 86400,)
+    )
+    deleted["drift_samples"] = cur.rowcount
+    cur = conn.execute(
+        "DELETE FROM entry_reviews WHERE ts < ?", (t - event_days * 86400,)
+    )
+    deleted["entry_reviews"] = cur.rowcount
+    # Feed lines for finished runs age out; a running run's feed is never touched.
+    # Walk-forward/Monte Carlo output (spec 6c/7): the fastest-growing storage
+    # component, so it gets its own retention window rather than riding on the
+    # general event retention. A run still "running" is never touched
+    # regardless of age.
+    wfmc_cutoff = t - int(wfmc_days if wfmc_days is not None else event_days) * 86400
+    old_runs = [
+        int(r["run_id"]) for r in conn.execute(
+            "SELECT run_id FROM optimizer_runs WHERE status != 'running' AND updated_at < ?",
+            (wfmc_cutoff,),
+        ).fetchall()
+    ]
+    deleted["optimizer_feed"] = 0
+    deleted["optimizer_runs"] = 0
+    if old_runs:
+        placeholders = ",".join("?" * len(old_runs))
+        cur = conn.execute(
+            f"DELETE FROM optimizer_feed WHERE run_id IN ({placeholders})", old_runs
+        )
+        deleted["optimizer_feed"] = cur.rowcount
+        cur = conn.execute(
+            f"DELETE FROM optimizer_runs WHERE run_id IN ({placeholders})", old_runs
+        )
+        deleted["optimizer_runs"] = cur.rowcount
+
+    # A rejected or superseded bundle is only useful for as long as its run
+    # is; the active shadow/promoted one is never touched by age alone.
+    cur = conn.execute(
+        "DELETE FROM param_bundles WHERE status IN ('rejected', 'superseded') "
+        "AND received_at < ?",
+        (wfmc_cutoff,),
+    )
+    deleted["param_bundles"] = cur.rowcount
     return deleted
 
 

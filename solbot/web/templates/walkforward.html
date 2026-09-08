@@ -1,0 +1,196 @@
+{% extends "base.html" %}
+{% block title %}Walk-forward — Solana TA Bot{% endblock %}
+
+{% block content %}
+
+<div class="panel-head">
+  <h2>Walk-forward optimizer</h2>
+  <span class="hint" id="wfRunLabel">—</span>
+</div>
+
+<p class="hint" style="margin-top:-6px">
+  Daily incremental re-scoring runs on this droplet's own CPU against a focused parameter set;
+  a monthly full-space retest runs on a RunPod GPU worker this droplet spins up, ships data to,
+  and tears down afterward. What you see here is what either has reported.
+</p>
+
+<div class="btn-row" style="margin-bottom:16px">
+  <form method="post" action="{{ url_for('dashboard.run_wfmc', kind='daily') }}">
+    <button class="btn-ghost">Run daily walk-forward now</button>
+  </form>
+  <form method="post" action="{{ url_for('dashboard.run_wfmc', kind='monthly') }}">
+    <button class="btn-ghost">Run monthly RunPod retest now</button>
+  </form>
+</div>
+
+<div class="grid grid-4" style="margin:16px 0">
+  <div class="stat">
+    <div class="label">Walk-forward efficiency</div>
+    <div class="value" id="wfEfficiency">—</div>
+    <div class="sub" id="wfEfficiencySub">out-of-sample against in-sample</div>
+  </div>
+  <div class="stat">
+    <div class="label">Windows profitable</div>
+    <div class="value" id="wfWindows">—</div>
+    <div class="sub" id="wfWindowsSub">out of sample</div>
+  </div>
+  <div class="stat">
+    <div class="label">Mean window return</div>
+    <div class="value" id="wfMeanReturn">—</div>
+    <div class="sub" id="wfStdev">—</div>
+  </div>
+  <div class="stat">
+    <div class="label">5% worst-case drawdown</div>
+    <div class="value warn" id="wfP5Drawdown">—</div>
+    <div class="sub">this is what sizes positions</div>
+  </div>
+</div>
+
+<div id="wfFlags" class="btn-row" style="margin-bottom:16px"></div>
+
+<div class="grid grid-2" style="margin-bottom:16px">
+  <div class="panel">
+    <div class="panel-head">
+      <h2>Run feed</h2>
+      <span class="hint" id="wfStatus">—</span>
+    </div>
+    <p class="hint" style="margin-top:0">
+      What the optimizer is finding as it goes, in plain language.
+    </p>
+    <div class="feed" id="wfFeed">
+      <div class="empty">No run has reported in yet.</div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-head">
+      <h2>Monte Carlo</h2>
+      <span class="hint" id="mcSource">—</span>
+    </div>
+    <p class="hint" style="margin-top:0">
+      The out-of-sample trades resampled thousands of times, with slippage and fees drawn
+      from what execution actually cost rather than from assumed constants. The first chart is
+      the full distribution of worst drawdowns across those runs, not just the summary
+      percentile markers; the second is the actual equity curve of the ten worst simulated
+      runs, so what a bad stretch would look like is visible, not just its depth as a number.
+    </p>
+    <canvas id="mcChart" style="width:100%;height:220px"></canvas>
+    <div class="kv"><span>Median return</span><span id="mcMedianReturn">—</span></div>
+    <div class="kv"><span>5% worst-case return</span><span id="mcP5Return">—</span></div>
+    <div class="kv"><span>Median drawdown</span><span id="mcMedianDd">—</span></div>
+    <div class="kv"><span>5% worst-case drawdown</span><span id="mcP5Dd">—</span></div>
+    <div class="kv"><span>Historical drawdown</span><span id="mcHistoricalDd">—</span></div>
+    <div class="kv"><span>Chance of ending down</span><span id="mcLossProb">—</span></div>
+    <h3 style="font-size:13px;margin:14px 0 6px">Worst-case equity paths</h3>
+    <canvas id="mcPathsChart" style="width:100%;height:200px"></canvas>
+  </div>
+</div>
+
+<div class="panel" style="margin-bottom:16px">
+  <h2>Windows</h2>
+  <p class="hint" style="margin-top:0">
+    A window only counts once it has produced at least the minimum number of closed trades.
+    A window that did not reach it is neither a pass nor a fail — it is not evidence.
+  </p>
+  <div class="table-scroll">
+    <table>
+      <thead>
+        <tr>
+          <th>#</th><th>In-sample</th><th>Out-of-sample</th>
+          <th class="num">OOS trades</th><th class="num">OOS return</th>
+          <th class="num">Win rate</th><th>Verdict</th>
+        </tr>
+      </thead>
+      <tbody id="wfWindowRows">
+        <tr><td colspan="7" class="empty">No windows reported yet</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="grid grid-2" style="margin-bottom:16px">
+  <div class="panel">
+    <h2>Crash replay</h2>
+    <p class="hint" style="margin-top:0">
+      The worst stretches in the data, replayed on their own. A set that fails here is flagged
+      fragile and cannot be auto-promoted, however good the ordinary windows looked.
+    </p>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>Window</th><th>Result</th><th>Note</th></tr></thead>
+        <tbody id="wfStressRows">
+          <tr><td colspan="3" class="empty">No stress windows reported</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Live versus backtest drift</h2>
+    <p class="hint" style="margin-top:0">
+      Rolling comparison of what the rules are actually doing against what the backtest said
+      they would. Strategies rarely fail loudly; they win a little less often than they used to.
+    </p>
+    <canvas id="driftChart" style="width:100%;height:180px"></canvas>
+    <div id="driftRows"></div>
+  </div>
+</div>
+
+<div class="grid grid-2">
+  <div class="panel">
+    <h2>Parameter bundles</h2>
+    <p class="hint" style="margin-top:0">
+      Sets received from the daily on-droplet run or a monthly RunPod retest. Everything lands
+      in shadow first; promotion to live is automatic but needs a long clean run and a decisive
+      margin.
+    </p>
+    <div class="kv"><span>Last bundle received</span><span id="psLastPull">—</span></div>
+    <div class="table-scroll" style="margin-top:10px">
+      <table>
+        <thead><tr><th>Set</th><th>Status</th><th>Received</th><th>Note</th></tr></thead>
+        <tbody id="psBundleRows">
+          <tr><td colspan="4" class="empty">No parameter sets received yet</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Promotion decisions</h2>
+    <p class="hint" style="margin-top:0">
+      Every decision is recorded, including the refusals — a set that was not promoted is as
+      much part of the record as one that was.
+    </p>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>When</th><th>Outcome</th><th>Reason</th></tr></thead>
+        <tbody id="psPromotionRows">
+          <tr><td colspan="3" class="empty">No promotion decisions yet</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div class="panel" style="margin-top:16px">
+  <div class="panel-head">
+    <h2>Stored WF/MC runs</h2>
+    <span class="hint" id="storageRetention">—</span>
+  </div>
+  <p class="hint" style="margin-top:0">
+    Every daily on-droplet run, browsable by date and parameter bundle before it ages out.
+    Window scores, parameter bundles and Monte Carlo distributions are the fastest-growing
+    part of this bot's storage, so — unlike raw candle history, kept indefinitely — this is
+    purged automatically past the retention window above.
+  </p>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Run</th><th>Started</th><th>Finished</th><th>Status</th><th>Bundle</th></tr></thead>
+      <tbody id="wfmcStorageRows">
+        <tr><td colspan="5" class="empty">No stored runs yet</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% endblock %}

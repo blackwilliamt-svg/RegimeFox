@@ -35,10 +35,6 @@ class RateLimited(ApiError):
     """The provider returned 429 and the retry budget was exhausted."""
 
 
-class BudgetExhausted(ApiError):
-    """A metered provider has no monthly allowance left."""
-
-
 class HttpClient:
     """Thin wrapper over httpx.Client with a rate limiter attached."""
 

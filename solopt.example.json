@@ -1,0 +1,89 @@
+{
+  "_comment": [
+    "Baked into the RunPod worker image/env for the monthly retest (spec 5).",
+    "The daily on-droplet run does not use this file at all - it calls",
+    "solopt.pipeline directly. Do NOT put droplet_token here if this file",
+    "might end up in a container image - set SOLOPT_TOKEN in the environment",
+    "instead, which wins.",
+    "",
+    "Generate the token from the dashboard: Settings -> RunPod worker token."
+  ],
+
+  "droplet_url": "https://solbotmax.duckdns.org",
+  "droplet_token": "",
+
+  "data_dir": "data/bundle",
+  "store_path": "data/solopt.db",
+
+  "asset_class": "crypto",
+  "base_interval": "1m",
+  "timeframe_minutes": 10,
+
+  "_utilization_comment": [
+    "A fixed cap on how much of the machine the search may use, as a percentage",
+    "of wall-clock time. 60 leaves the PC responsive for other work; 100 runs",
+    "flat out. This is a duty cycle, not a thermal governor - it does what it",
+    "says regardless of what the GPU temperature is doing."
+  ],
+  "utilization_pct": 100,
+  "memory_budget_mb": 512,
+  "workers": 0,
+  "prefer_gpu": true,
+
+  "monte_carlo_iterations": 5000,
+  "push_feed": true,
+
+  "walk_forward": {
+    "in_sample_days": 60,
+    "out_of_sample_days": 15,
+    "step_days": 15,
+
+    "_thresholds_comment": "A window needs 30 closed trades to count; 70% of counted windows must be profitable; a set whose window returns vary more than they average is flagged overfit.",
+    "min_trades_per_window": 30,
+    "min_profitable_window_pct": 0.7,
+
+    "_search_comment": "The search stops at the cap or early once the best result stops improving for plateau_rounds batches.",
+    "max_evaluations": 2000,
+    "batch_size": 64,
+    "plateau_rounds": 4,
+
+    "_churn_comment": "Sets that trade above this rate are discounted. The prior configuration ran at roughly 35 a day and paid 449 USD in fees for it.",
+    "trades_per_day_cap": 8.0,
+
+    "per_symbol_enabled": true,
+    "per_symbol_min_trades": 60,
+    "per_symbol_margin": 0.2,
+    "per_symbol_max_evaluations": 400
+  },
+
+  "portfolio": {
+    "starting_balance": 1000.0,
+    "max_total_deployed_pct": 0.90,
+    "max_position_pct_of_wallet": 0.45,
+    "max_position_pct_of_liquidity": 0.01,
+    "min_position_usd": 10.0,
+    "min_candles_required": 40,
+    "fee_pct": 0.25,
+    "slippage_pct": 0.5,
+    "confluence_multiples": [3, 6],
+    "sizing_mode": "portfolio",
+    "portfolio_vol_target": 0.019,
+    "drawdown_tolerance": 0.25
+  },
+
+  "stress": {
+    "crash_windows": 3,
+    "flash_windows": 2,
+    "crash_days": 7,
+    "min_index_decline": 0.15,
+    "min_flash_decline": 0.08,
+    "max_stress_drawdown": 0.3,
+    "min_stress_return": -0.15
+  },
+
+  "_grid_comment": [
+    "Omit 'grid' entirely to use solopt.params.DEFAULT_GRID. Keep it coarse:",
+    "a fine grid over sixteen axes is a curve-fitting machine, and the",
+    "walk-forward windows are what earn the right to narrow it later."
+  ]
+}

@@ -23,7 +23,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .indicators import Snapshot, compute, snapshot_at
+from .indicators import Snapshot, compute, regime_allowed, snapshot_at
 
 
 @dataclass(slots=True)
@@ -135,6 +135,32 @@ def evaluate_entry(
     else:
         passed.append(f"pool depth ${liquidity_usd:,.0f}")
 
+    # --- 5. regime gate (spec 4.1) ----------------------------------------
+    # Which signals are allowed to fire depends on what the market is doing.
+    # Chop is excluded by default: a volume spike inside a whipsaw looks
+    # identical to one starting a move, and paying the spread to find out which
+    # is what produced the fee bill in the earlier backtest.
+    if cfg.get("regime_gate_enabled", True):
+        if not regime_allowed(snap.regime, int(cfg.get("regime_allowed", 7))):
+            reasons.append(f"{snap.regime_name} market is not an allowed regime")
+        else:
+            passed.append(f"{snap.regime_name} market (efficiency {snap.efficiency:.2f})")
+
+    # --- 6. multi-timeframe confluence (spec 4.2) -------------------------
+    if cfg.get("confluence_enabled", True):
+        needed = int(cfg.get("confluence_required", 0))
+        frames = cfg.get("confluence_timeframes") or []
+        if needed > 0:
+            if snap.confluence >= needed:
+                passed.append(
+                    f"{snap.confluence} of {len(frames)} higher timeframes agree"
+                )
+            else:
+                reasons.append(
+                    f"only {snap.confluence} of {len(frames)} higher timeframes agree "
+                    f"(need {needed})"
+                )
+
     # --- "of interest": early characteristics worth a faster poll ---------
     # Deliberately looser than the entry gate. The point is to escalate a token
     # to the 1s tier while the signal is still forming, so the entry window is
@@ -203,7 +229,7 @@ def _levels(snap: Snapshot, cfg: dict[str, Any]) -> tuple[float, float, float, f
     rr = rr_min + (rr_max - rr_min) * strength
     rr = max(rr_min, min(rr_max, rr))
 
-    stop_distance = atr_val * 1.2
+    stop_distance = atr_val * float(cfg.get("stop_atr_mult", 1.2))
     stop = price - stop_distance
     target = price + stop_distance * rr
     return stop, target, rr, strength

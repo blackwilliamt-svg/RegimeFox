@@ -73,11 +73,12 @@ def create_app(config: Config | None = None) -> Flask:
             return "—"
         return f"-${abs(v):,.2f}" if v < 0 else f"${v:,.2f}"
 
-    from . import api, auth, routes
+    from . import api, auth, optimizer, routes
 
     app.register_blueprint(auth.bp)
     app.register_blueprint(routes.bp)
     app.register_blueprint(api.bp, url_prefix="/api")
+    app.register_blueprint(optimizer.bp, url_prefix="/api")
     auth.install_guard(app)
 
     @app.after_request

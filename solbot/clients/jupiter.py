@@ -70,6 +70,10 @@ class TokenInfo:
     top_holders_pct: float = 0.0
     first_pool_at: int | None = None
     tags: list[str] = field(default_factory=list)
+    # The Binance pair this mint was routed from (spec 2), e.g. "BTCUSDT" -
+    # candle history is pulled from Binance under this symbol. Empty for a
+    # token found some other way (search, manual entry).
+    binance_pair: str = ""
 
 
 @dataclass(slots=True)

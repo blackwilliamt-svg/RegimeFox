@@ -14,10 +14,16 @@ EnvironmentFile=/opt/solana-ta-bot/.env
 # Two workers is plenty: the dashboard is read-mostly and the trading loop lives
 # in a separate process. More workers on a 1 vCPU box just adds contention.
 # Bound to localhost only - nginx terminates TLS and is the sole public entry.
+#
+# The timeout is generous rather than the 60s default as a liveness ceiling,
+# not a target - ordinary dashboard requests, and the /optimizer/bundle a
+# RunPod worker POSTs back at the end of a monthly retest, all finish in
+# well under a second. The threads keep the dashboard responsive under a
+# handful of concurrent requests without adding a second worker process.
 ExecStart=/opt/solana-ta-bot/.venv/bin/gunicorn \
     --workers 2 \
     --threads 4 \
-    --timeout 60 \
+    --timeout 600 \
     --graceful-timeout 30 \
     --bind 127.0.0.1:8090 \
     --access-logfile - \

@@ -71,8 +71,12 @@ def test_refuses_when_entire_balance_is_reserve(settings):
     assert out.capped_by == "gas_reserve"
 
 
-def test_deployment_never_exceeds_the_concurrent_cap(settings):
-    """With one position open, the second cannot exceed the remaining allowance."""
+def test_deployment_never_exceeds_the_total_deployed_cap(settings):
+    """A second position cannot exceed what the total-deployed budget has left.
+
+    There is no position-count ceiling (spec 4): the budget is a percentage of
+    the wallet, not a fixed number of slots.
+    """
     out = risk.size_position(
         wallet_usd=1000.0, liquidity_usd=10_000_000.0, price=1.0,
         atr_pct=settings["volatility_target_atr_pct"], cfg=settings,
@@ -80,7 +84,25 @@ def test_deployment_never_exceeds_the_concurrent_cap(settings):
     )
     assert out.size_usd <= 450.0
     total = 450.0 + out.size_usd
-    assert total <= 1000.0 * 0.45 * settings["max_concurrent_positions"] + 1e-6
+    assert total <= 1000.0 * settings["max_total_deployed_pct"] + 1e-6
+
+
+def test_a_third_and_fourth_position_can_still_open_if_budget_remains(settings):
+    """No count ceiling: sizing keeps succeeding as long as the budget has room."""
+    cfg = {**settings, "max_position_pct_of_wallet": 0.30, "max_total_deployed_pct": 0.90}
+    deployed = 0.0
+    opened = 0
+    for _ in range(6):
+        out = risk.size_position(
+            wallet_usd=1000.0, liquidity_usd=10_000_000.0, price=1.0,
+            atr_pct=cfg["volatility_target_atr_pct"], cfg=cfg, deployed_usd=deployed,
+        )
+        if not out.ok:
+            break
+        deployed += out.size_usd
+        opened += 1
+    assert opened >= 3, "a 30%-per-position cap under a 90% total should allow at least 3"
+    assert deployed <= 1000.0 * 0.90 + 1e-6
 
 
 def test_rejects_size_below_minimum(settings):
@@ -178,21 +200,19 @@ def test_drawdown_peak_survives_a_restart(workspace, settings):
 
 def test_kill_switch_blocks_new_positions(workspace, settings):
     conn = workspace["conn"]
-    gate = risk.can_open_position(open_count=0, cfg=settings, conn=conn)
+    gate = risk.can_open_position(cfg=settings, conn=conn)
     assert gate.allowed
 
     risk.engage_kill_switch("testing", "tester", conn)
-    gate = risk.can_open_position(open_count=0, cfg=settings, conn=conn)
+    gate = risk.can_open_position(cfg=settings, conn=conn)
     assert not gate.allowed
     assert "kill switch" in gate.reason
 
     risk.release_kill_switch("tester", conn)
-    assert risk.can_open_position(open_count=0, cfg=settings, conn=conn).allowed
+    assert risk.can_open_position(cfg=settings, conn=conn).allowed
 
 
-def test_position_cap_blocks_extra_entries(workspace, settings):
-    gate = risk.can_open_position(
-        open_count=settings["max_concurrent_positions"], cfg=settings, conn=workspace["conn"]
-    )
-    assert not gate.allowed
-    assert "already holding" in gate.reason
+def test_open_position_gate_has_no_position_count_ceiling(workspace, settings):
+    """Concurrency is bounded by the total-deployed budget, not a fixed count."""
+    gate = risk.can_open_position(cfg=settings, conn=workspace["conn"])
+    assert gate.allowed

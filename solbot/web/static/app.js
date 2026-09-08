@@ -125,7 +125,8 @@
     return "$" + v.toPrecision(4);
   }
 
-  /* Two open positions render as two clearly labelled charts side by side. */
+  /* Every open position renders as its own clearly labelled chart, wrapping
+   * to as many rows as needed - there is no fixed position-count cap. */
   function renderPositionCharts(host, rows) {
     if (!rows.length) {
       host.innerHTML = '<div class="panel"><div class="empty">' +
@@ -217,13 +218,14 @@
     if (!el("pullProgress") && !el("backtestProgress")) return Promise.resolve();
     return get("/api/progress").then(function (d) {
       bar("pull", d.historical_pull);
+      bar("dailyPull", d.daily_incremental_pull);
       bar("backtest", d.backtest);
-      var b = el("budgetUsed");
-      if (b && d.birdeye_budget) {
-        var used = d.birdeye_budget.units || 0;
-        var limit = d.birdeye_budget.limit || 0;
-        b.textContent = used.toLocaleString() + " / " + limit.toLocaleString() + " CU" +
-          (limit ? " (" + ((used / limit) * 100).toFixed(1) + "%)" : "");
+      var cov = el("candleCoverage");
+      if (cov && d.candle_coverage) {
+        var c = d.candle_coverage;
+        cov.textContent = (c.tokens || 0) + " coins, " + (c.candles || 0).toLocaleString() +
+          " candles, " + (c.days || 0) + " days (" +
+          ((c.disk && c.disk.megabytes) || 0).toLocaleString() + " MB on disk)";
       }
     });
   }
@@ -242,6 +244,265 @@
     }
     wrap.style.display = "";
   }
+
+  /* ---------- walk-forward tab ---------- */
+  var wfFeedSince = 0;
+  var wfRunId = null;
+  var mcData = null;
+
+  function pctText(v, digits) {
+    if (v === null || v === undefined) return "—";
+    return (v * 100).toFixed(digits === undefined ? 1 : digits) + "%";
+  }
+  function signedPct(v, digits) {
+    if (v === null || v === undefined) return "—";
+    return (v >= 0 ? "+" : "") + (v * 100).toFixed(digits === undefined ? 1 : digits) + "%";
+  }
+
+  function loadWalkForward() {
+    if (!el("wfFeed")) return Promise.resolve();
+    return get("/api/walkforward").then(function (d) {
+      var run = d.run;
+      if (!run) { setText("wfStatus", "no runs yet"); return; }
+
+      // A new run resets the feed cursor so a fresh search does not append to
+      // the previous one's narration.
+      if (wfRunId !== run.run_id) { wfRunId = run.run_id; wfFeedSince = 0; clear("wfFeed"); }
+
+      var cov = run.coverage || {};
+      setText("wfRunLabel",
+        "run " + run.run_id + (run.label ? " · " + run.label : "") +
+        (cov.symbols ? " · " + cov.symbols + " coins, " + (cov.days || 0) + " days" : ""));
+      setText("wfStatus", run.status === "running"
+        ? "running — last update " + Math.round(run.age_seconds) + "s ago"
+        : run.status);
+
+      var s = run.summary || {};
+      var wfe = s.walk_forward_efficiency;
+      setText("wfEfficiency", wfe === undefined || wfe === null ? "—" : wfe.toFixed(2));
+      var eff = el("wfEfficiency");
+      if (eff) eff.className = "value " + (wfe >= 0.5 ? "pos" : (wfe > 0 ? "warn" : "dim"));
+      setText("wfEfficiencySub", s.counted_windows
+        ? "out-of-sample kept " + Math.round((wfe || 0) * 100) + "% of in-sample"
+        : "out-of-sample against in-sample");
+
+      setText("wfWindows", (s.profitable_windows || 0) + " / " + (s.counted_windows || 0));
+      setText("wfWindowsSub", s.counted_windows
+        ? Math.round((s.profitable_share || 0) * 100) + "% profitable"
+        : "no window reached the trade floor");
+      setText("wfMeanReturn", signedPct(s.mean_window_return, 2));
+      var mean = el("wfMeanReturn");
+      if (mean) mean.className = "value " + cls(s.mean_window_return || 0);
+      setText("wfStdev", "std dev " + pctText(s.stdev_window_return, 2));
+
+      renderFlags(s);
+      renderWindows(s);
+      renderMonteCarlo(run.monte_carlo);
+      renderStress(run.stress);
+      return loadWalkForwardFeed(run.run_id);
+    });
+  }
+
+  function renderFlags(s) {
+    var box = el("wfFlags");
+    if (!box) return;
+    var flags = [];
+    if (s.overfit) {
+      flags.push(["neg", "OVERFIT — window returns swing more than they average"]);
+    }
+    if (s.fragile) {
+      flags.push(["neg", "FRAGILE — failed the crash replay: " +
+        (s.fragile_windows || []).join(", ")]);
+    }
+    if (s.accepted) {
+      flags.push(["pos", "Accepted — met every walk-forward, Monte Carlo and stress gate"]);
+    }
+    (s.reasons || []).forEach(function (r) { flags.push(["warn", "Not accepted: " + r]); });
+    if (!flags.length && s.counted_windows) flags.push(["dim", "No flags raised."]);
+
+    box.innerHTML = flags.map(function (f) {
+      return '<span class="mode ' + f[0] + '">' + esc(f[1]) + "</span>";
+    }).join("");
+  }
+
+  function renderWindows(s) {
+    var body = el("wfWindowRows");
+    if (!body) return;
+    var windows = s.windows_detail || [];
+    if (!windows.length) return;   // the summary carries counts, not per-window rows
+    body.innerHTML = windows.map(function (w, i) {
+      var m = w.oos_metrics || {};
+      var verdict = !w.counted
+        ? '<span class="dim">not enough trades</span>'
+        : (w.profitable ? '<span class="pos">held up</span>'
+                        : '<span class="neg">did not hold up</span>');
+      return "<tr><td>" + (i + 1) + "</td><td class='mono nowrap'>" + esc(w.is_label || "") +
+        "</td><td class='mono nowrap'>" + esc(w.oos_label || "") +
+        "</td><td class='num'>" + (m.trades || 0) +
+        "</td><td class='num " + cls(m.total_return || 0) + "'>" + signedPct(m.total_return, 2) +
+        "</td><td class='num'>" + pctText(m.win_rate, 0) +
+        "</td><td>" + verdict + "</td></tr>";
+    }).join("");
+  }
+
+  function renderMonteCarlo(mc) {
+    if (!mc) return;
+    mcData = mc;
+    setText("mcMedianReturn", signedPct(mc.median_return, 2));
+    setText("mcP5Return", signedPct(mc.p5_return, 2));
+    setText("mcMedianDd", pctText(mc.median_max_drawdown, 2));
+    setText("mcP5Dd", pctText(mc.p5_max_drawdown, 2));
+    setText("mcHistoricalDd", pctText(mc.historical_max_drawdown, 2));
+    setText("mcLossProb", pctText(mc.probability_of_loss, 1));
+    setText("wfP5Drawdown", pctText(mc.p5_max_drawdown, 1));
+    var exec = mc.execution || {};
+    setText("mcSource", (mc.iterations || 0).toLocaleString() + " runs · " +
+      (exec.source === "observed"
+        ? exec.samples + " observed fills"
+        : "assumed execution costs"));
+    drawMonteCarlo();
+  }
+
+  function drawMonteCarlo() {
+    var canvas = el("mcChart");
+    if (canvas && mcData) {
+      var hist = mcData.drawdown_histogram ||
+        (mcData.histograms && mcData.histograms.drawdown);
+      if (hist) {
+        window.SolChart.histogram(canvas, hist, {
+          height: 220,
+          marker: mcData.p5_max_drawdown,
+          median: mcData.median_max_drawdown,
+          format: function (v) { return (v * 100).toFixed(0) + "%"; },
+          empty: "No out-of-sample trades to resample yet"
+        });
+      }
+    }
+    var pathsCanvas = el("mcPathsChart");
+    if (pathsCanvas && mcData) {
+      window.SolChart.paths(pathsCanvas, mcData.paths || [], {
+        height: 200,
+        empty: "No simulated paths yet"
+      });
+    }
+  }
+
+  function renderStress(rows) {
+    var body = el("wfStressRows");
+    if (!body || !rows || !rows.length) return;
+    body.innerHTML = rows.map(function (r) {
+      return "<tr><td class='mono'>" + esc(r.name) + "</td><td>" +
+        (r.passed ? '<span class="pos">survived</span>' : '<span class="neg">FAILED</span>') +
+        "</td><td class='hint'>" + esc(r.note || "") + "</td></tr>";
+    }).join("");
+  }
+
+  function loadWalkForwardFeed(runId) {
+    return get("/api/walkforward/feed?run=" + runId + "&since_id=" + wfFeedSince)
+      .then(function (d) {
+        var box = el("wfFeed");
+        if (!box || !d.lines || !d.lines.length) return;
+        if (box.querySelector(".empty")) box.innerHTML = "";
+        d.lines.forEach(function (line) {
+          if (line.id > wfFeedSince) wfFeedSince = line.id;
+          var div = document.createElement("div");
+          div.className = "feed-item feed-" + esc(line.level);
+          div.innerHTML =
+            '<span class="feed-time">' + fmtTime(line.ts) + "</span>" +
+            '<span class="feed-msg">' + esc(line.message) + "</span>";
+          box.appendChild(div);
+        });
+        while (box.children.length > 400) box.removeChild(box.firstChild);
+        box.scrollTop = box.scrollHeight;
+      });
+  }
+
+  function loadDrift() {
+    if (!el("driftRows")) return Promise.resolve();
+    return get("/api/drift?limit=200").then(function (d) {
+      var box = el("driftRows");
+      var latest = d.latest || {};
+      var names = Object.keys(latest);
+      box.innerHTML = names.length
+        ? names.map(function (n) {
+            var s = latest[n];
+            var klass = s.status === "drifting" ? "neg"
+              : (s.status === "watch" ? "warn" : (s.status === "ok" ? "pos" : "dim"));
+            return '<div class="kv"><span>' + esc(n) + '</span><span class="' + klass +
+              '">' + esc(s.status) + "</span></div>" +
+              '<p class="hint">' + esc((s.detail && s.detail.message) || "") + "</p>";
+          }).join("")
+        : '<p class="hint">No drift samples yet — a backtest and some live trades are needed first.</p>';
+
+      var series = {};
+      (d.samples || []).forEach(function (s) {
+        if (!series[s.instance]) series[s.instance] = [];
+        series[s.instance].push({ time: s.ts, value: s.live_expectancy });
+      });
+      var canvas = el("driftChart");
+      if (canvas && Object.keys(series).length) {
+        window.SolChart.lines(canvas, series, { height: 180 });
+      }
+    });
+  }
+
+  function loadParamSync() {
+    if (!el("psBundleRows")) return Promise.resolve();
+    return get("/api/paramsync").then(function (d) {
+      var last = d.last_bundle || {};
+      setText("psLastPull", last.ts
+        ? fmtTime(last.ts) + " · " + String(last.source || "")
+        : "never");
+
+      var bundles = d.bundles || [];
+      if (bundles.length) {
+        el("psBundleRows").innerHTML = bundles.map(function (b) {
+          var klass = b.status === "promoted" ? "pos"
+            : (b.status === "rejected" ? "neg" : (b.status === "shadow" ? "warn" : "dim"));
+          return "<tr><td class='mono'>" + esc(b.fingerprint) + "</td><td class='" + klass +
+            "'>" + esc(b.status) + "</td><td class='nowrap'>" + fmtTime(b.received_at) +
+            "</td><td class='hint'>" + esc(b.note || "") + "</td></tr>";
+        }).join("");
+      }
+
+      var promotions = d.promotions || [];
+      if (promotions.length) {
+        el("psPromotionRows").innerHTML = promotions.map(function (p) {
+          return "<tr><td class='nowrap'>" + fmtTime(p.ts) + "</td><td class='" +
+            (p.promoted ? "pos" : "dim") + "'>" +
+            (p.promoted ? "promoted" : "held") + "</td><td class='hint'>" +
+            esc(p.reason) + "</td></tr>";
+        }).join("");
+      }
+    });
+  }
+
+  /* ---------- WF/MC storage browser (spec 6c) ---------- */
+  function loadWfmcStorage() {
+    if (!el("wfmcStorageRows")) return Promise.resolve();
+    return get("/api/wfmc/storage").then(function (d) {
+      setText("storageRetention", "kept " + (d.retention_days || 0) + " days");
+      var runs = d.runs || [];
+      if (!runs.length) return;
+      el("wfmcStorageRows").innerHTML = runs.map(function (r) {
+        var klass = r.status === "done" ? "pos" : (r.status === "failed" ? "neg" : "dim");
+        return "<tr><td class='mono'>" + r.id + (r.label ? " · " + esc(r.label) : "") +
+          "</td><td class='nowrap'>" + fmtTime(r.started_at) +
+          "</td><td class='nowrap'>" + (r.finished_at ? fmtTime(r.finished_at) : "—") +
+          "</td><td class='" + klass + "'>" + esc(r.status) +
+          "</td><td class='mono dim'>" + esc(r.bundle || "") + "</td></tr>";
+      }).join("");
+    });
+  }
+
+  function fmtTime(ts) {
+    var d = new Date(ts * 1000);
+    return d.toLocaleString(undefined, {
+      month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"
+    });
+  }
+
+  function clear(id) { var e = el(id); if (e) e.innerHTML = ""; }
 
   /* ---------- key rotation ---------- */
   document.addEventListener("submit", function (ev) {
@@ -285,6 +546,43 @@
       });
   });
 
+  /* ---------- bulk data token ---------- */
+  var genToken = el("genBulkToken");
+  if (genToken) {
+    genToken.addEventListener("click", function () {
+      if (!confirm(
+        "Generate a new bulk data token?\n\n" +
+        "The current token stops working immediately. Any optimizer still using it " +
+        "will not be able to download history until you update SOLOPT_TOKEN on that machine."
+      )) return;
+
+      var status = el("bulkTokenStatus");
+      var value = el("bulkTokenValue");
+      genToken.disabled = true;
+      status.className = "hint";
+      status.innerHTML = '<span class="spinner">◌</span> Generating…';
+
+      fetch("/api/keys/bulk_data/generate", { method: "POST", credentials: "same-origin" })
+        .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+        .then(function (res) {
+          genToken.disabled = false;
+          if (res.ok && res.body.ok) {
+            status.className = "hint pos";
+            status.textContent = "✓ " + res.body.message;
+            value.textContent = res.body.token;
+          } else {
+            status.className = "hint neg";
+            status.textContent = "✗ " + (res.body.error || "Could not generate a token");
+          }
+        })
+        .catch(function (e) {
+          genToken.disabled = false;
+          status.className = "hint neg";
+          status.textContent = "✗ " + e.message;
+        });
+    });
+  }
+
   /* ---------- kill switch two-step confirm ---------- */
   document.addEventListener("submit", function (ev) {
     var form = ev.target;
@@ -303,6 +601,7 @@
   function refreshCharts() {
     loadPositions().catch(noop);
     loadEquity().catch(noop);
+    drawMonteCarlo();
   }
   function noop() {}
 
@@ -312,6 +611,10 @@
     loadEvents().catch(noop);
     loadEquity().catch(noop);
     loadProgress().catch(noop);
+    loadWalkForward().catch(noop);
+    loadDrift().catch(noop);
+    loadParamSync().catch(noop);
+    loadWfmcStorage().catch(noop);
   }
 
   if (document.body.dataset.live !== "off") {

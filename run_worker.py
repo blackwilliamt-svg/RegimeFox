@@ -16,8 +16,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from solbot import db
-from solbot.backtest import run_and_store
+from solbot import daily_review, db
+from solbot.backtest import Backtester, run_and_store
 from solbot.config import get_config
 from solbot.engine import Engine
 from solbot.lock import AlreadyRunning, ProcessLock
@@ -52,13 +52,41 @@ def main() -> int:
         return 1
 
     engine = Engine(config)
+    # The real worker process is the one place a scheduled WFMC run should
+    # actually fire - see Engine._wfmc_hook_enabled.
+    engine._wfmc_hook_enabled = True
 
-    # Wire the backtest in so the daily schedule and the dashboard button work.
+    # Wire the backtest in so the daily schedule and the dashboard button work,
+    # and hang the daily review off the end of it.
     def run_backtest(days: int) -> None:
         try:
-            run_and_store(engine.store, engine.cfg, days=days)
+            result = run_and_store(engine.store, engine.cfg, days=days)
         except Exception:
             log.exception("backtest failed")
+            return
+
+        if not engine.cfg.get("daily_review_enabled", True):
+            return
+
+        def rerun(overrides: dict) -> dict:
+            """Backtest a proposed set over the identical window.
+
+            Same days, same stored candles, same basket - only the parameters
+            differ, which is the only way the before-and-after numbers the spec
+            asks for actually mean anything.
+            """
+            candidate = {**engine.cfg, **overrides}
+            return Backtester(engine.store, candidate).run(days=days).summary()
+
+        try:
+            daily_review.run_daily_review(
+                cfg=engine.cfg,
+                summary=result.summary(),
+                days=days,
+                backtest=rerun,
+            )
+        except Exception:
+            log.exception("daily review failed")
 
     engine._backtest_hook = run_backtest
 

@@ -113,28 +113,46 @@ class Portfolio:
         entry_reason: str,
         snapshot: dict[str, Any] | None,
         manual: bool = False,
+        review: dict[str, Any] | None = None,
         conn: sqlite3.Connection | None = None,
     ) -> int:
         conn = conn or db.connect()
         now = db.now()
         risk = max(1e-12, fill.price - stop)
+        review = review or {}
 
         with db.transaction(conn):
             cur = conn.execute(
                 "INSERT INTO positions(instance, mint, symbol, status, entry_price, entry_ts, "
                 "qty, size_usd, hard_stop, take_profit, trailing_stop, trailing_armed, "
                 "high_water_price, initial_risk, rr_target, entry_reason, entry_snapshot, "
+                "exit_style, trail_override_atr, review_source, review_conviction, "
                 "entry_fee_usd, entry_tx, manual, updated_at) "
-                "VALUES (?,?,?,'open',?,?,?,?,?,?,NULL,0,?,?,?,?,?,?,?,?,?)",
+                "VALUES (?,?,?,'open',?,?,?,?,?,?,NULL,0,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     self.instance, mint, symbol, fill.price, now, fill.qty, fill.gross_usd,
                     stop, target, fill.price, risk, rr, entry_reason,
-                    json.dumps(snapshot or {}), fill.fee_usd, fill.tx_signature,
-                    1 if manual else 0, now,
+                    json.dumps(snapshot or {}),
+                    review.get("exit_style"), review.get("trailing_distance_atr"),
+                    review.get("source"), review.get("conviction"),
+                    fill.fee_usd, fill.tx_signature, 1 if manual else 0, now,
                 ),
             )
             position_id = int(cur.lastrowid)
             self.adjust_balance(-fill.gross_usd, conn)
+            # The Monte Carlo module resamples slippage and fees from these rows
+            # rather than from the configured constants, so every fill is
+            # recorded whether it was simulated or real.
+            db.record_fill(
+                instance=self.instance,
+                mint=mint,
+                side="buy",
+                notional_usd=fill.gross_usd,
+                slippage_pct=fill.slippage_pct,
+                fee_usd=fill.fee_usd,
+                simulated=bool(fill.detail.get("simulated")),
+                conn=conn,
+            )
 
         db.log_event(
             f"OPENED {symbol or mint[:8]} - ${fill.gross_usd:,.2f} at ${fill.price:.6g}, "
@@ -213,6 +231,16 @@ class Portfolio:
                 ),
             )
             self.adjust_balance(proceeds, conn)
+            db.record_fill(
+                instance=self.instance,
+                mint=position["mint"],
+                side="sell",
+                notional_usd=fill.gross_usd,
+                slippage_pct=fill.slippage_pct,
+                fee_usd=fill.fee_usd,
+                simulated=bool(fill.detail.get("simulated")),
+                conn=conn,
+            )
 
         tag = "MANUAL " if manual else ""
         db.log_event(

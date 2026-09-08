@@ -122,7 +122,7 @@ def test_recovery_reloads_open_positions(workspace, settings):
     open_a_position(p, conn)
 
     clients = fake_clients(prices={MINT: 1.10})
-    store = DataStore(clients.birdeye, settings)
+    store = DataStore(clients.binance, settings)
 
     report = recover(portfolio=p, clients=clients, store=store, cfg=settings, conn=conn)
 
@@ -141,7 +141,7 @@ def test_recovery_recomputes_stops_from_price_moved_while_down(workspace, settin
     assert before["trailing_stop"] is None
 
     clients = fake_clients(prices={MINT: 1.40})   # +8R while offline
-    store = DataStore(clients.birdeye, settings)
+    store = DataStore(clients.binance, settings)
     report = recover(portfolio=p, clients=clients, store=store, cfg=settings, conn=conn)
 
     after = conn.execute("SELECT * FROM positions WHERE id = ?", (position_id,)).fetchone()
@@ -156,7 +156,7 @@ def test_recovery_on_a_clean_start_is_a_no_op(workspace, settings):
     conn = workspace["conn"]
     p = Portfolio("paper", settings)
     clients = fake_clients()
-    store = DataStore(clients.birdeye, settings)
+    store = DataStore(clients.binance, settings)
 
     report = recover(portfolio=p, clients=clients, store=store, cfg=settings, conn=conn)
     assert report.positions_recovered == 0
@@ -172,7 +172,7 @@ def test_halts_are_re_announced_after_a_restart(workspace, settings):
 
     p = Portfolio("paper", settings)
     clients = fake_clients()
-    store = DataStore(clients.birdeye, settings)
+    store = DataStore(clients.binance, settings)
     recover(portfolio=p, clients=clients, store=store, cfg=settings, conn=conn)
 
     # Both are still in force after the "restart".
@@ -225,7 +225,7 @@ def test_live_mismatch_halts_trading(workspace, settings):
             return {"pubkey": "Wallet111", "sol": 1.0, "tokens": {}}  # holds nothing
 
     clients = fake_clients(prices={MINT: 1.0})
-    store = DataStore(clients.birdeye, settings)
+    store = DataStore(clients.binance, settings)
     report = recover(
         portfolio=p, clients=clients, store=store, cfg=settings,
         executor=Executor(), conn=conn,
@@ -250,7 +250,7 @@ def test_live_reconciliation_passes_when_consistent(workspace, settings):
             return {"pubkey": "Wallet111", "sol": 1.0, "tokens": {MINT: 100.0}}
 
     clients = fake_clients(prices={MINT: 1.0})
-    store = DataStore(clients.birdeye, settings)
+    store = DataStore(clients.binance, settings)
     report = recover(
         portfolio=p, clients=clients, store=store, cfg=settings,
         executor=Executor(), conn=conn,

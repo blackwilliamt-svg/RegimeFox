@@ -35,9 +35,10 @@ def to_frame(rows: Sequence[Any]) -> pd.DataFrame:
 def resample(df: pd.DataFrame, target_seconds: int) -> pd.DataFrame:
     """Aggregate candles up to a longer timeframe.
 
-    Birdeye does not serve a 10-minute interval, so the default timeframe is
-    built by rolling 5-minute candles up here rather than trading a timeframe
-    that merely resembles the configured one.
+    Candle history is stored at a fixed 1-minute base interval (spec 3b), so
+    the configured trading timeframe (5-15 minutes) is always built by rolling
+    that base up here rather than trading a timeframe that merely resembles
+    the configured one.
     """
     if df.empty:
         return df
@@ -119,6 +120,90 @@ def consecutive_up(df: pd.DataFrame, bars: int) -> pd.Series:
     return up.rolling(bars).sum() >= bars
 
 
+# --------------------------------------------------------------------------
+# Regime detection (spec 4.1)
+# --------------------------------------------------------------------------
+TRENDING, RANGING, CHOPPY = 0, 1, 2
+REGIME_NAMES = {TRENDING: "trending", RANGING: "ranging", CHOPPY: "choppy"}
+REGIME_BITS = {TRENDING: 1, RANGING: 2, CHOPPY: 4}
+
+
+def efficiency_ratio(series: pd.Series, lookback: int = 20) -> pd.Series:
+    """Net travel over gross travel - Kaufman's efficiency ratio.
+
+    A market that moves 10% in a straight line and one that moves 10% net after
+    whipsawing 40% look identical to a momentum rule and completely different to
+    a trader. This separates them with one number and no extra thresholds, which
+    is why it is the regime input rather than a tuned oscillator.
+    """
+    lookback = max(2, int(lookback))
+    step = series.diff().abs().fillna(0.0)
+    gross = step.rolling(lookback).sum()
+    net = (series - series.shift(lookback)).abs()
+    return net / gross.replace(0.0, np.nan)
+
+
+def classify_regime(
+    efficiency: pd.Series, atr_pct: pd.Series, *, trend_er: float, chop_atr_pct: float
+) -> pd.Series:
+    """Map efficiency and volatility onto trending / ranging / choppy.
+
+    Directional efficiency splits trend from no-trend; volatility then splits
+    no-trend into an orderly range and genuine chop. An efficiency reading that
+    is not yet defined counts as chop, so the gate errs toward standing aside.
+    """
+    trending = efficiency >= float(trend_er)
+    volatile = atr_pct > float(chop_atr_pct)
+    out = np.where(trending, TRENDING, np.where(volatile, CHOPPY, RANGING))
+    out = np.where(efficiency.isna().to_numpy(), CHOPPY, out)
+    return pd.Series(out.astype(np.int8), index=efficiency.index)
+
+
+def regime_allowed(regime: int, allowed_mask: int) -> bool:
+    return bool(int(allowed_mask) & REGIME_BITS.get(int(regime), 0))
+
+
+# --------------------------------------------------------------------------
+# Multi-timeframe confluence (spec 4.2)
+# --------------------------------------------------------------------------
+def aggregate_trend(
+    series: pd.Series, multiple: int, fast: int, slow: int
+) -> pd.Series:
+    """Is the ``multiple``-bar aggregate timeframe in an uptrend?
+
+    The aggregate closing at bar ``k*m - 1`` is the higher-timeframe candle, and
+    a base bar reads the last aggregate that has *closed* - never the one still
+    forming. Reading the forming bar is the classic multi-timeframe mistake: it
+    repaints, and a backtest that repaints reports entries the live bot could
+    never have taken.
+    """
+    multiple = max(1, int(multiple))
+    n = len(series)
+    out = pd.Series(np.zeros(n, dtype=bool), index=series.index)
+    n_agg = n // multiple
+    if n_agg < 2:
+        return out
+
+    agg_close = series.iloc[multiple - 1 :: multiple].iloc[:n_agg].reset_index(drop=True)
+    agg_up = (ema(agg_close, fast) > ema(agg_close, slow)).to_numpy()
+
+    idx = ((np.arange(n, dtype=np.int64) + 1) // multiple) - 1
+    have = idx >= 0
+    out.iloc[:] = agg_up[np.clip(idx, 0, n_agg - 1)] & have
+    return out
+
+
+def confluence_count(df: pd.DataFrame, cfg: dict[str, Any]) -> pd.Series:
+    """How many configured aggregate timeframes agree the trend is up."""
+    multiples = cfg.get("confluence_timeframes") or []
+    total = pd.Series(np.zeros(len(df), dtype=np.int8), index=df.index)
+    for multiple in multiples:
+        total = total + aggregate_trend(
+            df["close"], int(multiple), int(cfg["ema_fast"]), int(cfg["ema_slow"])
+        ).astype(np.int8)
+    return total
+
+
 @dataclass(slots=True)
 class Snapshot:
     """Indicator state at one bar - stored with a position to justify the entry."""
@@ -135,9 +220,18 @@ class Snapshot:
     momentum_pct: float
     consecutive_up: bool
     bars: int
+    efficiency: float = 0.0
+    regime: int = CHOPPY
+    confluence: int = 0
+
+    @property
+    def regime_name(self) -> str:
+        return REGIME_NAMES.get(int(self.regime), "unknown")
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        out = asdict(self)
+        out["regime_name"] = self.regime_name
+        return out
 
 
 def compute(df: pd.DataFrame, cfg: dict[str, Any]) -> pd.DataFrame:
@@ -153,6 +247,14 @@ def compute(df: pd.DataFrame, cfg: dict[str, Any]) -> pd.DataFrame:
     out["vol_ratio"] = volume_ratio(out, cfg["volume_spike_lookback"])
     out["momentum"] = momentum_pct(out, cfg["momentum_candles"])
     out["consec_up"] = consecutive_up(out, cfg["momentum_candles"])
+    out["efficiency"] = efficiency_ratio(out["close"], cfg.get("regime_lookback", 20))
+    out["regime"] = classify_regime(
+        out["efficiency"],
+        out["atr_pct"],
+        trend_er=cfg.get("regime_trend_er", 0.35),
+        chop_atr_pct=cfg.get("regime_chop_atr_pct", 0.03),
+    )
+    out["confluence"] = confluence_count(out, cfg)
     return out
 
 
@@ -186,4 +288,7 @@ def snapshot_at(df: pd.DataFrame, index: int = -1) -> Snapshot | None:
         momentum_pct=val("momentum"),
         consecutive_up=bool(row.get("consec_up", False)),
         bars=len(df),
+        efficiency=val("efficiency"),
+        regime=int(row.get("regime", CHOPPY)),
+        confluence=int(row.get("confluence", 0)),
     )

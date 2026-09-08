@@ -35,35 +35,65 @@
     <p class="key-status hint"></p>
   </form>
   {% endfor %}
+
+  <hr style="border:none;border-top:1px solid var(--border);margin:16px 0">
+  <h2 style="font-size:14px">RunPod worker token</h2>
+  <p class="hint" style="margin-top:0">
+    The bearer token a RunPod monthly-retest worker presents when it reports its feed, run
+    summary, and finished parameter bundle back to this droplet. Generated here rather than
+    typed in, and shown exactly once. It grants write access to the run feed and bundle
+    submission only — it cannot halt trading, close a position or read an API key.
+    Generating a new one immediately invalidates the old one.
+  </p>
+  <div class="btn-row">
+    <button type="button" id="genBulkToken">Generate a new token</button>
+    <span class="hint" id="bulkTokenStatus"></span>
+  </div>
+  <p class="mono" id="bulkTokenValue" style="word-break:break-all;margin-top:8px"></p>
 </div>
 
 <form method="post" action="{{ url_for('dashboard.save_settings') }}">
   <input type="hidden" name="_form_rendered" value="1">
 
   {% set groups = [
-    ('Trading &amp; sizing', ['max_concurrent_positions','max_position_pct_of_wallet',
+    ('Trading &amp; sizing', ['max_position_pct_of_wallet','max_total_deployed_pct',
       'max_position_pct_of_liquidity','gas_reserve_sol','min_position_usd',
       'paper_starting_balance']),
     ('Signal timeframe &amp; scan cadence', ['candle_minutes','broad_scan_seconds',
       'hot_scan_seconds','hot_list_max','min_candles_required']),
     ('Entry rules', ['volume_spike_multiple','volume_spike_lookback','momentum_candles',
       'momentum_min_pct','rsi_period','rsi_max_entry','ema_fast','ema_slow','atr_period']),
-    ('Exit rules &amp; reward:risk', ['rr_min','rr_max','trailing_activate_r',
+    ('Exit rules &amp; reward:risk', ['rr_min','rr_max','stop_atr_mult','trailing_activate_r',
       'trailing_distance_atr','signal_invalidation_bars','max_hold_minutes']),
     ('Risk &amp; circuit breaker', ['circuit_consecutive_losses','circuit_daily_drawdown_pct',
       'correlation_lookback','correlation_max','volatility_size_floor',
       'volatility_target_atr_pct']),
-    ('Universe filters', ['min_liquidity_usd','min_volume_24h_usd','universe_max_tokens',
-      'universe_refresh_seconds']),
+    ('Universe filters', ['binance_top_n','min_liquidity_usd','min_volume_24h_usd',
+      'universe_max_tokens','universe_refresh_seconds']),
     ('Execution &amp; slippage', ['max_slippage_pct','taker_fee_pct','priority_fee_lamports',
       'congestion_max_priority_fee_lamports']),
     ('Rug Check thresholds', ['rugcheck_min_lp_locked_pct','rugcheck_max_top_holder_pct',
       'rugcheck_max_insider_pct','rugcheck_min_token_age_hours','rugcheck_min_liquidity_usd',
       'rugcheck_pass_ttl_seconds','rugcheck_fail_cooldown_seconds']),
     ('API rate limits', ['jupiter_rps','jupiter_burst','jupiter_price_batch_size',
-      'birdeye_rps','birdeye_monthly_cu_budget','rugcheck_rps']),
-    ('Data retention &amp; backtest', ['candle_retention_days','price_tick_retention_hours',
+      'binance_rps','rugcheck_rps']),
+    ('Data retention &amp; backtest', ['price_tick_retention_hours',
       'event_retention_days','backtest_daily_hour_utc','backtest_lookback_days']),
+    ('Market regime gate', ['regime_lookback','regime_trend_er','regime_chop_atr_pct',
+      'regime_allowed','confluence_required']),
+    ('Portfolio sizing', ['portfolio_vol_target','drawdown_tolerance',
+      'monte_carlo_p5_drawdown']),
+    ('Overtrading brakes', ['max_trades_per_day','min_seconds_between_entries',
+      'min_seconds_between_entries_same_mint']),
+    ('Drift monitoring', ['drift_window_days','drift_min_trades',
+      'drift_win_rate_tolerance','drift_expectancy_tolerance','drift_check_seconds']),
+    ('Entry review gate', ['entry_gate_min_strength']),
+    ('Walk-forward / Monte Carlo (spec 5)', ['wfmc_daily_hour_utc',
+      'wfmc_monthly_day_utc','wfmc_monthly_hour_utc','runpod_batch_size']),
+    ('Promotion', ['promotion_check_interval_seconds','shadow_min_days',
+      'shadow_min_trades','shadow_min_margin','shadow_min_confidence']),
+    ('RunPod worker ingest', ['runpod_rate_limit_per_minute']),
+    ('Universe & candle backfill', ['bulk_backfill_months']),
     ('Dashboard', ['session_timeout_minutes','login_rate_limit_attempts',
       'login_rate_limit_window_seconds']),
   ] %}
@@ -96,6 +126,52 @@
     </div>
   </div>
   {% endfor %}
+
+  <div class="panel" style="margin-bottom:16px">
+    <h2>Modes, lists and text</h2>
+    <div class="settings-grid">
+      {% for row in spec if row.kind == 'enum' %}
+      <div class="field">
+        <label for="f_{{ row.key }}">{{ row.key.replace('_', ' ') }}</label>
+        <select id="f_{{ row.key }}" name="{{ row.key }}">
+          {% for option in row.options %}
+          <option value="{{ option }}" {{ 'selected' if values[row.key] == option }}>{{ option }}</option>
+          {% endfor %}
+        </select>
+        <p class="hint">
+          {% if row.key == 'sizing_mode' %}
+            <em>portfolio</em> holds portfolio volatility at target given what is already
+            open and how correlated the candidate is; <em>flat</em> scales by the token's
+            own volatility alone.
+          {% endif %}
+        </p>
+      </div>
+      {% endfor %}
+
+      {% for row in spec if row.kind == 'list' %}
+      <div class="field">
+        <label for="f_{{ row.key }}">{{ row.key.replace('_', ' ') }}</label>
+        <input type="text" id="f_{{ row.key }}" name="{{ row.key }}"
+               value="{{ values[row.key] | join(', ') }}">
+        <p class="hint">
+          up to {{ row.max_items }} values, {{ row.min }}–{{ row.max }}, comma separated
+          {%- if row.key == 'confluence_timeframes' %} — multiples of the base candle, so
+          at a {{ values['candle_minutes'] }}-minute timeframe 3 means
+          {{ values['candle_minutes'] * 3 }} minutes{% endif %}
+        </p>
+      </div>
+      {% endfor %}
+
+      {% for row in spec if row.kind == 'text' %}
+      <div class="field">
+        <label for="f_{{ row.key }}">{{ row.key.replace('_', ' ') }}</label>
+        <input type="text" id="f_{{ row.key }}" name="{{ row.key }}"
+               value="{{ values[row.key] }}" maxlength="{{ row.max }}">
+        <p class="hint">leave blank to keep the current value</p>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
 
   <div class="panel" style="margin-bottom:16px">
     <h2>Toggles</h2>
@@ -141,9 +217,15 @@
 
 <div class="panel">
   <h2>Settings change log</h2>
+  <p class="hint" style="margin-top:0">
+    Every parameter change is recorded here, whether made from this page or by the bot
+    itself (an auto-promoted walk-forward bundle) — the "Why" column names the run or
+    evidence that triggered a bot-made change, so underperformance can be traced back and
+    rolled back.
+  </p>
   <div class="table-scroll">
     <table>
-      <thead><tr><th>When (UTC)</th><th>Who</th><th>Setting</th><th>From</th><th>To</th></tr></thead>
+      <thead><tr><th>When (UTC)</th><th>Who</th><th>Setting</th><th>From</th><th>To</th><th>Why</th></tr></thead>
       <tbody>
         {% for row in audit %}
         <tr>
@@ -152,9 +234,10 @@
           <td class="mono">{{ row.key }}</td>
           <td class="mono dim">{{ row.old_value }}</td>
           <td class="mono">{{ row.new_value }}</td>
+          <td class="hint">{{ row.reason or '—' }}</td>
         </tr>
         {% else %}
-        <tr><td colspan="5" class="empty">No settings changes recorded yet</td></tr>
+        <tr><td colspan="6" class="empty">No settings changes recorded yet</td></tr>
         {% endfor %}
       </tbody>
     </table>
