@@ -581,6 +581,14 @@ class Engine:
         records blend weights (if any) for _open() to attach to the entry
         snapshot - the "log the blend weights alongside each trade decision"
         explainability requirement.
+
+        Regime/library data is keyed by mint, not ticker `symbol` (the
+        walk-forward pipeline's own Frames.symbols come from the candle
+        bundle's `<mint>__<interval>.parquet` filenames - see
+        solbot.candlestore.ParquetCandleStore.materialize_bundle - so
+        `symbol` here is display text only, in log messages; every actual
+        lookup key is `mint`, matching what item 4/5's library entries and
+        the fuzzy-regime section's regime models were stored under).
         """
         snap = snapshot_at(df, -1)
         key = (inst.name, mint)
@@ -589,9 +597,9 @@ class Engine:
             from .regime_classify import classify_current_regime
 
             store = self._get_library_store()
-            membership = classify_current_regime(symbol, snap, store=store)
+            membership = classify_current_regime(mint, snap, store=store)
             if membership is not None:
-                entries = store.regime_cluster_entries(symbol)
+                entries = store.regime_cluster_entries(mint)
                 blend = paramsync.blend_regime_params(cfg, membership, entries)
                 if blend.applied:
                     self._active_blend_detail[key] = blend.as_dict()
@@ -605,7 +613,7 @@ class Engine:
 
         current_regime = snap.efficiency if snap is not None else None
         selection = paramsync.select_regime_scoped_params(
-            cfg, symbol, current_regime, store=self._get_library_store()
+            cfg, mint, current_regime, store=self._get_library_store()
         )
         self._note_regime_choice(
             inst, mint, symbol, selection.fingerprint if selection.applied else None,

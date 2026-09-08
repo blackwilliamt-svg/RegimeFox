@@ -41,12 +41,16 @@ def engine(workspace, monkeypatch):
 class _OneClusterStore:
     """A regime model with exactly one cluster - membership is always
     {0: 1.0} regardless of the live feature vector, which keeps the blend
-    weight deterministic without needing a realistic fuzzy fit in a test."""
+    weight deterministic without needing a realistic fuzzy fit in a test.
+
+    Regime/library lookups are keyed by mint, not ticker - see
+    Engine._regime_scoped_cfg's docstring - so this matches against MINT.
+    """
 
     def __init__(self, cluster_params: dict | None) -> None:
         centroid = [[0.0, 0.0, 0.0]]
         self.model = {
-            "symbol": "BLND",
+            "symbol": MINT,
             "feature_names": ["adx", "atr_pct", "volume_zscore"],
             "scaler": {"mean": [0.0, 0.0, 0.0], "std": [1.0, 1.0, 1.0]},
             "centroids": centroid,
@@ -57,13 +61,13 @@ class _OneClusterStore:
         self.cluster_params = cluster_params
         self.calls = 0
 
-    def get_regime_model(self, symbol):
+    def get_regime_model(self, mint):
         self.calls += 1
-        return {"symbol": symbol, "model": self.model, "run_id": 1, "discovered_at": 0} \
-            if symbol == "BLND" else None
+        return {"symbol": mint, "model": self.model, "run_id": 1, "discovered_at": 0} \
+            if mint == MINT else None
 
-    def regime_cluster_entries(self, symbol):
-        if self.cluster_params is None or symbol != "BLND":
+    def regime_cluster_entries(self, mint):
+        if self.cluster_params is None or mint != MINT:
             return {}
         return {0: {"params": self.cluster_params, "fingerprint": "blend-fp"}}
 

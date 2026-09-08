@@ -40,15 +40,20 @@ def engine(workspace, monkeypatch):
 class _FixedStore:
     """A library store whose nearest match is fixed by the test - close
     enough to always qualify, so the sole variable is whether an entry is
-    even present for this symbol."""
+    even present for this symbol.
+
+    Regime/library lookups are keyed by mint, not ticker - see
+    Engine._regime_scoped_cfg's docstring - so `_entry_mint` here must be the
+    same mint the test's positions are opened against, not a ticker.
+    """
 
     def __init__(self, entry: dict | None) -> None:
         self.entry = entry
         self.calls = 0
 
-    def nearest_regime_entries(self, symbol, target, *, n=1):
+    def nearest_regime_entries(self, mint, target, *, n=1):
         self.calls += 1
-        if self.entry is None or symbol != self.entry.get("_symbol"):
+        if self.entry is None or mint != self.entry.get("_entry_mint"):
             return []
         return [
             {
@@ -64,7 +69,7 @@ def test_a_qualifying_regime_scoped_set_is_used_for_the_entry_decision(engine, w
     engine.startup()
 
     store = _FixedStore(
-        {"_symbol": "REGM", "fingerprint": "fp-live-1", "params": {"volume_spike_multiple": 999.0}}
+        {"_entry_mint": MINT, "fingerprint": "fp-live-1", "params": {"volume_spike_multiple": 999.0}}
     )
     monkeypatch.setattr(engine, "_get_library_store", lambda: store)
 
@@ -91,7 +96,7 @@ def test_switching_logs_an_event_only_on_change_not_every_cycle(engine, workspac
     conn = workspace["conn"]
 
     store = _FixedStore(
-        {"_symbol": "REGM", "fingerprint": "fp-live-2", "params": {"volume_spike_multiple": 999.0}}
+        {"_entry_mint": MINT, "fingerprint": "fp-live-2", "params": {"volume_spike_multiple": 999.0}}
     )
     monkeypatch.setattr(engine, "_get_library_store", lambda: store)
     monkeypatch.setattr(
@@ -116,7 +121,7 @@ def test_reverting_to_the_global_set_also_logs_once(engine, workspace, monkeypat
     conn = workspace["conn"]
 
     store = _FixedStore(
-        {"_symbol": "REGM", "fingerprint": "fp-live-3", "params": {"volume_spike_multiple": 999.0}}
+        {"_entry_mint": MINT, "fingerprint": "fp-live-3", "params": {"volume_spike_multiple": 999.0}}
     )
     monkeypatch.setattr(engine, "_get_library_store", lambda: store)
 
