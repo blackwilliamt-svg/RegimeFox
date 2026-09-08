@@ -949,6 +949,13 @@ class Engine:
             ).start()
             return "RunPod GPU-tier benchmark started"
 
+        if command == "run_regime_pass":
+            threading.Thread(
+                target=lambda: wfmc.run_regime_pass(self.cfg, self.store),
+                name="regime-pass-manual", daemon=True,
+            ).start()
+            return "fuzzy regime discovery + per-regime walk-forward pass started"
+
         return f"unknown command: {command}"
 
     def _manual_close(self, position_id: int, who: str, conn: sqlite3.Connection) -> str:

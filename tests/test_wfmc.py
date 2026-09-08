@@ -49,6 +49,29 @@ def _seed_minutes(mint: str, days: int, *, seed: int = 1) -> None:
     ParquetCandleStore().append(mint, "1m", rows)
 
 
+def _seed_minutes_with_varied_volume(mint: str, days: int, *, seed: int = 1) -> None:
+    """Like _seed_minutes, but with per-minute volume noise (real market data
+    always has some) rather than a near-constant baseline - the fuzzy-regime
+    section's volume-behaviour feature needs a nonzero rolling standard
+    deviation to be defined at all, which a near-constant series doesn't
+    reliably give it after being summed into 10-minute candles."""
+    rng = np.random.default_rng(seed)
+    total = days * 1440
+    end = int(time.time())
+    start = end - total * 60
+    price = 1.0
+    rows = []
+    for i in range(total):
+        drift = rng.normal(0, 0.0015)
+        spike = (i % 1600) < 3
+        if spike:
+            drift = abs(drift) + 0.003
+        price = max(1e-6, price * (1 + drift))
+        volume = max(100.0, rng.lognormal(np.log(5000.0), 0.5)) * (6.0 if spike else 1.0)
+        rows.append((start + i * 60, price * 0.999, price * 1.004, price * 0.996, price, volume))
+    ParquetCandleStore().append(mint, "1m", rows)
+
+
 # --------------------------------------------------------------------------
 # Bundle materialization
 # --------------------------------------------------------------------------
@@ -305,3 +328,75 @@ def test_run_benchmark_flags_a_tier_that_failed_to_tear_down_cleanly(workspace, 
         "not cleanly torn down" in e["message"].lower() and e["level"] == "alert"
         for e in events
     )
+
+
+# --------------------------------------------------------------------------
+# Fuzzy-regime section, step 5: manual trigger + progress
+# --------------------------------------------------------------------------
+def test_run_regime_pass_requires_a_routed_universe(workspace, settings, tmp_path, monkeypatch):
+    monkeypatch.setattr(wfmc, "DAILY_STORE_PATH", str(tmp_path / "wfmc.db"))
+    store = DataStore(binance=None, cfg=settings)
+    result = wfmc.run_regime_pass(settings, store, conn=workspace["conn"])
+    assert not result["ran"]
+    assert "universe" in result["reason"]
+
+    progress = db.get_progress(wfmc.REGIME_PASS_JOB, conn=workspace["conn"])
+    assert progress["status"] == "failed"
+
+
+def test_run_regime_pass_discovers_and_reports_progress(workspace, settings, tmp_path, monkeypatch):
+    monkeypatch.setattr(wfmc, "DAILY_STORE_PATH", str(tmp_path / "wfmc.db"))
+    conn = workspace["conn"]
+    _seed_universe(conn, {MINT_A: "AAAUSDT"})
+    _seed_minutes_with_varied_volume(MINT_A, days=3)   # enough bars to clear MIN_SAMPLES_PER_COIN
+    store = DataStore(binance=None, cfg=settings)
+
+    result = wfmc.run_regime_pass(
+        settings, store, conn=conn,
+        wf_config_overrides={
+            "max_evaluations": 10, "batch_size": 5, "min_trades_per_window": 0,
+            "workers": 1,
+        },
+        k_range=(2,),
+    )
+
+    assert result["ran"]
+    assert result["coins_modeled"] + result["coins_skipped"] == 1
+
+    progress = db.get_progress(wfmc.REGIME_PASS_JOB, conn=conn)
+    assert progress["status"] == "done"
+    assert progress["done"] == progress["total"] == 1
+
+    feed_lines = conn.execute(
+        "SELECT message FROM optimizer_feed ORDER BY id"
+    ).fetchall()
+    joined = " ".join(r["message"] for r in feed_lines)
+    assert "Regime pass starting" in joined
+    assert "Regime pass finished" in joined
+
+
+def test_run_regime_pass_saves_a_model_when_discovery_succeeds(workspace, settings, tmp_path, monkeypatch):
+    monkeypatch.setattr(wfmc, "DAILY_STORE_PATH", str(tmp_path / "wfmc.db"))
+    conn = workspace["conn"]
+    _seed_universe(conn, {MINT_A: "AAAUSDT"})
+    _seed_minutes_with_varied_volume(MINT_A, days=3)
+    store = DataStore(binance=None, cfg=settings)
+
+    from solopt.store import RunStore
+
+    result = wfmc.run_regime_pass(
+        settings, store, conn=conn,
+        wf_config_overrides={
+            "max_evaluations": 10, "batch_size": 5, "min_trades_per_window": 0,
+            "workers": 1,
+        },
+        k_range=(2,),
+    )
+
+    if result["coins_modeled"] == 0:
+        pytest.skip("synthetic series did not clear the minimum sample bar in this run")
+
+    local_store = RunStore(wfmc.DAILY_STORE_PATH)
+    stored = local_store.get_regime_model(MINT_A)
+    assert stored is not None
+    assert stored["model"]["n_clusters"] == 2

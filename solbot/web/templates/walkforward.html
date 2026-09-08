@@ -23,6 +23,22 @@
   </form>
 </div>
 
+<div class="panel" style="margin-bottom:16px">
+  <h2>Fuzzy regime discovery</h2>
+  <p class="hint" style="margin-top:0">
+    Discovers each coin's own regimes from its own history (soft clustering, not a hand-picked
+    "trending"/"choppy" label), then walk-forward-optimizes a distinct parameter set for each one
+    — independent of the monthly automatic retest, and safe to run any time.
+  </p>
+  <div id="regimePassProgress" style="margin:12px 0">
+    <div class="progress"><div id="regimePassBar" style="width:0%"></div></div>
+    <p class="hint" id="regimePassLabel">{{ regime_pass_progress.message or 'Not run yet' }}</p>
+  </div>
+  <form method="post" action="{{ url_for('dashboard.regime_pass') }}">
+    <button class="btn-ghost">Run regime discovery + per-regime walk-forward now</button>
+  </form>
+</div>
+
 <div class="grid grid-4" style="margin:16px 0">
   <div class="stat">
     <div class="label">Walk-forward efficiency</div>

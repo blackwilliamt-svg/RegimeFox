@@ -244,6 +244,7 @@ def progress():
             "historical_pull": db.get_progress("historical_pull"),
             "daily_incremental_pull": db.get_progress(JOB_DAILY_INCREMENTAL),
             "backtest": db.get_progress("backtest"),
+            "regime_pass": db.get_progress("regime_pass"),
             "candle_coverage": {
                 **candles.universe_coverage(mints, BASE_INTERVAL),
                 "disk": candles.disk_usage(),

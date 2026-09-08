@@ -100,7 +100,10 @@ def walkforward():
     endpoints, so there is nothing to render server-side that would not be stale
     by the time the page loaded.
     """
-    return render_template("walkforward.html", mode=cfg()["trading_mode"])
+    return render_template(
+        "walkforward.html", mode=cfg()["trading_mode"],
+        regime_pass_progress=db.get_progress("regime_pass"),
+    )
 
 
 @bp.route("/settings")
@@ -252,6 +255,20 @@ def benchmark_runpod():
         "success",
     )
     return redirect(url_for("dashboard.settings"))
+
+
+@bp.route("/walkforward/regime-pass", methods=["POST"])
+def regime_pass():
+    """Fuzzy-regime section, step 5: manual trigger for the full per-coin
+    regime discovery + per-regime walk-forward pass, independent of the
+    monthly automatic retest."""
+    _enqueue("run_regime_pass")
+    flash(
+        "Regime discovery + per-regime walk-forward pass queued - this can "
+        "take a while for a large universe. Progress appears on this page.",
+        "success",
+    )
+    return redirect(url_for("dashboard.walkforward"))
 
 
 @bp.route("/backtest/pull", methods=["POST"])

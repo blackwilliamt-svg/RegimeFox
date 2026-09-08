@@ -475,3 +475,157 @@ def _recommend_tier(results: list[Any]) -> str:
         best = min(priced, key=lambda r: r.price_per_hour)
         return f"{best.gpu_type} (${best.price_per_hour:.2f}/hr - no combination count to compare cost-per-run)"
     return ""
+
+
+# --------------------------------------------------------------------------
+# Fuzzy-regime section, step 5: manual trigger + progress for the full
+# per-coin regime discovery + per-regime walk-forward pass.
+# --------------------------------------------------------------------------
+REGIME_PASS_JOB = "regime_pass"
+
+
+def run_regime_pass(
+    cfg: dict[str, Any],
+    store: Any,
+    *,
+    conn: sqlite3.Connection | None = None,
+    wf_config_overrides: dict[str, Any] | None = None,
+    k_range: tuple[int, ...] = (4, 5, 6),
+    membership_threshold: float | None = None,
+) -> dict[str, Any]:
+    """Discover every coin's own fuzzy regimes, then walk-forward each one -
+    on demand (the dashboard button, or `manage.py`), independent of the
+    monthly automatic retest. Reports progress two ways at once: a percent-
+    complete bar under REGIME_PASS_JOB (db.get_progress, the same mechanism
+    the historical pull and daily backtest already use), and a plain-
+    language feed through the existing walk-forward run/feed tables the
+    dashboard's walk-forward tab already polls - "now discovering regimes
+    for X", "now optimizing the trending regime for X", per step 5's own
+    wording.
+    """
+    from solopt.dataset import load_panel
+    from solopt.engine import PortfolioSettings
+    from solopt.feed import RunFeed
+    from solopt.frames import compact
+    from solopt.regime_discovery import MIN_SAMPLES_PER_COIN, compute_features, discover_coin_regimes
+    from solopt.regime_walkforward import DEFAULT_MEMBERSHIP_THRESHOLD, run_and_store_all_regimes
+    from solopt.schema import CostModel, get_schema
+    from solopt.store import RunStore
+    from solopt.walkforward import WalkForwardConfig
+
+    conn = conn or db.connect()
+    mints = list(store.pair_map(conn))
+    if not mints:
+        db.set_progress(REGIME_PASS_JOB, status="failed", message="no routed universe tokens", conn=conn)
+        return {"ran": False, "reason": "no routed universe tokens to test"}
+
+    db.set_progress(
+        REGIME_PASS_JOB, status="running", done=0, total=len(mints),
+        message="loading candle history", conn=conn,
+    )
+
+    out_dir = materialize_bundle(store.candles, mints, out_dir=DAILY_BUNDLE_DIR, conn=conn)
+    schema = get_schema("crypto")
+    timeframe_seconds = int(cfg["candle_minutes"]) * 60
+    panel = load_panel(out_dir, timeframe_seconds=timeframe_seconds, schema=schema)
+    frames = compact(panel)
+
+    space = focused_space(cfg, conn)
+    wf_config = WalkForwardConfig(
+        **{
+            "in_sample_days": 45, "out_of_sample_days": 10, "step_days": 10,
+            "max_evaluations": 150, "batch_size": 32, "workers": 1,
+            "utilization_pct": 80.0,
+            "library_seed_fraction": float(cfg.get("library_seed_fraction", 0.3)),
+            **(wf_config_overrides or {}),
+        }
+    )
+    portfolio = PortfolioSettings(
+        starting_balance=float(cfg["paper_starting_balance"]),
+        max_total_deployed_pct=float(cfg["max_total_deployed_pct"]),
+        max_position_pct_of_wallet=float(cfg["max_position_pct_of_wallet"]),
+        max_position_pct_of_liquidity=float(cfg["max_position_pct_of_liquidity"]),
+        min_position_usd=float(cfg["min_position_usd"]),
+        min_candles_required=int(cfg["min_candles_required"]),
+        volatility_target_atr_pct=float(cfg["volatility_target_atr_pct"]),
+        volatility_size_floor=float(cfg["volatility_size_floor"]),
+        correlation_lookback=int(cfg["correlation_lookback"]),
+        correlation_max=float(cfg["correlation_max"]),
+        costs=CostModel(fee_pct=float(cfg["taker_fee_pct"]), slippage_pct=float(cfg["max_slippage_pct"])),
+        confluence_multiples=tuple(cfg.get("confluence_timeframes") or ()),
+        sizing_mode=str(cfg.get("sizing_mode", "portfolio")),
+        portfolio_vol_target=float(cfg.get("portfolio_vol_target", 0.019)),
+        drawdown_tolerance=float(cfg.get("drawdown_tolerance", 0.25)),
+    )
+
+    local_store = RunStore(DAILY_STORE_PATH)
+    bundle_id = time.strftime("regime-pass-%Y-%m-%d-%H%M", time.gmtime())
+    run_id = local_store.start_run(
+        config=wf_config.as_dict(), settings=portfolio.as_dict(),
+        space={"values": space.values}, bundle=bundle_id, coverage=panel.coverage(),
+        label=bundle_id,
+    )
+    report_id = next_run_id(conn)
+    feed = RunFeed(local_store, run_id, report_run_id=report_id, sinks=[_LocalFeedSink(conn)])
+    feed.say(f"Regime pass starting: {len(mints)} coin(s) in the routed universe.")
+
+    all_features = compute_features(frames)  # once for the whole panel, not per coin
+    threshold = DEFAULT_MEMBERSHIP_THRESHOLD if membership_threshold is None else membership_threshold
+
+    totals = {"coins_modeled": 0, "coins_skipped": 0, "regimes_accepted": 0, "regimes_tried": 0}
+    total_coins = len(mints)
+    for i, mint in enumerate(mints):
+        label = mint[:8]
+        db.set_progress(
+            REGIME_PASS_JOB, status="running", done=i, total=total_coins,
+            message=f"discovering regimes for {label}", conn=conn,
+        )
+        feed.say(f"Now discovering regimes for {label}...")
+
+        model = discover_coin_regimes(
+            frames, mint, k_range=k_range, min_samples=MIN_SAMPLES_PER_COIN, features=all_features,
+        )
+        if model is None:
+            totals["coins_skipped"] += 1
+            feed.say(f"{label}: not enough history yet - skipped.")
+            continue
+
+        totals["coins_modeled"] += 1
+        local_store.save_regime_model(mint, model.as_dict(), run_id=run_id)
+        feed.say(
+            f"{label}: discovered {model.n_clusters} regime(s) from {model.n_samples} bars "
+            f"(partition coefficient {model.fpc:.2f})."
+        )
+
+        def on_progress(cluster_id: int, n_clusters: int, *, _label: str = label, _i: int = i) -> None:
+            db.set_progress(
+                REGIME_PASS_JOB, status="running", done=_i, total=total_coins,
+                message=f"optimizing regime {cluster_id + 1}/{n_clusters} for {_label}",
+                conn=conn,
+            )
+            feed.say(f"Now optimizing regime {cluster_id + 1}/{n_clusters} for {_label}...")
+
+        outcomes = run_and_store_all_regimes(
+            frames, mint, model,
+            space=space, portfolio=portfolio, wf_config=wf_config, store=local_store,
+            threshold=threshold, run_id=run_id, on_progress=on_progress,
+        )
+        totals["regimes_tried"] += len(outcomes)
+        accepted = sum(1 for o in outcomes.values() if o.accepted)
+        totals["regimes_accepted"] += accepted
+        feed.say(
+            f"{label}: {accepted} of {len(outcomes)} tested regime(s) accepted and promoted."
+            if outcomes else f"{label}: no regime had enough dominated windows to search yet."
+        )
+
+    db.set_progress(
+        REGIME_PASS_JOB, status="done", done=total_coins, total=total_coins,
+        message="finished", conn=conn,
+    )
+    feed.say(
+        f"Regime pass finished: {totals['coins_modeled']} coin(s) modeled "
+        f"({totals['coins_skipped']} skipped for too little history), "
+        f"{totals['regimes_accepted']} of {totals['regimes_tried']} tested regime(s) promoted."
+    )
+    local_store.finish_run(run_id, "done", totals)
+    return {"ran": True, "run_id": report_id, **totals}

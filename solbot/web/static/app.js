@@ -291,11 +291,14 @@
 
   /* ---------- progress (backtest page) ---------- */
   function loadProgress() {
-    if (!el("pullProgress") && !el("backtestProgress")) return Promise.resolve();
+    if (!el("pullProgress") && !el("backtestProgress") && !el("regimePassProgress")) {
+      return Promise.resolve();
+    }
     return get("/api/progress").then(function (d) {
       bar("pull", d.historical_pull);
       bar("dailyPull", d.daily_incremental_pull);
       bar("backtest", d.backtest);
+      bar("regimePass", d.regime_pass);
       var cov = el("candleCoverage");
       if (cov && d.candle_coverage) {
         var c = d.candle_coverage;
