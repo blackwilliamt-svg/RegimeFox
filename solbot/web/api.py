@@ -470,18 +470,29 @@ def wfmc_storage():
 
 @bp.get("/review")
 def review_status():
-    """Recent entry-gate activity and the current market read."""
+    """Recent entry-gate activity and the current market read.
+
+    ``detail`` carries the explainability payload - the signal readings and
+    plain-language "why" the gate actually saw, alongside its verdict (see
+    review.EntryGate._record) - so the dashboard can answer "why did it
+    trade, or not" per decision, not just log that one was made.
+    """
     from .. import review as review_module
 
     conn = db.connect()
     recent_rows = conn.execute(
-        "SELECT ts, kind, instance, mint, decision, conviction, exit_style "
+        "SELECT ts, kind, instance, mint, decision, conviction, exit_style, detail "
         "FROM entry_reviews ORDER BY id DESC LIMIT 50"
     ).fetchall()
+    recent = []
+    for row in recent_rows:
+        item = dict(row)
+        item["detail"] = _loads(item.get("detail")) or {}
+        recent.append(item)
     return jsonify(
         {
             "market": review_module.build_market_context(conn=conn).as_dict(),
-            "recent": _rows(recent_rows),
+            "recent": recent,
         }
     )
 

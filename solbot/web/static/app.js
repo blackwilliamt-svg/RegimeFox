@@ -324,6 +324,78 @@
     });
   }
 
+  /* ---------- entry-decision explainability ---------- */
+  var reviewRows = [];
+
+  function loadReview() {
+    var body = el("reviewRows");
+    if (!body) return Promise.resolve();
+    return get("/api/review").then(function (d) {
+      var market = d.market || {};
+      setText("reviewMarket",
+        market.tone ? "market: " + market.tone + " · " +
+          Math.round((market.breadth || 0) * 100) + "% of coins up" : "—");
+
+      reviewRows = d.recent || [];
+      if (!reviewRows.length) {
+        body.innerHTML = "<tr><td colspan='5' class='empty'>No entry decisions recorded yet</td></tr>";
+        clear("reviewDetail");
+        return;
+      }
+      // Most recent first - the API already orders that way, this just
+      // makes it explicit rather than relying on insertion order.
+      var rows = reviewRows.slice().reverse();
+      body.innerHTML = rows.map(function (r, i) {
+        var detail = r.detail || {};
+        var decision = detail.decision || {};
+        var signal = detail.signal || {};
+        var approved = r.decision === "approve";
+        var d = new Date(r.ts * 1000);
+        var time = String(d.getHours()).padStart(2, "0") + ":" +
+          String(d.getMinutes()).padStart(2, "0") + ":" + String(d.getSeconds()).padStart(2, "0");
+        return "<tr class='review-row' data-idx='" + i + "' style='cursor:pointer'>" +
+          "<td class='mono nowrap'>" + time + "</td>" +
+          "<td>" + esc((detail.token && detail.token.symbol) || r.mint || "") + "</td>" +
+          "<td class='" + (approved ? "pos" : "neg") + "'>" + esc(r.decision || "") + "</td>" +
+          "<td class='num'>" + (r.conviction != null ? r.conviction.toFixed(2) : "—") + "</td>" +
+          "<td class='hint' style='max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap'>" +
+          esc(signal.why || decision.rationale || "") + "</td></tr>";
+      }).join("");
+    });
+  }
+
+  document.addEventListener("click", function (ev) {
+    var row = ev.target.closest && ev.target.closest("#reviewRows tr[data-idx]");
+    if (!row) return;
+    var idx = Number(row.getAttribute("data-idx"));
+    var sorted = reviewRows.slice().reverse();
+    var r = sorted[idx];
+    var box = el("reviewDetail");
+    if (!r || !box) return;
+    var detail = r.detail || {};
+    var decision = detail.decision || {};
+    var signal = detail.signal || {};
+    var token = detail.token || {};
+    var market = detail.market || {};
+    var lines = [
+      "<strong>" + esc(token.symbol || r.mint || "") + "</strong> — " +
+        esc((r.decision || "").toUpperCase()) +
+        (decision.source ? " (" + esc(decision.source) + ")" : ""),
+      esc(decision.rationale || signal.why || "no rationale recorded"),
+      "RSI " + (signal.rsi != null ? signal.rsi : "—") +
+        " · momentum " + (signal.momentum_pct != null ? signal.momentum_pct + "%" : "—") +
+        " · volume " + (signal.volume_vs_average != null ? signal.volume_vs_average + "x avg" : "—") +
+        " · ATR " + (signal.atr_pct != null ? signal.atr_pct + "%" : "—") +
+        " · efficiency " + (signal.efficiency_ratio != null ? signal.efficiency_ratio : "—") +
+        " · regime " + esc(signal.regime || "—") +
+        " · " + (signal.higher_timeframes_agreeing != null ? signal.higher_timeframes_agreeing : "—") + " timeframe(s) agreeing",
+      "market: " + esc(market.tone || "—") + " · reward/risk " +
+        (signal.reward_risk != null ? signal.reward_risk : "—") + " · conviction " +
+        (decision.conviction != null ? decision.conviction : "—"),
+    ];
+    box.innerHTML = lines.map(function (l) { return "<div>" + l + "</div>"; }).join("");
+  });
+
   /* ---------- progress (backtest page) ---------- */
   function loadProgress() {
     if (!el("pullProgress") && !el("backtestProgress") && !el("regimePassProgress")) {
@@ -823,6 +895,7 @@
     loadStatus().catch(noop);
     loadPositions().catch(noop);
     loadEvents().catch(noop);
+    loadReview().catch(noop);
     loadEquity().catch(noop);
     loadMarketChart().catch(noop);
     loadProgress().catch(noop);

@@ -431,3 +431,33 @@ def test_review_api_reports_recent_gate_activity(signed_in, workspace):
     body = signed_in.get("/api/review").get_json()
     assert "market" in body
     assert body["recent"] == []
+
+
+def test_review_api_carries_the_explainability_detail_for_each_decision(signed_in, workspace, settings):
+    """"Why did it trade, or not" needs the signal readings and rationale
+    alongside the verdict, not just a decision label."""
+    from solbot import review
+
+    request = review.EntryRequest(
+        mint="MintExplain111111111111111111111111111111",
+        symbol="EXPL", instance="paper", price=2.0, size_usd=300.0,
+        liquidity_usd=1_000_000.0, rr=2.5, strength=0.8,
+        entry_reason="volume 3.5x average; momentum +0.9%",
+        snapshot={
+            "volume_ratio": 3.5, "momentum_pct": 0.009, "rsi": 55.0,
+            "atr_pct": 0.015, "efficiency": 0.5, "regime": 0, "confluence": 1,
+        },
+        market=review.MarketContext(breadth=0.6, index_return=0.01, tokens=30),
+        trades_today=1,
+    )
+    gate = review.EntryGate({**settings, "entry_gate_enabled": True})
+    gate.review_entry(request, conn=workspace["conn"])
+
+    body = signed_in.get("/api/review").get_json()
+    assert len(body["recent"]) == 1
+    detail = body["recent"][0]["detail"]
+    assert detail["decision"]["approve"] in (True, False)
+    assert "rationale" in detail["decision"]
+    assert detail["signal"]["why"] == "volume 3.5x average; momentum +0.9%"
+    assert detail["signal"]["rsi"] == 55.0
+    assert detail["token"]["symbol"] == "EXPL"

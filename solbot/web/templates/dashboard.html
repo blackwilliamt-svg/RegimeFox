@@ -140,4 +140,29 @@
   </div>
 </div>
 
+<div class="panel" style="margin-top:16px">
+  <div class="panel-head">
+    <h2>Entry decisions</h2>
+    <span class="hint" id="reviewMarket">—</span>
+  </div>
+  <p class="hint" style="margin-top:0">
+    Why the entry gate approved or rejected each candidate - the signal it saw, not just the
+    verdict. Click a row for the full readout.
+  </p>
+  <div class="table-scroll">
+    <table>
+      <thead>
+        <tr>
+          <th>Time</th><th>Token</th><th>Decision</th><th class="num">Conviction</th>
+          <th>Why</th>
+        </tr>
+      </thead>
+      <tbody id="reviewRows">
+        <tr><td colspan="5" class="empty">No entry decisions recorded yet</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div id="reviewDetail" class="hint" style="margin-top:10px"></div>
+</div>
+
 {% endblock %}

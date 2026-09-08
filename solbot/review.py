@@ -374,18 +374,16 @@ class EntryGate:
     def _record(
         self, request: EntryRequest, decision: GateDecision, conn: sqlite3.Connection
     ) -> None:
+        # The full request (signal readings, the strategy's own plain-language
+        # `why`, token/liquidity context) alongside the gate's verdict - the
+        # explainability dashboard's whole point is showing what was actually
+        # seen, not just what was decided.
         conn.execute(
             "INSERT INTO entry_reviews(ts, kind, instance, mint, decision, "
             "conviction, exit_style, detail) VALUES (?,?,?,?,?,?,?,?)",
             (
                 db.now(), "gate", request.instance, request.mint,
                 decision.decision, decision.conviction, decision.exit_style,
-                json.dumps(
-                    {
-                        "decision": decision.as_dict(),
-                        "market": request.market.as_dict(),
-                        "symbol": request.symbol,
-                    }
-                ),
+                json.dumps({"decision": decision.as_dict(), **request.as_dict()}),
             ),
         )
