@@ -342,6 +342,52 @@ def test_walk_forward_api_mirrors_a_reported_run(signed_in, workspace):
     assert run["stress"][0]["passed"] is True
 
 
+def test_walk_forward_api_lists_recent_runs_with_their_own_stats(signed_in, workspace):
+    """Historical browsability: the run list carries enough of each run's own
+    summary to render a row (windows, efficiency), not just an id to click."""
+    for run_id, wfe, profitable in ((3, 0.58, 5), (4, 0.71, 8)):
+        signed_in.post(
+            "/api/optimizer/run",
+            json={
+                "run_id": run_id, "status": "done",
+                "summary": {
+                    "accepted": True, "counted_windows": 8, "profitable_windows": profitable,
+                    "walk_forward_efficiency": wfe,
+                },
+                "coverage": {"symbols": 20, "days": 180},
+            },
+            headers=AUTH,
+        )
+
+    body = signed_in.get("/api/walkforward").get_json()
+    by_id = {r["run_id"]: r for r in body["runs"]}
+    assert set(by_id) == {3, 4}
+    assert by_id[4]["walk_forward_efficiency"] == 0.71
+    assert by_id[4]["profitable_windows"] == 8
+    assert by_id[4]["counted_windows"] == 8
+    assert by_id[3]["walk_forward_efficiency"] == 0.58
+
+
+def test_walk_forward_api_can_be_asked_for_an_older_run_by_id(signed_in, workspace):
+    """The dashboard's "Recent runs" table browses history by passing ?run=,
+    not just ever showing whichever run reported most recently."""
+    for run_id, wfe in ((3, 0.58), (4, 0.71)):
+        signed_in.post(
+            "/api/optimizer/run",
+            json={
+                "run_id": run_id, "status": "done",
+                "summary": {"accepted": True, "walk_forward_efficiency": wfe},
+                "coverage": {},
+            },
+            headers=AUTH,
+        )
+
+    for run_id, wfe in ((3, 0.58), (4, 0.71)):
+        run = signed_in.get(f"/api/walkforward?run={run_id}").get_json()["run"]
+        assert run["run_id"] == run_id
+        assert run["summary"]["walk_forward_efficiency"] == wfe
+
+
 def test_walk_forward_feed_api_pages_from_a_cursor(signed_in, workspace):
     signed_in.post(
         "/api/optimizer/feed",

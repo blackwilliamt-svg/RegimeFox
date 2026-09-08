@@ -339,9 +339,22 @@ def walkforward():
         return jsonify({"run": None, "runs": []})
 
     runs = conn.execute(
-        "SELECT run_id, status, started_at, updated_at, label FROM optimizer_runs "
+        "SELECT run_id, status, started_at, updated_at, label, summary FROM optimizer_runs "
         "ORDER BY updated_at DESC LIMIT 20"
     ).fetchall()
+    run_list = []
+    for r in runs:
+        r_summary = _loads(r["summary"]) or {}
+        run_list.append(
+            {
+                "run_id": int(r["run_id"]), "status": r["status"], "label": r["label"],
+                "started_at": r["started_at"], "updated_at": r["updated_at"],
+                "profitable_windows": r_summary.get("profitable_windows"),
+                "counted_windows": r_summary.get("counted_windows"),
+                "walk_forward_efficiency": r_summary.get("walk_forward_efficiency"),
+                "accepted": r_summary.get("accepted"),
+            }
+        )
 
     summary = _loads(row["summary"])
     return jsonify(
@@ -358,7 +371,7 @@ def walkforward():
                 "monte_carlo": _loads(row["monte_carlo"]) or summary.get("monte_carlo"),
                 "stress": _loads(row["stress"]) or summary.get("stress"),
             },
-            "runs": _rows(runs),
+            "runs": run_list,
         }
     )
 

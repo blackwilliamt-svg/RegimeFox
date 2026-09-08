@@ -363,6 +363,10 @@
   var wfFeedSince = 0;
   var wfRunId = null;
   var mcData = null;
+  // null = always show the latest run (default, live-following); set by
+  // clicking a row in "Recent runs" to pin the view to one historical run
+  // instead - historical browsability alongside the live one.
+  var wfSelectedRunId = null;
 
   function pctText(v, digits) {
     if (v === null || v === undefined) return "—";
@@ -375,8 +379,10 @@
 
   function loadWalkForward() {
     if (!el("wfFeed")) return Promise.resolve();
-    return get("/api/walkforward").then(function (d) {
+    var url = "/api/walkforward" + (wfSelectedRunId ? "?run=" + wfSelectedRunId : "");
+    return get(url).then(function (d) {
       var run = d.run;
+      renderRunList(d.runs || [], run ? run.run_id : null);
       if (!run) { setText("wfStatus", "no runs yet"); return; }
 
       // A new run resets the feed cursor so a fresh search does not append to
@@ -386,7 +392,8 @@
       var cov = run.coverage || {};
       setText("wfRunLabel",
         "run " + run.run_id + (run.label ? " · " + run.label : "") +
-        (cov.symbols ? " · " + cov.symbols + " coins, " + (cov.days || 0) + " days" : ""));
+        (cov.symbols ? " · " + cov.symbols + " coins, " + (cov.days || 0) + " days" : "") +
+        (wfSelectedRunId ? " · viewing history, not the live run" : ""));
       setText("wfStatus", run.status === "running"
         ? "running — last update " + Math.round(run.age_seconds) + "s ago"
         : run.status);
@@ -411,6 +418,7 @@
 
       renderFlags(s);
       renderWindows(s);
+      renderBestParams(s.best_params);
       renderMonteCarlo(run.monte_carlo);
       renderStress(run.stress);
       return loadWalkForwardFeed(run.run_id);
@@ -443,7 +451,12 @@
     var body = el("wfWindowRows");
     if (!body) return;
     var windows = s.windows_detail || [];
-    if (!windows.length) return;   // the summary carries counts, not per-window rows
+    if (!windows.length) {
+      // Browsing a different run must not leave the previous one's rows on
+      // screen just because this one's summary carries counts but no detail.
+      body.innerHTML = "<tr><td colspan='7' class='empty'>No windows reported yet</td></tr>";
+      return;
+    }
     body.innerHTML = windows.map(function (w, i) {
       var m = w.oos_metrics || {};
       var verdict = !w.counted
@@ -458,6 +471,54 @@
         "</td><td>" + verdict + "</td></tr>";
     }).join("");
   }
+
+  function renderBestParams(params) {
+    var box = el("wfBestParams");
+    if (!box) return;
+    var keys = params ? Object.keys(params) : [];
+    if (!keys.length) {
+      box.innerHTML = '<span class="hint">No accepted parameter set for this run yet.</span>';
+      return;
+    }
+    keys.sort();
+    box.innerHTML = keys.map(function (k) {
+      var v = params[k];
+      return '<span class="hint" style="font-size:13px">' + esc(k) +
+        ' <span class="mono" style="color:var(--text)">' +
+        esc(typeof v === "number" ? String(v) : JSON.stringify(v)) + "</span></span>";
+    }).join("");
+  }
+
+  function renderRunList(runs, activeRunId) {
+    var body = el("wfRunRows");
+    if (!body) return;
+    if (!runs.length) {
+      body.innerHTML = "<tr><td colspan='5' class='empty'>No runs yet</td></tr>";
+      return;
+    }
+    body.innerHTML = runs.map(function (r) {
+      var wfe = r.walk_forward_efficiency;
+      var active = r.run_id === activeRunId;
+      return "<tr class='run-row" + (active ? " active" : "") + "' data-run-id='" + r.run_id +
+        "' style='cursor:pointer" + (active ? ";font-weight:600" : "") + "'>" +
+        "<td class='mono'>" + r.run_id + (r.label ? " · " + esc(r.label) : "") + "</td>" +
+        "<td class='nowrap'>" + fmtTime(r.started_at) + "</td>" +
+        "<td class='" + (r.status === "done" ? "pos" : (r.status === "failed" ? "neg" : "dim")) +
+        "'>" + esc(r.status) + "</td>" +
+        "<td class='num'>" + (r.profitable_windows != null ? r.profitable_windows + "/" + (r.counted_windows || 0) : "—") + "</td>" +
+        "<td class='num'>" + (wfe !== undefined && wfe !== null ? wfe.toFixed(2) : "—") + "</td>" +
+        "</tr>";
+    }).join("");
+  }
+
+  document.addEventListener("click", function (ev) {
+    var row = ev.target.closest && ev.target.closest("#wfRunRows tr[data-run-id]");
+    if (!row) return;
+    var runId = Number(row.getAttribute("data-run-id"));
+    if (!runId) return;
+    wfSelectedRunId = runId;
+    loadWalkForward().catch(noop);
+  });
 
   function renderMonteCarlo(mc) {
     if (!mc) return;

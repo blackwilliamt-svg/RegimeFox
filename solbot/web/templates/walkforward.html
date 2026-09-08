@@ -64,6 +64,26 @@
 
 <div id="wfFlags" class="btn-row" style="margin-bottom:16px"></div>
 
+<div class="panel" style="margin-bottom:16px">
+  <div class="panel-head">
+    <h2>Recent runs</h2>
+    <span class="hint">Click a row to browse that run's own windows, Monte Carlo and crash-replay detail below.</span>
+  </div>
+  <div class="table-scroll">
+    <table>
+      <thead>
+        <tr>
+          <th>Run</th><th>Started</th><th>Status</th>
+          <th class="num">Windows profitable</th><th class="num">WF efficiency</th>
+        </tr>
+      </thead>
+      <tbody id="wfRunRows">
+        <tr><td colspan="5" class="empty">No runs yet</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
 <div class="grid grid-2" style="margin-bottom:16px">
   <div class="panel">
     <div class="panel-head">
@@ -127,6 +147,17 @@
         <tr><td colspan="7" class="empty">No windows reported yet</td></tr>
       </tbody>
     </table>
+  </div>
+</div>
+
+<div class="panel" style="margin-bottom:16px">
+  <h2>Winning parameters</h2>
+  <p class="hint" style="margin-top:0">
+    The combination this run's windows converged on - the strategy detail behind the summary
+    numbers above, not just whether it passed.
+  </p>
+  <div id="wfBestParams" style="display:flex;flex-wrap:wrap;gap:8px 18px">
+    <span class="hint">No accepted parameter set for this run yet.</span>
   </div>
 </div>
 
