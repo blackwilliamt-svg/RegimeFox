@@ -1,13 +1,20 @@
 """Run state for the optimizer: checkpoints, windows, trades, feed lines.
 
-A walk-forward run over a full history takes hours. It must survive the PC being
-rebooted, the search being interrupted, or a window failing, and pick up where it
-left off rather than starting over - so every window's result is committed the
-moment it completes, and a resumed run replays nothing.
+A walk-forward run over a full history takes hours. It must survive the
+process being restarted, the search being interrupted, or a window failing,
+and pick up where it left off rather than starting over - so every window's
+result is committed the moment it completes, and a resumed run replays
+nothing.
 
-This is a separate SQLite file from the droplet's trading database. The two
-machines share data only through the download endpoint and the parameter
-hand-off repo; nothing here ever writes to the live bot's state.
+This is a separate SQLite file from the droplet's trading database
+(``data/wfmc.db`` next to ``data/solbot.db``). There is no PC and no git
+hand-off repository anywhere in this picture: the daily incremental run lives
+entirely inside the droplet's own trading worker process, in-process CPU only,
+and the monthly full retest runs on a RunPod GPU worker the droplet itself
+provisions, ships candle data to over HTTP, and tears down afterward -
+verified, not assumed. Both call :func:`solopt.pipeline.run_pipeline`, which
+writes here through this same RunStore either way; nothing here ever
+communicates with anything but that one process's own filesystem.
 """
 from __future__ import annotations
 
@@ -15,6 +22,7 @@ import json
 import sqlite3
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
@@ -105,6 +113,31 @@ CREATE TABLE IF NOT EXISTS stress (
     passed       INTEGER NOT NULL,
     PRIMARY KEY (run_id, name)
 ) WITHOUT ROWID;
+
+-- Persistent library of validated combinations (gap-closure item 4), shared
+-- with regime-scoped promotion (item 5): every combo a run's walk-forward
+-- thresholds accepted, deduped by fingerprint (keep the best-performing entry
+-- per fingerprint), so a future search can seed from what already worked
+-- instead of starting from DEFAULT_GRID every time. `symbol` NULL means a
+-- market-wide/global entry; a per-symbol entry additionally carries that
+-- coin's own regime score at validation time alongside the market-wide one -
+-- both continuous (item 5's regime_trend_er / efficiency-ratio measures), not
+-- hard buckets.
+CREATE TABLE IF NOT EXISTS library (
+    fingerprint         TEXT    PRIMARY KEY,
+    symbol              TEXT,                  -- NULL = global/market-wide
+    params              TEXT    NOT NULL,       -- JSON: indicator set + parameters
+    per_symbol          TEXT,                   -- JSON per-symbol overrides, if any
+    performance         TEXT    NOT NULL,       -- JSON: walk-forward summary metrics
+    market_regime_score REAL,                   -- continuous efficiency ratio, whole panel
+    symbol_regime_score REAL,                   -- continuous efficiency ratio, this symbol only
+    run_id              INTEGER,
+    first_seen_at       INTEGER NOT NULL,
+    last_seen_at        INTEGER NOT NULL,
+    times_seen          INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_library_symbol ON library(symbol);
+CREATE INDEX IF NOT EXISTS idx_library_last_seen ON library(last_seen_at);
 """
 
 
@@ -132,6 +165,47 @@ def _load(raw: Any, default: Any = None) -> Any:
         return json.loads(raw)
     except (TypeError, json.JSONDecodeError):
         return default
+
+
+# --------------------------------------------------------------------------
+# Library (gap-closure items 4 and 5)
+# --------------------------------------------------------------------------
+@dataclass
+class LibraryEntry:
+    """A combination worth remembering: it passed the walk-forward thresholds
+    at least once. `regime` tags (item 5) are continuous efficiency-ratio
+    readings, not bucket labels - see solopt/indicators.py's
+    efficiency_ratio_stack, which this reuses rather than reinventing a
+    separate regime measure."""
+
+    fingerprint: str
+    params: dict[str, Any]
+    performance: dict[str, Any]
+    symbol: str | None = None
+    per_symbol: dict[str, Any] | None = None
+    market_regime_score: float | None = None
+    symbol_regime_score: float | None = None
+    run_id: int | None = None
+
+
+def _library_score(performance: dict[str, Any]) -> float:
+    """Rank combinations by the same headline robustness number the
+    dashboard already shows: walk-forward efficiency, tie-broken by mean
+    window return - not total return, so a longer run doesn't automatically
+    outrank a shorter one that used its trades better."""
+    efficiency = float(performance.get("walk_forward_efficiency") or 0.0)
+    mean_return = float(performance.get("mean_window_return") or 0.0)
+    return efficiency * 1000.0 + mean_return
+
+
+def _recency_weight(last_seen_at: int, *, half_life_days: float = 30.0, now_ts: int | None = None) -> float:
+    """Exponential decay: an entry not re-validated in a while counts for
+    less when seeding a new search, without being deleted outright - it may
+    still be the best evidence available for a regime that hasn't recurred
+    recently."""
+    reference = now_ts if now_ts is not None else now()
+    age_days = max(0.0, (reference - int(last_seen_at)) / 86400.0)
+    return 0.5 ** (age_days / max(1e-6, half_life_days))
 
 
 class RunStore:
@@ -418,3 +492,145 @@ class RunStore:
             d["passed"] = bool(d["passed"])
             out.append(d)
         return out
+
+    # ------------------------------------------------------------------
+    # library (gap-closure items 4 and 5)
+    # ------------------------------------------------------------------
+    def upsert_library(self, entry: LibraryEntry) -> bool:
+        """Insert, or update only if this run's evidence outperforms what's
+        already on record for the same fingerprint. Either way the entry's
+        `last_seen_at`/`times_seen` advance - a repeat appearance is itself
+        evidence, even when it did not beat the incumbent.
+
+        Returns True if the stored parameters/performance actually changed.
+        """
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT performance FROM library WHERE fingerprint = ?", (entry.fingerprint,)
+            ).fetchone()
+            ts = now()
+            if row is None:
+                conn.execute(
+                    "INSERT INTO library(fingerprint, symbol, params, per_symbol, "
+                    "performance, market_regime_score, symbol_regime_score, run_id, "
+                    "first_seen_at, last_seen_at, times_seen) VALUES (?,?,?,?,?,?,?,?,?,?,1)",
+                    (
+                        entry.fingerprint, entry.symbol, _json(entry.params),
+                        _json(entry.per_symbol) if entry.per_symbol else None,
+                        _json(entry.performance), entry.market_regime_score,
+                        entry.symbol_regime_score, entry.run_id, ts, ts,
+                    ),
+                )
+                return True
+
+            incumbent = _library_score(_load(row["performance"], {}))
+            challenger = _library_score(entry.performance)
+            if challenger > incumbent:
+                conn.execute(
+                    "UPDATE library SET symbol = ?, params = ?, per_symbol = ?, "
+                    "performance = ?, market_regime_score = ?, symbol_regime_score = ?, "
+                    "run_id = ?, last_seen_at = ?, times_seen = times_seen + 1 "
+                    "WHERE fingerprint = ?",
+                    (
+                        entry.symbol, _json(entry.params),
+                        _json(entry.per_symbol) if entry.per_symbol else None,
+                        _json(entry.performance), entry.market_regime_score,
+                        entry.symbol_regime_score, entry.run_id, ts, entry.fingerprint,
+                    ),
+                )
+                return True
+
+            conn.execute(
+                "UPDATE library SET last_seen_at = ?, times_seen = times_seen + 1 "
+                "WHERE fingerprint = ?",
+                (ts, entry.fingerprint),
+            )
+            return False
+
+    def _library_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        d = dict(row)
+        d["params"] = _load(d.get("params"), {})
+        d["per_symbol"] = _load(d.get("per_symbol"))
+        d["performance"] = _load(d.get("performance"), {})
+        return d
+
+    def library_entry(self, fingerprint: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM library WHERE fingerprint = ?", (fingerprint,)
+        ).fetchone()
+        return self._library_row(row) if row is not None else None
+
+    def top_library_entries(
+        self, n: int, *, symbol: str | None = None, half_life_days: float = 30.0
+    ) -> list[dict[str, Any]]:
+        """The best `n` entries by recency-weighted performance - a search's
+        seed pool (item 4). `symbol=None` returns market-wide entries only;
+        pass a symbol for that coin's own per-symbol entries (item 5)."""
+        if symbol is None:
+            rows = self.conn.execute("SELECT * FROM library WHERE symbol IS NULL").fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM library WHERE symbol = ?", (symbol,)
+            ).fetchall()
+
+        ts = now()
+        scored = [
+            (
+                _library_score(_load(r["performance"], {}))
+                * _recency_weight(int(r["last_seen_at"]), half_life_days=half_life_days, now_ts=ts),
+                r,
+            )
+            for r in rows
+        ]
+        scored.sort(key=lambda t: t[0], reverse=True)
+        out = []
+        for score, row in scored[: max(0, int(n))]:
+            d = self._library_row(row)
+            d["score"] = score
+            out.append(d)
+        return out
+
+    def nearest_regime_entries(
+        self, symbol: str, target_regime_score: float, *, n: int = 1
+    ) -> list[dict[str, Any]]:
+        """This symbol's own library entries ordered by nearest regime match
+        (item 5) - a similarity search in continuous regime space, not a
+        threshold boundary. Falls back to nothing (an empty list) rather than
+        guessing when this symbol has no library entries yet; the caller is
+        expected to fall back to the existing global/per-coin set."""
+        rows = self.conn.execute(
+            "SELECT * FROM library WHERE symbol = ? AND symbol_regime_score IS NOT NULL",
+            (symbol,),
+        ).fetchall()
+        scored = [
+            (abs(float(r["symbol_regime_score"]) - float(target_regime_score)), r) for r in rows
+        ]
+        scored.sort(key=lambda t: t[0])
+        return [self._library_row(row) for _distance, row in scored[: max(0, int(n))]]
+
+    def prune_library(self, *, keep: int = 500) -> int:
+        """Cap the library at `keep` entries, dropping the lowest-scored
+        (recency-weighted) ones first - the same 'grow, then bound' pattern
+        purge_older_than uses for run history, sized by count rather than age
+        since a library entry has no natural expiry the way a run does."""
+        total = int(self.conn.execute("SELECT COUNT(*) AS n FROM library").fetchone()["n"])
+        overflow = total - max(0, int(keep))
+        if overflow <= 0:
+            return 0
+
+        rows = self.conn.execute(
+            "SELECT fingerprint, performance, last_seen_at FROM library"
+        ).fetchall()
+        ts = now()
+        scored = sorted(
+            rows,
+            key=lambda r: _library_score(_load(r["performance"], {}))
+            * _recency_weight(int(r["last_seen_at"]), now_ts=ts),
+        )
+        doomed = [r["fingerprint"] for r in scored[:overflow]]
+        with self.transaction() as conn:
+            placeholders = ",".join("?" * len(doomed))
+            cur = conn.execute(
+                f"DELETE FROM library WHERE fingerprint IN ({placeholders})", doomed
+            )
+            return cur.rowcount

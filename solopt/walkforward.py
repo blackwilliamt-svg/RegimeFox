@@ -131,6 +131,13 @@ class WalkForwardConfig:
     memory_budget_mb: int = 512
     warmup_bars: int = 0             # 0 = derive from the search space
 
+    # Persistent library (gap-closure item 4): the share of each window's
+    # first search batch seeded from combinations that already proved
+    # themselves in an earlier run, rather than starting cold from
+    # DEFAULT_GRID every time. The rest of that batch, and every later
+    # round's refinement, is unaffected.
+    library_seed_fraction: float = 0.3
+
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
 
@@ -265,6 +272,7 @@ def _init_worker(
     space_values: dict[str, list[Any]],
     space_fixed: dict[str, Any],
     warmup: int,
+    seed_pool: Sequence[dict[str, Any]] = (),
 ) -> None:  # pragma: no cover - exercised only via the process pool
     _WORKER.update(
         frames=frames,
@@ -272,6 +280,7 @@ def _init_worker(
         config=config,
         space=ParamSpace(values=space_values, fixed=space_fixed),
         warmup=warmup,
+        seed_pool=seed_pool,
         engine=VectorEngine(
             get_backend(),
             Throttle(config.utilization_pct),
@@ -289,6 +298,7 @@ def _worker_window(window: Window) -> dict[str, Any]:  # pragma: no cover - subp
         _WORKER["config"],
         _WORKER["engine"],
         _WORKER["warmup"],
+        seed_pool=_WORKER.get("seed_pool", ()),
     ).as_dict()
 
 
@@ -302,6 +312,7 @@ def evaluate_window(
     warmup: int,
     *,
     on_batch: Callable[[int, SearchState], None] | None = None,
+    seed_pool: Sequence[dict[str, Any]] = (),
 ) -> WindowResult:
     """Search the in-sample window, then test the winner out of sample."""
     result = WindowResult(index=window.index)
@@ -319,6 +330,8 @@ def evaluate_window(
         plateau_rounds=config.plateau_rounds,
         plateau_epsilon=config.plateau_epsilon,
         seed=config.seed + window.index,
+        seed_pool=seed_pool,
+        seed_fraction=config.library_seed_fraction,
     )
 
     cache = _shared_cache(is_frames, space, settings, config)
@@ -420,6 +433,24 @@ class WalkForward:
         self.feed = feed
         self.store = store
         self.run_id = run_id
+        self.seed_pool = self._fetch_seed_pool()
+
+    def _fetch_seed_pool(self) -> list[dict[str, Any]]:
+        """Top library entries (gap-closure item 4), market-wide only - a
+        window's own per-symbol seeding happens where per-symbol params are
+        searched (see :meth:`_per_symbol`), not here. `store` may be a bare
+        RunStore substitute in a test or an early call site that predates the
+        library; either way, no library just means no seeding, not an error.
+        """
+        fetch = getattr(self.store, "top_library_entries", None)
+        if not callable(fetch) or self.config.library_seed_fraction <= 0:
+            return []
+        try:
+            n = max(1, self.config.batch_size)
+            return [e["params"] for e in fetch(n, symbol=None)]
+        except Exception:
+            log.debug("library seed pool unavailable", exc_info=True)
+            return []
 
     # ------------------------------------------------------------------
     def run(self, frames: Frames, *, resume: bool = True) -> WalkForwardResult:
@@ -516,7 +547,7 @@ class WalkForward:
             initializer=_init_worker,
             initargs=(
                 frames, self.settings, self.config, self.space.values,
-                self.space.fixed, warmup,
+                self.space.fixed, warmup, self.seed_pool,
             ),
         ) as pool:
             futures = {pool.submit(_worker_window, w): w for w in windows}
@@ -542,7 +573,7 @@ class WalkForward:
 
         result = evaluate_window(
             window, frames, self.space, self.settings, self.config,
-            self.engine, warmup, on_batch=on_batch,
+            self.engine, warmup, on_batch=on_batch, seed_pool=self.seed_pool,
         )
         if self.feed:
             if result.status == "skipped":

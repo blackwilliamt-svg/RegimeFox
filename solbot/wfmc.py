@@ -201,6 +201,7 @@ def run_daily(
             "in_sample_days": 45, "out_of_sample_days": 10, "step_days": 10,
             "max_evaluations": 300, "batch_size": 32, "workers": 1,
             "utilization_pct": 80.0,
+            "library_seed_fraction": float(cfg.get("library_seed_fraction", 0.3)),
             **(wf_config_overrides or {}),
         }
     )

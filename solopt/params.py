@@ -217,6 +217,48 @@ class ParamSpace:
                 out.append(combo)
         return out
 
+    def sample_seeded(
+        self,
+        count: int,
+        rng: np.random.Generator,
+        seed_pool: Sequence[dict[str, Any]] = (),
+        seed_fraction: float = 0.0,
+    ) -> list[dict[str, Any]]:
+        """Like :meth:`sample`, but up to ``seed_fraction`` of ``count`` comes
+        from ``seed_pool`` first (gap-closure item 4's persistent library),
+        taken in the order the caller already ranked it - best first. The
+        rest is filled with a fresh random sample, so a thin library (or
+        none at all) never shrinks the batch below ``count``.
+        """
+        names = self.names
+        seen: set[tuple] = set()
+        out: list[dict[str, Any]] = []
+
+        if seed_pool and seed_fraction > 0:
+            target = min(count, int(round(count * seed_fraction)))
+            for candidate in seed_pool:
+                if len(out) >= target:
+                    break
+                combo = {**self.fixed}
+                for n in names:
+                    # A library entry missing an axis this space now tunes
+                    # (e.g. one written before a new indicator's parameter
+                    # existed) falls back to that axis's own first candidate
+                    # value - partial evidence still beats none.
+                    combo[n] = candidate[n] if n in candidate else self.values[n][0]
+                if not is_valid(combo):
+                    continue
+                point = tuple(combo[n] for n in names)
+                if point in seen:
+                    continue
+                seen.add(point)
+                out.append(combo)
+
+        remaining = max(0, count - len(out))
+        if remaining:
+            out.extend(self.sample(remaining, rng))
+        return out
+
     def neighbours(
         self, combo: dict[str, Any], rng: np.random.Generator, count: int
     ) -> list[dict[str, Any]]:
@@ -315,6 +357,11 @@ class Search:
     refine_after: int = 3              # rounds of random sampling before refining
     seed: int = 20260903
     state: SearchState = field(default_factory=SearchState)
+    # Persistent library (gap-closure item 4): only the very first batch is
+    # seeded - by the time refinement starts, the search has its own best
+    # combo to refine around, which is a stronger signal than the library.
+    seed_pool: Sequence[dict[str, Any]] = field(default_factory=tuple)
+    seed_fraction: float = 0.0
 
     def __post_init__(self) -> None:
         self._rng = np.random.default_rng(self.seed + self.state.rounds)
@@ -349,6 +396,10 @@ class Search:
                 batch = self.space.neighbours(self.state.best_combo, self._rng, take)
                 if len(batch) < take:
                     batch += self.space.sample(take - len(batch), self._rng)
+            elif self.state.rounds == 0 and self.seed_pool and self.seed_fraction > 0:
+                batch = self.space.sample_seeded(
+                    take, self._rng, self.seed_pool, self.seed_fraction
+                )
             else:
                 batch = self.space.sample(take, self._rng)
 

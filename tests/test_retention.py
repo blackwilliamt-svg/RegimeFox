@@ -78,6 +78,36 @@ def test_prune_drops_old_rejected_bundles_but_keeps_the_active_shadow_one(worksp
     assert remaining == {"shadow-old"}
 
 
+def test_datastore_prune_also_prunes_the_local_wfmc_library(workspace, settings, monkeypatch, tmp_path):
+    """DataStore.prune() (spec 6c/7's actual entrypoint) wraps db.prune() plus
+    the local RunStore's run-history purge and, since gap-closure item 4, the
+    persistent library's own count-capped prune - all three in one call."""
+    import solbot.wfmc as wfmc
+    from solbot.datastore import DataStore
+    from solopt.store import LibraryEntry, RunStore
+
+    db_path = tmp_path / "wfmc.db"
+    monkeypatch.setattr(wfmc, "DAILY_STORE_PATH", str(db_path))
+
+    store = RunStore(db_path)
+    for i in range(5):
+        store.upsert_library(
+            LibraryEntry(
+                fingerprint=f"fp{i}",
+                params={"ema_fast": 9},
+                performance={"walk_forward_efficiency": i / 10.0},
+            )
+        )
+    store.close()
+
+    ds = DataStore(object(), {**settings, "library_max_entries": 3})
+    deleted = ds.prune(conn=workspace["conn"])
+
+    assert deleted["library_pruned"] == 2
+    remaining = RunStore(db_path).top_library_entries(10)
+    assert len(remaining) == 3
+
+
 # --------------------------------------------------------------------------
 # settings_audit's reason column (spec 6b) - the audit trail for both a
 # manual dashboard edit and a bot-made (auto-promoted) change.

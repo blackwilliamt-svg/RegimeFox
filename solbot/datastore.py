@@ -434,10 +434,14 @@ class DataStore:
             from .wfmc import DAILY_STORE_PATH
             from solopt.store import RunStore
 
-            local = RunStore(DAILY_STORE_PATH).purge_older_than(
-                int(self.cfg.get("wfmc_result_retention_days", 180))
-            )
+            store = RunStore(DAILY_STORE_PATH)
+            local = store.purge_older_than(int(self.cfg.get("wfmc_result_retention_days", 180)))
             deleted["wfmc_local_runs"] = local["runs"]
+            # Persistent library (gap-closure item 4): capped by entry count,
+            # not age - see library_max_entries's own comment in config.py.
+            deleted["library_pruned"] = store.prune_library(
+                keep=int(self.cfg.get("library_max_entries", 500))
+            )
         except Exception:
             pass  # the local WFMC store may not exist yet on a fresh install
         return deleted

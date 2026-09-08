@@ -234,6 +234,10 @@ DEFAULTS: dict[str, Any] = {
     # distributions) is the fastest-growing storage component - unlike raw
     # candles, which are kept indefinitely, this needs its own bound (spec 6c).
     "wfmc_result_retention_days": 180,
+    # Persistent library (gap-closure item 4) - capped by entry count rather
+    # than age, since a validated combination has no natural expiry the way a
+    # run does; it may simply describe a regime that has not recurred lately.
+    "library_max_entries": 500,
 
     # --- backtest ---------------------------------------------------------
     "backtest_daily_enabled": True,
@@ -277,6 +281,11 @@ DEFAULTS: dict[str, Any] = {
     "shadow_min_trades": 30,
     "shadow_min_margin": 0.25,
     "shadow_min_confidence": 0.90,
+    # Persistent library (gap-closure item 4): the share of each window's
+    # first search batch seeded from combinations that already passed the
+    # walk-forward thresholds in an earlier run, instead of every run
+    # starting cold from DEFAULT_GRID. 0 restores that old behaviour exactly.
+    "library_seed_fraction": 0.3,
 
     # --- RunPod worker ingest endpoint --------------------------------------
     "runpod_ingest_enabled": True,
@@ -373,6 +382,8 @@ SPEC: dict[str, Bound] = {
     "shadow_min_trades": (int, 5, 10000),
     "shadow_min_margin": (float, 0.0, 10.0),
     "shadow_min_confidence": (float, 0.5, 1.0),
+    "library_seed_fraction": (float, 0.0, 1.0),
+    "library_max_entries": (int, 10, 100000),
     "runpod_rate_limit_per_minute": (int, 1, 10000),
     "max_slippage_pct": (float, 0.05, 5.0),
     "taker_fee_pct": (float, 0.0, 2.0),
