@@ -1,15 +1,18 @@
-"""Command line for the optimizer - the RunPod monthly-retest worker's entry point.
+"""Command line for the optimizer - the RunPod worker's entry point.
 
     python -m solopt run                 walk-forward, Monte Carlo, stress, report
+    python -m solopt regime-pass         fuzzy regime discovery + per-regime walk-forward
     python -m solopt status              what the last run concluded
     python -m solopt feed --follow       tail the plain-language run feed
 
 The daily on-droplet run does not go through this CLI at all - it calls
 :mod:`solopt.pipeline` directly, in-process, since it already has local access
 to the droplet's database and Parquet files (see :mod:`solbot.wfmc`). This
-entry point exists for the one case that genuinely runs somewhere else: a
-RunPod GPU worker, which gets its data shipped to it before ``run`` starts and
-reports back to the droplet over HTTP as it goes.
+entry point exists for the cases that genuinely run somewhere else: a RunPod
+GPU worker, which gets its data shipped to it before ``run``/``regime-pass``
+starts and reports back to the droplet over HTTP as it goes (the monthly
+full-space retest and the on-demand fuzzy-regime pass, respectively - see
+:func:`solbot.wfmc.run_monthly` and :func:`solbot.wfmc.run_regime_pass`).
 
 ``run`` is the whole pipeline in one command because the stages are not
 independently useful: a walk-forward result without the Monte Carlo tail has no
@@ -458,6 +461,141 @@ def _execution_profile(
     return profile if profile.source == "observed" else assumed
 
 
+def _parse_k_range(raw: str) -> tuple[int, ...]:
+    values = tuple(int(x) for x in raw.split(",") if x.strip())
+    if not values:
+        raise SystemExit("--k-range needs at least one cluster-count value")
+    return values
+
+
+def cmd_regime_pass(args: argparse.Namespace, settings: Settings) -> int:
+    """Fuzzy-regime section, step 5's RunPod worker side: discover every coin
+    in this batch's own fuzzy regimes, then walk-forward each one - the exact
+    per-coin loop :func:`solbot.wfmc.run_regime_pass` used to run directly on
+    the droplet, moved onto the GPU worker the same way the monthly full-space
+    retest already is (see ``cmd_run``). Regime models and accepted per-regime
+    library entries are pushed straight to the droplet as they are found,
+    since a worker's own local store is torn down with its container/volume.
+    """
+    from .promotion import ParameterBundle
+    from .regime_discovery import MIN_SAMPLES_PER_COIN, compute_features, discover_coin_regimes
+    from .regime_walkforward import DEFAULT_MEMBERSHIP_THRESHOLD, run_and_store_all_regimes
+
+    directory = Path(args.data_dir or settings.data_dir)
+    schema = get_schema(settings.asset_class)
+    timeframe = int(args.timeframe or settings.timeframe_minutes) * 60
+    k_range = _parse_k_range(args.k_range)
+    threshold = args.membership_threshold if args.membership_threshold is not None else DEFAULT_MEMBERSHIP_THRESHOLD
+
+    store = RunStore(settings.store_path)
+    print(f"Loading {directory} at {timeframe // 60}-minute candles…")
+    panel = load_panel(directory, timeframe_seconds=timeframe, schema=schema)
+    frames = compact(panel)
+
+    space = settings.space()
+    wf_config = settings.wf_config()
+    portfolio = settings.portfolio_settings()
+
+    run_id = store.start_run(
+        config=wf_config.as_dict(), settings=portfolio.as_dict(),
+        space={"values": space.values}, bundle=bundle_fingerprint(directory),
+        coverage=panel.coverage(), label=args.label or "regime-pass",
+    )
+
+    client = None
+    sinks = []
+    if settings.push_feed and settings.droplet_url:
+        try:
+            client = settings.client()
+            sinks.append(BufferedSink(send=lambda rid, lines: client.push_feed(rid, lines)))
+        except SystemExit:
+            client = None
+
+    feed = RunFeed(store, run_id, report_run_id=settings.report_run_id, sinks=sinks)
+    mints = list(frames.symbols)
+    feed.say(f"Regime pass starting: {len(mints)} coin(s) in this batch.")
+
+    all_features = compute_features(frames)
+    totals = {"coins_modeled": 0, "coins_skipped": 0, "regimes_accepted": 0, "regimes_tried": 0}
+
+    for mint in mints:
+        label = mint[:8]
+        feed.say(f"Now discovering regimes for {label}...")
+
+        model = discover_coin_regimes(
+            frames, mint, k_range=k_range, min_samples=MIN_SAMPLES_PER_COIN, features=all_features,
+        )
+        if model is None:
+            totals["coins_skipped"] += 1
+            feed.say(f"{label}: not enough history yet - skipped.")
+            continue
+
+        totals["coins_modeled"] += 1
+        model_dict = model.as_dict()
+        store.save_regime_model(mint, model_dict, run_id=run_id)
+        if client is not None:
+            try:
+                client.push_regime_model(feed.report_run_id, mint, model_dict)
+            except ReportError as exc:
+                feed.alert(f"could not report {label}'s regime model to the droplet: {exc}")
+        feed.say(
+            f"{label}: discovered {model.n_clusters} regime(s) from {model.n_samples} bars "
+            f"(partition coefficient {model.fpc:.2f})."
+        )
+
+        def on_progress(cluster_id: int, n_clusters: int, *, _label: str = label) -> None:
+            feed.say(f"Now optimizing regime {cluster_id + 1}/{n_clusters} for {_label}...")
+
+        outcomes = run_and_store_all_regimes(
+            frames, mint, model,
+            space=space, portfolio=portfolio, wf_config=wf_config, store=store,
+            threshold=threshold, run_id=run_id, on_progress=on_progress,
+        )
+        totals["regimes_tried"] += len(outcomes)
+        accepted = 0
+        for cluster_id, outcome in outcomes.items():
+            if not outcome.accepted or not outcome.best_params:
+                continue
+            accepted += 1
+            if client is None:
+                continue
+            fingerprint = ParameterBundle(global_params=dict(outcome.best_params)).fingerprint()
+            try:
+                client.push_regime_library(
+                    {
+                        "run_id": feed.report_run_id, "fingerprint": fingerprint,
+                        "params": dict(outcome.best_params), "performance": outcome.summary(),
+                        "symbol": mint, "regime_cluster_id": int(cluster_id),
+                    }
+                )
+            except ReportError as exc:
+                feed.alert(f"could not report {label}'s regime {cluster_id} result to the droplet: {exc}")
+        totals["regimes_accepted"] += accepted
+        feed.say(
+            f"{label}: {accepted} of {len(outcomes)} tested regime(s) accepted and promoted."
+            if outcomes else f"{label}: no regime had enough dominated windows to search yet."
+        )
+
+    feed.say(
+        f"Regime pass finished: {totals['coins_modeled']} coin(s) modeled "
+        f"({totals['coins_skipped']} skipped for too little history), "
+        f"{totals['regimes_accepted']} of {totals['regimes_tried']} tested regime(s) promoted."
+    )
+    store.finish_run(run_id, "done", totals)
+    if client:
+        try:
+            client.push_run(
+                feed.report_run_id,
+                {"status": "done", "label": args.label or "", "coverage": panel.coverage(), "summary": totals},
+            )
+        except Exception as exc:
+            log.warning("could not push the regime-pass run summary: %s", exc)
+    feed.flush()
+
+    print(json.dumps(totals, indent=2))
+    return 0
+
+
 def cmd_status(args: argparse.Namespace, settings: Settings) -> int:
     store = RunStore(settings.store_path)
     run = store.get_run(args.run) if args.run else store.latest_run()
@@ -535,6 +673,17 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--cpu", action="store_true", help="force the NumPy backend")
     run.add_argument("--no-report", action="store_true", help="do not report the bundle")
     run.set_defaults(func=cmd_run)
+
+    regime_pass = sub.add_parser(
+        "regime-pass",
+        help="fuzzy regime discovery + per-regime walk-forward for a RunPod worker's coin batch",
+    )
+    regime_pass.add_argument("--data-dir")
+    regime_pass.add_argument("--timeframe", type=int, help="candle minutes to test")
+    regime_pass.add_argument("--k-range", default="4,5,6", help="comma list of cluster counts to try")
+    regime_pass.add_argument("--membership-threshold", type=float)
+    regime_pass.add_argument("--label", help="a name for this run")
+    regime_pass.set_defaults(func=cmd_regime_pass)
 
     status = sub.add_parser("status", help="what the last run concluded")
     status.add_argument("--run", type=int)

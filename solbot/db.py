@@ -698,7 +698,7 @@ def execution_samples(
 
 
 # --------------------------------------------------------------------------
-# retention - keeps the database small enough for a 2GB droplet
+# retention - keeps the database small regardless of droplet size
 #
 # Candle history is never pruned (spec 3a): it lives in Parquet, kept
 # indefinitely, and is not touched here at all.

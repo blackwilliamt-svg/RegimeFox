@@ -12,7 +12,9 @@ Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=/opt/solana-ta-bot/.env
 
 # Two workers is plenty: the dashboard is read-mostly and the trading loop lives
-# in a separate process. More workers on a 1 vCPU box just adds contention.
+# in a separate process. More workers would just add contention with that loop
+# and with live fuzzy-regime classification for the droplet's vCPUs (see
+# deploy/DEPLOY.md for the current droplet size).
 # Bound to localhost only - nginx terminates TLS and is the sole public entry.
 #
 # The timeout is generous rather than the 60s default as a liveness ceiling,

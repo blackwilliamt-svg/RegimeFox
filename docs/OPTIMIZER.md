@@ -90,8 +90,9 @@ than silently leaving a bill running.
 `utilization_pct` in the walk-forward config caps how much wall-clock time the
 search may use — at 60 it works for 60ms out of every 100ms and sleeps the
 rest. On the daily run this is what keeps it from meaningfully competing with
-the trading loop for the droplet's one vCPU; on a RunPod worker it matters far
-less, since nothing else is sharing that GPU.
+the trading loop and live fuzzy-regime classification for the droplet's own
+vCPUs (see `deploy/DEPLOY.md` for the current droplet size); on a RunPod
+worker it matters far less, since nothing else is sharing that GPU.
 
 ### Teardown verification
 

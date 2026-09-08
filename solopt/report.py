@@ -96,5 +96,20 @@ class DropletClient:
         """
         return self._request("POST", "/api/optimizer/bundle", body=bundle_payload)
 
+    def push_regime_model(self, run_id: int, symbol: str, model: dict[str, Any]) -> None:
+        """Hand a coin's freshly-discovered fuzzy regime model to the droplet's
+        own regime-model table - the same one the live trading loop reads from
+        (see ``solbot.store``'s reuse of :class:`solopt.store.RunStore`)."""
+        self._request(
+            "POST", "/api/optimizer/regime-model",
+            body={"run_id": run_id, "symbol": symbol, "model": model},
+        )
+
+    def push_regime_library(self, entry_payload: dict[str, Any]) -> None:
+        """Hand one accepted per-coin, per-regime walk-forward result to the
+        droplet's library - keyed by ``symbol`` + ``regime_cluster_id``, same
+        shape as :class:`solopt.store.LibraryEntry`."""
+        self._request("POST", "/api/optimizer/regime-library", body=entry_payload)
+
     def execution_profile(self) -> dict[str, Any]:
         return self._request("GET", "/api/optimizer/execution")

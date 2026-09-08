@@ -29,10 +29,15 @@ KillSignal=SIGTERM
 TimeoutStopSec=30
 
 # The daily walk-forward/Monte Carlo re-score (spec 5) also runs in this
-# process, on this same vCPU, during its configured low-activity window
+# process, on this same box, during its configured low-activity window
 # (wfmc_daily_hour_utc) - roughly 5-10 minutes against a focused parameter
-# set. The monthly full-space retest instead runs on a rented RunPod GPU
-# worker; this process only orchestrates it (ship data, poll, tear down).
+# set. Live fuzzy-regime classification (fuzzy-regime section) runs
+# continuously alongside the trading loop in this same process too - between
+# the two, this is why the droplet is sized at 4 vCPU / 8 GB rather than the
+# original 1 vCPU / 2 GB (see deploy/DEPLOY.md). The monthly full-space
+# retest and the on-demand fuzzy-regime discovery pass instead run on rented
+# RunPod GPU workers; this process only orchestrates them (ship data, poll,
+# tear down).
 
 # Hardening. The bot needs outbound HTTPS and its own directory, nothing else.
 NoNewPrivileges=true
@@ -47,7 +52,7 @@ RestrictNamespaces=true
 RestrictSUIDSGID=true
 LockPersonality=true
 
-# 2GB droplet shared with other services: keep this one bounded.
+# Droplet shared with other services: keep this one bounded.
 MemoryMax=700M
 CPUWeight=80
 

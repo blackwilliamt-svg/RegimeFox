@@ -1,8 +1,18 @@
 # Deploying to the DigitalOcean droplet
 
-Target: 1 vCPU / 2 GB (Basic Intel). This bot runs in its own directory, its own
-virtualenv and its own systemd units, entirely separate from the freight lead-gen
-app already on the box — nothing is shared except nginx and the OS.
+Target: 4 vCPU / 8 GB (DigitalOcean Basic/Premium tier, ~$48/mo as of Sep
+2026). This bot runs in its own directory, its own virtualenv and its own
+systemd units, entirely separate from the freight lead-gen app already on the
+box — nothing is shared except nginx and the OS.
+
+The original 1 vCPU / 2 GB box was undersized even before the fuzzy-regime
+work landed: the droplet now runs live fuzzy regime classification and the
+daily WFMC scoring pass concurrently with the trading loop and the dashboard,
+and none of that shares a core gracefully with `solbot-worker`. The heavier,
+GPU-bound regime discovery + per-regime walk-forward search itself still runs
+off-box on RunPod, same as the monthly full-space retest — this resize is for
+the classification and daily-scoring load that stayed on the droplet, not for
+that search.
 
 Two processes:
 

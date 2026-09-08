@@ -49,29 +49,6 @@ def _seed_minutes(mint: str, days: int, *, seed: int = 1) -> None:
     ParquetCandleStore().append(mint, "1m", rows)
 
 
-def _seed_minutes_with_varied_volume(mint: str, days: int, *, seed: int = 1) -> None:
-    """Like _seed_minutes, but with per-minute volume noise (real market data
-    always has some) rather than a near-constant baseline - the fuzzy-regime
-    section's volume-behaviour feature needs a nonzero rolling standard
-    deviation to be defined at all, which a near-constant series doesn't
-    reliably give it after being summed into 10-minute candles."""
-    rng = np.random.default_rng(seed)
-    total = days * 1440
-    end = int(time.time())
-    start = end - total * 60
-    price = 1.0
-    rows = []
-    for i in range(total):
-        drift = rng.normal(0, 0.0015)
-        spike = (i % 1600) < 3
-        if spike:
-            drift = abs(drift) + 0.003
-        price = max(1e-6, price * (1 + drift))
-        volume = max(100.0, rng.lognormal(np.log(5000.0), 0.5)) * (6.0 if spike else 1.0)
-        rows.append((start + i * 60, price * 0.999, price * 1.004, price * 0.996, price, volume))
-    ParquetCandleStore().append(mint, "1m", rows)
-
-
 # --------------------------------------------------------------------------
 # Bundle materialization
 # --------------------------------------------------------------------------
@@ -331,12 +308,26 @@ def test_run_benchmark_flags_a_tier_that_failed_to_tear_down_cleanly(workspace, 
 
 
 # --------------------------------------------------------------------------
-# Fuzzy-regime section, step 5: manual trigger + progress
+# Fuzzy-regime section, step 5: manual trigger + progress - dispatched to
+# RunPod exactly like run_monthly, never run in-process on the droplet.
 # --------------------------------------------------------------------------
-def test_run_regime_pass_requires_a_routed_universe(workspace, settings, tmp_path, monkeypatch):
-    monkeypatch.setattr(wfmc, "DAILY_STORE_PATH", str(tmp_path / "wfmc.db"))
+def test_run_regime_pass_requires_a_runpod_api_key(workspace, settings):
     store = DataStore(binance=None, cfg=settings)
-    result = wfmc.run_regime_pass(settings, store, conn=workspace["conn"])
+
+    class NoKey:
+        runpod_api_key = ""
+
+    result = wfmc.run_regime_pass(settings, store, NoKey(), conn=workspace["conn"])
+    assert not result["ran"]
+    assert "RUNPOD_API_KEY" in result["reason"]
+
+    progress = db.get_progress(wfmc.REGIME_PASS_JOB, conn=workspace["conn"])
+    assert progress["status"] == "failed"
+
+
+def test_run_regime_pass_requires_a_routed_universe(workspace, settings):
+    store = DataStore(binance=None, cfg=settings)
+    result = wfmc.run_regime_pass(settings, store, _Secrets(), conn=workspace["conn"])
     assert not result["ran"]
     assert "universe" in result["reason"]
 
@@ -344,59 +335,83 @@ def test_run_regime_pass_requires_a_routed_universe(workspace, settings, tmp_pat
     assert progress["status"] == "failed"
 
 
-def test_run_regime_pass_discovers_and_reports_progress(workspace, settings, tmp_path, monkeypatch):
-    monkeypatch.setattr(wfmc, "DAILY_STORE_PATH", str(tmp_path / "wfmc.db"))
+def test_run_regime_pass_launches_a_runpod_batch_per_chunk_and_verifies_teardown(workspace, settings):
+    from tests.test_runpod import FakeTransport
+
     conn = workspace["conn"]
-    _seed_universe(conn, {MINT_A: "AAAUSDT"})
-    _seed_minutes_with_varied_volume(MINT_A, days=3)   # enough bars to clear MIN_SAMPLES_PER_COIN
-    store = DataStore(binance=None, cfg=settings)
+    _seed_universe(conn, {MINT_A: "AAAUSDT", MINT_B: "BBBUSDT"})
+    _seed_minutes(MINT_A, days=1)
+    _seed_minutes(MINT_B, days=1, seed=3)
+
+    transport = FakeTransport()
+    client = RunPodClient(
+        api_key="test-key", transport=transport,
+        poll_interval_seconds=0.01, max_poll_seconds=0.05,
+    )
+    store = DataStore(binance=None, cfg={**settings, "runpod_batch_size": 1})
 
     result = wfmc.run_regime_pass(
-        settings, store, conn=conn,
-        wf_config_overrides={
-            "max_evaluations": 10, "batch_size": 5, "min_trades_per_window": 0,
-            "workers": 1,
-        },
-        k_range=(2,),
+        {**settings, "runpod_batch_size": 1}, store, _Secrets(), conn=conn, runpod_client=client,
     )
 
     assert result["ran"]
-    assert result["coins_modeled"] + result["coins_skipped"] == 1
+    assert len(result["jobs"]) == 2   # one batch per coin, batch size 1
+    assert result["teardown"]["clean"] is True
+    assert not transport.pods and not transport.volumes
+
+    # The job kind (and this pass's own knobs) are signalled to the worker
+    # through its environment, the same mechanism the benchmark path already
+    # uses for SOLOPT_BENCHMARK - no separate dispatch endpoint needed.
+    pod_calls = [c for c in transport.calls if c[0] == "POST" and c[1] == "/pods"]
+    assert len(pod_calls) == 2
+    for _, _, body in pod_calls:
+        env = {e["key"]: e["value"] for e in body["env"]}
+        assert env["SOLOPT_JOB_KIND"] == "regime-pass"
+        assert env["SOLOPT_REGIME_K_RANGE"] == "4,5,6"
 
     progress = db.get_progress(wfmc.REGIME_PASS_JOB, conn=conn)
     assert progress["status"] == "done"
-    assert progress["done"] == progress["total"] == 1
+    assert progress["done"] == progress["total"] == 2
 
-    feed_lines = conn.execute(
-        "SELECT message FROM optimizer_feed ORDER BY id"
-    ).fetchall()
-    joined = " ".join(r["message"] for r in feed_lines)
-    assert "Regime pass starting" in joined
-    assert "Regime pass finished" in joined
+    events = conn.execute("SELECT message FROM events ORDER BY id").fetchall()
+    assert any(
+        "regime" in e["message"].lower() and "runpod" in e["message"].lower() for e in events
+    )
+    assert any("teardown check" in e["message"].lower() for e in events)
 
 
-def test_run_regime_pass_saves_a_model_when_discovery_succeeds(workspace, settings, tmp_path, monkeypatch):
-    monkeypatch.setattr(wfmc, "DAILY_STORE_PATH", str(tmp_path / "wfmc.db"))
+def test_run_regime_pass_records_a_launch_failure_without_aborting_the_others(workspace, settings):
+    from tests.test_runpod import FakeTransport
+
     conn = workspace["conn"]
-    _seed_universe(conn, {MINT_A: "AAAUSDT"})
-    _seed_minutes_with_varied_volume(MINT_A, days=3)
-    store = DataStore(binance=None, cfg=settings)
+    _seed_universe(conn, {MINT_A: "AAAUSDT", MINT_B: "BBBUSDT"})
+    _seed_minutes(MINT_A, days=1)
+    _seed_minutes(MINT_B, days=1, seed=3)
 
-    from solopt.store import RunStore
+    transport = FakeTransport()
+    client = RunPodClient(
+        api_key="test-key", transport=transport,
+        poll_interval_seconds=0.01, max_poll_seconds=0.05,
+    )
+    store = DataStore(binance=None, cfg={**settings, "runpod_batch_size": 1})
+
+    orig_create_pod = client.create_pod
+    state = {"calls": 0}
+
+    def flaky_create_pod(*a, **kw):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            from solbot.runpod import RunPodError
+
+            raise RunPodError("simulated launch failure")
+        return orig_create_pod(*a, **kw)
+
+    client.create_pod = flaky_create_pod
 
     result = wfmc.run_regime_pass(
-        settings, store, conn=conn,
-        wf_config_overrides={
-            "max_evaluations": 10, "batch_size": 5, "min_trades_per_window": 0,
-            "workers": 1,
-        },
-        k_range=(2,),
+        {**settings, "runpod_batch_size": 1}, store, _Secrets(), conn=conn, runpod_client=client,
     )
 
-    if result["coins_modeled"] == 0:
-        pytest.skip("synthetic series did not clear the minimum sample bar in this run")
-
-    local_store = RunStore(wfmc.DAILY_STORE_PATH)
-    stored = local_store.get_regime_model(MINT_A)
-    assert stored is not None
-    assert stored["model"]["n_clusters"] == 2
+    assert result["ran"]
+    assert len(result["jobs"]) == 1
+    assert len(result["errors"]) == 1

@@ -67,9 +67,10 @@ def _presented_token() -> str:
 def _rate_limited() -> bool:
     """A simple fixed-window cap, shared across every bulk endpoint.
 
-    The droplet runs the trading loop on one vCPU. An optimizer that fans out
-    two hundred parallel downloads would starve it, so the ceiling is enforced
-    here rather than trusted to the client.
+    The droplet runs the trading loop and live fuzzy-regime classification
+    alongside this dashboard process. An optimizer that fans out two hundred
+    parallel downloads would starve them, so the ceiling is enforced here
+    rather than trusted to the client.
     """
     limit = int(cfg().get("runpod_rate_limit_per_minute", 60))
     now = time.monotonic()
@@ -316,3 +317,72 @@ def ingest_bundle():
         return jsonify({"error": str(exc)}), 400
 
     return jsonify({"ok": True, **result})
+
+
+def _regime_store() -> Any:
+    """The same on-droplet library store the live trading loop reads fuzzy
+    regime models and per-regime parameter sets from (see
+    ``solbot.engine.Engine._get_library_store``) - a RunPod regime-pass
+    worker's own local store does not survive its container/volume being torn
+    down, so its findings have to land here directly, over this endpoint."""
+    from solopt.store import RunStore
+
+    from ..wfmc import DAILY_STORE_PATH
+
+    return RunStore(DAILY_STORE_PATH)
+
+
+@bp.post("/optimizer/regime-model")
+@token_required
+def ingest_regime_model():
+    """Accept one coin's freshly-discovered fuzzy regime model from a RunPod
+    regime-pass worker (fuzzy-regime section, step 5)."""
+    payload = request.get_json(silent=True) or {}
+    symbol = str(payload.get("symbol") or "").strip()
+    model = payload.get("model")
+    if not symbol or not isinstance(model, dict):
+        return jsonify({"error": "symbol and model are required"}), 400
+    try:
+        run_id = int(payload.get("run_id") or 0) or None
+    except (TypeError, ValueError):
+        run_id = None
+
+    _regime_store().save_regime_model(symbol, model, run_id=run_id)
+    return jsonify({"ok": True})
+
+
+@bp.post("/optimizer/regime-library")
+@token_required
+def ingest_regime_library():
+    """Accept one accepted per-coin, per-regime walk-forward result from a
+    RunPod regime-pass worker - the regime-scoped counterpart to
+    ``/optimizer/bundle``, stored in the library rather than the shadow/
+    promotion system since it is keyed by coin and regime cluster, not a
+    portfolio-wide parameter set."""
+    from solopt.store import LibraryEntry
+
+    payload = request.get_json(silent=True) or {}
+    fingerprint = str(payload.get("fingerprint") or "").strip()
+    symbol = str(payload.get("symbol") or "").strip()
+    params = payload.get("params")
+    performance = payload.get("performance")
+    if not fingerprint or not symbol or not isinstance(params, dict) or not isinstance(performance, dict):
+        return jsonify(
+            {"error": "fingerprint, symbol, params, and performance are required"}
+        ), 400
+    try:
+        regime_cluster_id = int(payload.get("regime_cluster_id"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "regime_cluster_id is required"}), 400
+    try:
+        run_id = int(payload.get("run_id") or 0) or None
+    except (TypeError, ValueError):
+        run_id = None
+
+    changed = _regime_store().upsert_library(
+        LibraryEntry(
+            fingerprint=fingerprint, params=params, performance=performance,
+            symbol=symbol, regime_cluster_id=regime_cluster_id, run_id=run_id,
+        )
+    )
+    return jsonify({"ok": True, "changed": changed})

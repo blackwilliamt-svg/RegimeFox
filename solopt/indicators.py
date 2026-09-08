@@ -103,7 +103,7 @@ def rsi_stack(close: np.ndarray, periods: Sequence[int]) -> np.ndarray:
     avg_gain = ewm_stack(gain, alphas, start=1, min_index=mins)
     avg_loss = ewm_stack(loss, alphas, start=1, min_index=mins)
 
-    with np.errstate(divide="ignore", invalid="ignore"):
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
         rs = avg_gain / np.where(avg_loss == 0.0, NAN, avg_loss)
         rsi = 100.0 - (100.0 / (1.0 + rs))
     defined = ~np.isnan(avg_loss) & (avg_loss != 0.0)

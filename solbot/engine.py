@@ -1,8 +1,10 @@
 """The trading loop.
 
-A single polling loop, not a scheduler framework - this has to be light enough
-for one vCPU, and the work per cycle is batched HTTP calls plus indicator math,
-not model inference.
+A single polling loop, not a scheduler framework - this has to stay light on
+its own vCPU even though it now shares the droplet with live fuzzy-regime
+classification and the daily WFMC scoring pass (see deploy/DEPLOY.md), and
+the work per cycle is batched HTTP calls plus indicator math, not model
+inference.
 
 Each cycle, in order:
 
@@ -951,7 +953,7 @@ class Engine:
 
         if command == "run_regime_pass":
             threading.Thread(
-                target=lambda: wfmc.run_regime_pass(self.cfg, self.store),
+                target=lambda: wfmc.run_regime_pass(self.cfg, self.store, self.config.secrets),
                 name="regime-pass-manual", daemon=True,
             ).start()
             return "fuzzy regime discovery + per-regime walk-forward pass started"
@@ -1274,7 +1276,7 @@ class Engine:
             df = compute(df, self.cfg)
         self._candle_cache[mint] = (bar, df)
 
-        if len(self._candle_cache) > 600:  # bound memory on a 2GB box
+        if len(self._candle_cache) > 600:  # bound memory - shared with other processes on the box
             for key in list(self._candle_cache)[:200]:
                 self._candle_cache.pop(key, None)
         return df
