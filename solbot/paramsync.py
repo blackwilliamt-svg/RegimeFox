@@ -608,3 +608,96 @@ def select_regime_scoped_params(
         True, merged, fingerprint=entry["fingerprint"], distance=distance,
         reason=f"regime match within {distance:.3f}",
     )
+
+
+# --------------------------------------------------------------------------
+# Blended live strategy application (fuzzy-regime section, step 4)
+#
+# The complement to the single nearest-match selection above: instead of
+# hard-switching to one regime's promoted set, every regime this coin has a
+# promoted set for contributes to the effective parameters, weighted by its
+# current fuzzy membership - a transition between regimes moves the blend
+# smoothly rather than jumping the entry threshold and stop distance in one
+# tick. Off by default (fuzzy_regime_blend_enabled) since it depends on
+# regime discovery and per-regime walk-forward having actually run for a
+# coin; select_regime_scoped_params above (item 5's simpler nearest-match)
+# remains the fallback either way.
+# --------------------------------------------------------------------------
+# Blending a bitmask/categorical setting by weighted average produces a
+# number with no meaning (a "half indicator_mask" is not a smaller mask) -
+# these take the highest-weighted contributor's value outright instead.
+BLEND_AS_DOMINANT = {"indicator_mask", "regime_allowed"}
+
+
+@dataclass(slots=True)
+class BlendResult:
+    """What blend_regime_params computed, and why - `weights` (normalized,
+    summing to 1 over only the clusters that actually contributed) is exactly
+    what step 4 asks to be logged alongside the trade decision."""
+
+    applied: bool
+    params: dict[str, Any]
+    weights: dict[int, float] = field(default_factory=dict)
+    reason: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "applied": self.applied,
+            "weights": {str(k): round(v, 4) for k, v in self.weights.items()},
+            "reason": self.reason,
+        }
+
+
+def blend_regime_params(
+    cfg: dict[str, Any],
+    membership: Any,
+    cluster_entries: dict[int, dict[str, Any]],
+) -> BlendResult:
+    """Weighted-average this coin's per-regime promoted sets by its current
+    fuzzy membership (`membership.percentages`, from
+    solbot.regime_classify.classify_current_regime).
+
+    Falls back to `cfg` unchanged when there is nothing to blend - no
+    per-regime entries yet, or zero membership in every cluster that has
+    one (both ordinary, not error, cases).
+    """
+    if not cluster_entries:
+        return BlendResult(False, cfg, reason="no per-regime library entries for this symbol yet")
+
+    raw_weights = {
+        cid: float(membership.percentages.get(cid, 0.0)) for cid in cluster_entries
+    }
+    total = sum(raw_weights.values())
+    if total <= 0:
+        return BlendResult(
+            False, cfg, reason="zero current membership in every cluster with a promoted set"
+        )
+    weights = {cid: w / total for cid, w in raw_weights.items()}
+
+    keys: set[str] = set()
+    for entry in cluster_entries.values():
+        keys.update(entry.get("params", {}).keys())
+
+    blended = dict(cfg)
+    for key in keys:
+        contributions = [
+            (weights[cid], entry["params"][key])
+            for cid, entry in cluster_entries.items()
+            if key in entry.get("params", {})
+        ]
+        if not contributions:
+            continue
+        if key in BLEND_AS_DOMINANT:
+            _, blended[key] = max(contributions, key=lambda t: t[0])
+            continue
+        w_sum = sum(w for w, _ in contributions)
+        avg = sum(w * v for w, v in contributions) / w_sum
+        original = cfg.get(key, avg)
+        if isinstance(original, bool):
+            blended[key] = bool(round(avg))
+        elif isinstance(original, int):
+            blended[key] = int(round(avg))
+        else:
+            blended[key] = float(avg)
+
+    return BlendResult(True, blended, weights, reason=f"blended {len(weights)} regime(s)")

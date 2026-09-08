@@ -448,3 +448,78 @@ def test_a_library_lookup_failure_falls_back_rather_than_raising(settings):
     result = paramsync.select_regime_scoped_params(settings, "AAA", 0.4, store=BrokenStore())
     assert result.applied is False
     assert result.params == settings
+
+
+# --------------------------------------------------------------------------
+# blended live strategy application (fuzzy-regime section, step 4)
+# --------------------------------------------------------------------------
+class _Membership:
+    def __init__(self, percentages: dict[int, float]) -> None:
+        self.percentages = percentages
+
+
+def _cluster_entry(**params) -> dict:
+    return {"params": params}
+
+
+def test_blend_weighted_averages_a_continuous_parameter(settings):
+    membership = _Membership({0: 0.6, 1: 0.4})
+    entries = {
+        0: _cluster_entry(volume_spike_multiple=2.0),
+        1: _cluster_entry(volume_spike_multiple=4.0),
+    }
+    result = paramsync.blend_regime_params(settings, membership, entries)
+
+    assert result.applied is True
+    assert result.params["volume_spike_multiple"] == pytest.approx(0.6 * 2.0 + 0.4 * 4.0)
+    assert result.weights == {0: pytest.approx(0.6), 1: pytest.approx(0.4)}
+
+
+def test_blend_normalizes_weights_over_only_the_available_clusters(settings):
+    """Membership carries a third cluster (0.3) with no promoted set - its
+    weight must not just vanish, the other two must pick it up."""
+    membership = _Membership({0: 0.5, 1: 0.2, 2: 0.3})
+    entries = {0: _cluster_entry(rr_min=2.0), 1: _cluster_entry(rr_min=3.0)}
+
+    result = paramsync.blend_regime_params(settings, membership, entries)
+
+    assert result.weights[0] == pytest.approx(0.5 / 0.7)
+    assert result.weights[1] == pytest.approx(0.2 / 0.7)
+    assert 2 not in result.weights
+
+
+def test_blend_takes_the_dominant_clusters_value_for_a_bitmask_setting(settings):
+    membership = _Membership({0: 0.9, 1: 0.1})
+    entries = {
+        0: _cluster_entry(indicator_mask=15),
+        1: _cluster_entry(indicator_mask=511),
+    }
+    result = paramsync.blend_regime_params(settings, membership, entries)
+    assert result.params["indicator_mask"] == 15   # the 0.9-weight cluster's value, not an average
+
+
+def test_blend_rounds_an_int_period_rather_than_leaving_it_fractional(settings):
+    membership = _Membership({0: 0.5, 1: 0.5})
+    entries = {0: _cluster_entry(ema_fast=9), 1: _cluster_entry(ema_fast=10)}
+    result = paramsync.blend_regime_params(settings, membership, entries)
+    assert isinstance(result.params["ema_fast"], int)
+
+
+def test_blend_falls_back_with_no_per_regime_entries(settings):
+    result = paramsync.blend_regime_params(settings, _Membership({0: 1.0}), {})
+    assert result.applied is False
+    assert result.params == settings
+
+
+def test_blend_falls_back_when_membership_is_zero_in_every_available_cluster(settings):
+    membership = _Membership({0: 0.0, 1: 0.0})
+    entries = {0: _cluster_entry(rr_min=2.0), 1: _cluster_entry(rr_min=3.0)}
+    result = paramsync.blend_regime_params(settings, membership, entries)
+    assert result.applied is False
+
+
+def test_blend_leaves_a_key_no_cluster_provides_untouched(settings):
+    membership = _Membership({0: 1.0})
+    entries = {0: _cluster_entry(volume_spike_multiple=5.0)}
+    result = paramsync.blend_regime_params(settings, membership, entries)
+    assert result.params["rr_min"] == settings["rr_min"]   # untouched, not zeroed

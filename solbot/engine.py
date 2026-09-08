@@ -59,6 +59,12 @@ class _EmptyLibraryStore:
     def nearest_regime_entries(self, *_args: Any, **_kwargs: Any) -> list[dict[str, Any]]:
         return []
 
+    def regime_cluster_entries(self, *_args: Any, **_kwargs: Any) -> dict[int, dict[str, Any]]:
+        return {}
+
+    def get_regime_model(self, *_args: Any, **_kwargs: Any) -> dict[str, Any] | None:
+        return None
+
 
 @dataclass
 class InstanceRunner:
@@ -104,6 +110,12 @@ class Engine:
         # choice logs once rather than every cycle it stays the same.
         self._regime_selection: dict[tuple[str, str], str | None] = {}
         self._library_store: Any = None  # lazily opened once, not per entry check
+        # (instance, mint) -> the blend detail _regime_scoped_cfg computed
+        # for the entry decision currently in flight, if fuzzy blending
+        # (step 4) applied - _open() reads and clears this when it records
+        # the actual position, so it can only ever attach to the trade it
+        # was computed for.
+        self._active_blend_detail: dict[tuple[str, str], dict[str, Any]] = {}
         self._backtest_hook = None  # set by run_worker so a daily run can fire
         # Off by default so constructing an Engine for a test or a script never
         # spawns a real WFMC run purely because the wall clock happens to match
@@ -550,45 +562,90 @@ class Engine:
         df: pd.DataFrame,
         conn: sqlite3.Connection,
     ) -> dict[str, Any]:
-        """This one entry decision's effective config (gap-closure item 5).
+        """This one entry decision's effective config.
 
-        Falls back to `cfg` unchanged whenever no regime-scoped set qualifies
-        - see paramsync.select_regime_scoped_params for the distance gate.
-        Logs a plain-language event only when the *choice itself* changes for
-        this mint (not on every cycle it stays the same), so the feed shows
-        switches rather than repeating itself every poll.
+        Two mechanisms, tried in order, either falling back to `cfg`
+        unchanged:
+
+        1. Blended (fuzzy-regime section, step 4, off by default): every
+           regime this coin has its own promoted set for contributes,
+           weighted by current fuzzy membership - a smooth transition
+           between regimes rather than a hard switch. Needs regime
+           discovery and per-regime walk-forward to have actually run for
+           this coin; when they have not, falls through to (2).
+        2. Nearest-match (gap-closure item 5): the single closest
+           continuous-regime library entry, hard-switched.
+
+        Either way, logs a plain-language event only when the *choice*
+        changes for this mint (not every cycle it stays the same), and
+        records blend weights (if any) for _open() to attach to the entry
+        snapshot - the "log the blend weights alongside each trade decision"
+        explainability requirement.
         """
         snap = snapshot_at(df, -1)
+        key = (inst.name, mint)
+
+        if cfg.get("fuzzy_regime_blend_enabled", False) and snap is not None:
+            from .regime_classify import classify_current_regime
+
+            store = self._get_library_store()
+            membership = classify_current_regime(symbol, snap, store=store)
+            if membership is not None:
+                entries = store.regime_cluster_entries(symbol)
+                blend = paramsync.blend_regime_params(cfg, membership, entries)
+                if blend.applied:
+                    self._active_blend_detail[key] = blend.as_dict()
+                    self._note_regime_choice(
+                        inst, mint, symbol, f"blend:{sorted(blend.weights)}", blend.reason, conn,
+                        switched_msg=f"{symbol}: now blending {len(blend.weights)} regime(s) "
+                                     f"for new entries ({blend.reason}).",
+                    )
+                    return blend.params
+        self._active_blend_detail.pop(key, None)
+
         current_regime = snap.efficiency if snap is not None else None
         selection = paramsync.select_regime_scoped_params(
             cfg, symbol, current_regime, store=self._get_library_store()
         )
+        self._note_regime_choice(
+            inst, mint, symbol, selection.fingerprint if selection.applied else None,
+            selection.reason, conn,
+            switched_msg=f"{symbol}: switched to a regime-scoped parameter set "
+                         f"({selection.reason}) for new entries.",
+            reverted_msg=f"{symbol}: reverted to the global parameter set for new entries "
+                         f"({selection.reason}).",
+            detail={"fingerprint": selection.fingerprint, "distance": selection.distance},
+        )
+        return selection.params
 
+    def _note_regime_choice(
+        self,
+        inst: "InstanceRunner",
+        mint: str,
+        symbol: str,
+        chosen: Any,
+        reason: str,
+        conn: sqlite3.Connection,
+        *,
+        switched_msg: str,
+        reverted_msg: str | None = None,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        """Log only on an actual change of choice for this mint - shared by
+        both the blended and nearest-match paths in _regime_scoped_cfg so
+        neither one spams the feed every cycle it stays the same."""
         key = (inst.name, mint)
         previous = self._regime_selection.get(key)
-        chosen = selection.fingerprint if selection.applied else None
-        if chosen != previous:
-            self._regime_selection[key] = chosen
-            if selection.applied:
-                db.log_event(
-                    f"{symbol}: switched to a regime-scoped parameter set "
-                    f"({selection.reason}) for new entries.",
-                    category="system",
-                    instance=inst.name,
-                    mint=mint,
-                    detail={"fingerprint": selection.fingerprint, "distance": selection.distance},
-                    conn=conn,
-                )
-            elif previous is not None:
-                db.log_event(
-                    f"{symbol}: reverted to the global parameter set for new entries "
-                    f"({selection.reason}).",
-                    category="system",
-                    instance=inst.name,
-                    mint=mint,
-                    conn=conn,
-                )
-        return selection.params
+        if chosen == previous:
+            return
+        self._regime_selection[key] = chosen
+        if chosen is not None:
+            db.log_event(
+                switched_msg, category="system", instance=inst.name, mint=mint,
+                detail=detail, conn=conn,
+            )
+        elif previous is not None and reverted_msg is not None:
+            db.log_event(reverted_msg, category="system", instance=inst.name, mint=mint, conn=conn)
 
     # ------------------------------------------------------------------
     # The entry review gate
@@ -666,6 +723,17 @@ class Engine:
         reason = f"[{tier}] " + signal.summary() + f"; sized {', '.join(sizing.reasons)}"
         if decision is not None:
             reason += f"; review: {decision.rationale}"
+
+        snapshot_dict = signal.snapshot.to_dict() if signal.snapshot else {}
+        # Fuzzy-regime section, step 4's explainability requirement: the
+        # blend weights that produced this entry's effective parameters, if
+        # any applied - popped, not just read, so a decision that does not
+        # convert into a trade never leaves a stale blend attached to the
+        # next one for this mint.
+        blend = self._active_blend_detail.pop((inst.name, token.mint), None)
+        if blend is not None:
+            snapshot_dict["regime_blend"] = blend
+
         inst.portfolio.open_position(
             mint=token.mint,
             symbol=token.symbol,
@@ -674,7 +742,7 @@ class Engine:
             target=target,
             rr=signal.rr,
             entry_reason=reason,
-            snapshot=signal.snapshot.to_dict() if signal.snapshot else {},
+            snapshot=snapshot_dict,
             review=decision.as_dict() if decision is not None else None,
             conn=conn,
         )

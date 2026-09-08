@@ -117,6 +117,13 @@ DEFAULTS: dict[str, Any] = {
     # arbitrary-feeling number on some other scale.
     "regime_scoped_promotion_enabled": True,
     "regime_scoped_max_distance": 0.15,
+    # Fuzzy-regime section, step 4: blend every regime this coin has a
+    # promoted set for, weighted by its current fuzzy membership, instead of
+    # hard-switching to the single nearest continuous-regime match above.
+    # Off by default - it depends on regime discovery and per-regime
+    # walk-forward having actually run for a coin, which
+    # regime_scoped_promotion_enabled's simpler nearest-match does not.
+    "fuzzy_regime_blend_enabled": False,
 
     # --- multi-timeframe confluence (spec 4.2) ----------------------------
     # Aggregate timeframes as multiples of the base candle. At the 10-minute
@@ -438,6 +445,7 @@ BOOLS = {
     "congestion_check_enabled",
     "mev_protection_enabled",
     "regime_scoped_promotion_enabled",
+    "fuzzy_regime_blend_enabled",
     "rugcheck_enabled",
     "rugcheck_require_mint_revoked",
     "rugcheck_require_freeze_revoked",
