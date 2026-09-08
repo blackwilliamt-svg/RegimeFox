@@ -41,6 +41,18 @@ import numpy as np
 from .arrays import Backend, Throttle, chunks, get_backend
 from .frames import Frames
 from .indicators import IndicatorCache, build_cache
+from .params import (
+    IND_ADX,
+    IND_BBANDS,
+    IND_EMA_CROSS,
+    IND_MACD,
+    IND_MOMENTUM,
+    IND_RSI,
+    IND_STOCHASTIC,
+    IND_VOLUME_SPIKE,
+    IND_VWAP,
+    LEGACY_INDICATOR_MASK,
+)
 from .schema import CostModel
 
 log = logging.getLogger(__name__)
@@ -67,10 +79,16 @@ EXIT_NAMES = {
 MAX_HORIZON_BARS = 2048
 
 # Indicator periods that define a signature group. Two combinations agreeing on
-# all of these read the identical series and can share one pass.
+# all of these read the identical series and can share one pass. Extended for
+# the indicator-combination search (gap-closure item 3) with every new
+# indicator's own period(s) - indicator_mask/indicator_min_agree/bb_std are
+# per-combo scalars applied by broadcasting, same as volume_spike_multiple
+# already is, so they do not need to be part of the signature.
 SIGNATURE_KEYS = (
     "ema_fast", "ema_slow", "rsi_period", "atr_period",
     "volume_spike_lookback", "momentum_candles", "regime_lookback",
+    "macd_fast", "macd_slow", "macd_signal",
+    "bb_period", "stoch_k_period", "stoch_d_period", "adx_period", "vwap_period",
 )
 
 
@@ -347,6 +365,22 @@ def drawdown_scalar(p5_drawdown: float, tolerance: float, floor: float = 0.25) -
     return float(max(floor, tolerance / p5_drawdown))
 
 
+# A combo dict predating the indicator-combination search (gap-closure item
+# 3) - an older stored bundle, a hand-built test fixture - simply lacks these
+# keys. Reading them with these defaults reproduces the legacy hard-AND of
+# volume spike + momentum + RSI + EMA cross exactly, the same convention
+# solbot.config's DEFAULTS and cache_requirements() already use.
+INDICATOR_SEARCH_DEFAULTS: dict[str, Any] = {
+    "indicator_mask": LEGACY_INDICATOR_MASK,
+    "indicator_min_agree": 4,
+    "macd_fast": 12, "macd_slow": 26, "macd_signal": 9,
+    "bb_period": 20, "bb_std": 2.0, "bb_bullish_pct": 0.5,
+    "stoch_k_period": 14, "stoch_d_period": 3, "stoch_overbought": 80.0,
+    "adx_period": 14, "adx_min": 20.0,
+    "vwap_period": 20,
+}
+
+
 # --------------------------------------------------------------------------
 # Combination grouping
 # --------------------------------------------------------------------------
@@ -357,13 +391,22 @@ class SignatureGroup:
     combos: list[dict[str, Any]]
 
     def column(self, key: str, dtype: Any = np.float32) -> np.ndarray:
-        return np.asarray([c[key] for c in self.combos], dtype=dtype)
+        default = INDICATOR_SEARCH_DEFAULTS.get(key)
+        if default is None:
+            return np.asarray([c[key] for c in self.combos], dtype=dtype)
+        return np.asarray([c.get(key, default) for c in self.combos], dtype=dtype)
+
+
+def _signature_value(combo: dict[str, Any], key: str) -> int:
+    if key in combo:
+        return int(combo[key])
+    return int(INDICATOR_SEARCH_DEFAULTS[key])
 
 
 def group_by_signature(combos: Sequence[dict[str, Any]]) -> list[SignatureGroup]:
     buckets: dict[tuple, list[int]] = defaultdict(list)
     for i, combo in enumerate(combos):
-        buckets[tuple(int(combo[k]) for k in SIGNATURE_KEYS)].append(i)
+        buckets[tuple(_signature_value(combo, k) for k in SIGNATURE_KEYS)].append(i)
     return [
         SignatureGroup(sig, idx, [combos[i] for i in idx])
         for sig, idx in buckets.items()
@@ -373,10 +416,19 @@ def group_by_signature(combos: Sequence[dict[str, Any]]) -> list[SignatureGroup]
 def cache_requirements(
     combos: Sequence[dict[str, Any]], settings: PortfolioSettings
 ) -> dict[str, list[Any]]:
-    """Indicator series the whole batch needs, including the confluence pairs."""
+    """Indicator series the whole batch needs, including the confluence pairs.
+
+    A combo missing one of the indicator-combination-search keys (gap-closure
+    item 3) is read with the legacy default for it - the same convention
+    solbot.config's DEFAULTS use, so an older combo dict (a test, a stored
+    bundle from before this search space existed) still resolves to something
+    the cache can serve rather than a KeyError.
+    """
     req: dict[str, set] = {
         "ema": set(), "rsi": set(), "atr": set(), "vol_ratio": set(),
         "momentum": set(), "efficiency": set(),
+        "macd_line": set(), "macd_signal": set(),
+        "bbands": set(), "stoch_k": set(), "stoch_d": set(), "adx": set(), "vwap": set(),
     }
     mtf: set[tuple[int, int, int]] = set()
     for combo in combos:
@@ -388,6 +440,26 @@ def cache_requirements(
         req["efficiency"].add(int(combo["regime_lookback"]))
         for multiple in settings.confluence_multiples:
             mtf.add((int(multiple), int(combo["ema_fast"]), int(combo["ema_slow"])))
+
+        d = INDICATOR_SEARCH_DEFAULTS
+        mask = int(combo.get("indicator_mask", d["indicator_mask"]))
+        macd_fast = int(combo.get("macd_fast", d["macd_fast"]))
+        macd_slow = int(combo.get("macd_slow", d["macd_slow"]))
+        macd_signal = int(combo.get("macd_signal", d["macd_signal"]))
+        if mask & IND_MACD:
+            req["macd_line"].add((macd_fast, macd_slow))
+            req["macd_signal"].add((macd_fast, macd_slow, macd_signal))
+        if mask & IND_BBANDS:
+            req["bbands"].add(int(combo.get("bb_period", d["bb_period"])))
+        if mask & IND_STOCHASTIC:
+            k_period = int(combo.get("stoch_k_period", d["stoch_k_period"]))
+            req["stoch_k"].add(k_period)
+            req["stoch_d"].add((k_period, int(combo.get("stoch_d_period", d["stoch_d_period"]))))
+        if mask & IND_ADX:
+            req["adx"].add(int(combo.get("adx_period", d["adx_period"])))
+        if mask & IND_VWAP:
+            req["vwap"].add(int(combo.get("vwap_period", d["vwap_period"])))
+
     out: dict[str, list[Any]] = {k: sorted(v) for k, v in req.items()}
     out["mtf"] = sorted(mtf)
     return out
@@ -479,9 +551,11 @@ class VectorEngine:
         group: SignatureGroup,
         settings: PortfolioSettings,
     ) -> dict[str, np.ndarray]:
-        ema_fast, ema_slow, rsi_period, atr_period, vol_lookback, mom_bars, er_bars = (
-            group.signature
-        )
+        (
+            ema_fast, ema_slow, rsi_period, atr_period, vol_lookback, mom_bars, er_bars,
+            macd_fast, macd_slow, macd_signal_span,
+            bb_period, stoch_k_period, stoch_d_period, adx_period, vwap_period,
+        ) = group.signature
         ef = cache.get(("ema", ema_fast))
         es = cache.get(("ema", ema_slow))
         rsi = cache.get(("rsi", rsi_period))
@@ -492,13 +566,12 @@ class VectorEngine:
         consec = cache.get(("consec_up", mom_bars))
         efficiency = cache.get(("efficiency", er_bars))
 
-        # Conditions shared by every combination in the group, computed once as
-        # a plain [symbols, bars] array.
+        # Structural conditions every entry needs regardless of which
+        # indicators are active - ATR sizes the stop, so a signal with no ATR
+        # reading cannot be traded no matter what the vote gate decides.
         base = (
             frames.tradeable
             & frames.warmup_split(settings.min_candles_required)
-            & consec
-            & (ef > es)
             & (np.nan_to_num(atr, nan=0.0) > 0)
         )
         if settings.confluence_multiples:
@@ -517,19 +590,105 @@ class VectorEngine:
         allowed = group.column("regime_allowed", np.int32)
         need_agree = group.column("confluence_required", np.int8)
 
+        # --- indicator-combination search (gap-closure item 3) ------------
+        # Fetch each new indicator's shared (group-signature-level) series
+        # only when some combo in this group actually votes on it - the cache
+        # was only ever populated for the (period) combinations that at least
+        # one combo's mask requested (see cache_requirements).
+        ind_mask = group.column("indicator_mask", np.int32)
+        min_agree = group.column("indicator_min_agree", np.int8)
+        wants = lambda bit: bool(int((ind_mask & bit).any()))  # noqa: E731
+
+        macd_line = macd_sig = None
+        if wants(IND_MACD):
+            macd_line = cache.get(("macd_line", (macd_fast, macd_slow)))
+            macd_sig = cache.get(("macd_signal", (macd_fast, macd_slow, macd_signal_span)))
+
+        bb_mid = bb_std_series = None
+        if wants(IND_BBANDS):
+            bb_mid = cache.get(("bb_mid", bb_period))
+            bb_std_series = cache.get(("bb_std", bb_period))
+
+        stoch_k = stoch_d = None
+        if wants(IND_STOCHASTIC):
+            stoch_k = cache.get(("stoch_k", stoch_k_period))
+            stoch_d = cache.get(("stoch_d", (stoch_k_period, stoch_d_period)))
+
+        adx_line = plus_di = minus_di = None
+        if wants(IND_ADX):
+            adx_line = cache.get(("adx", adx_period))
+            plus_di = cache.get(("plus_di", adx_period))
+            minus_di = cache.get(("minus_di", adx_period))
+
+        vwap = None
+        if wants(IND_VWAP):
+            vwap = cache.get(("vwap", vwap_period))
+
+        bb_std_mult = group.column("bb_std")
+        bb_bullish_pct = group.column("bb_bullish_pct")
+        stoch_overbought = group.column("stoch_overbought")
+        adx_min = group.column("adx_min")
+
         # Chunk the combination axis so the boolean block stays inside budget.
-        per_combo_bytes = max(1, frames.n_symbols * frames.n_bars * 6)
+        # More vote arrays than the legacy four now, so a more generous
+        # per-combo estimate than the old "6".
+        per_combo_bytes = max(1, frames.n_symbols * frames.n_bars * 12)
         step = max(1, min(n_combos, self.memory_budget // per_combo_bytes))
 
         parts: list[dict[str, np.ndarray]] = []
         for lo, hi in chunks(n_combos, step):
             sl = slice(lo, hi)
-            mask = (
-                base[None, :, :]
-                & (vol_ratio[None] >= spike[sl][:, None, None])
+            width = hi - lo
+
+            def active(bit: int) -> np.ndarray:
+                return ((ind_mask[sl] & bit) != 0)[:, None, None]
+
+            agree_count = np.zeros((width, frames.n_symbols, frames.n_bars), dtype=np.int8)
+            agree_count += (
+                active(IND_VOLUME_SPIKE) & (vol_ratio[None] >= spike[sl][:, None, None])
+            ).astype(np.int8)
+            agree_count += (
+                active(IND_MOMENTUM)
                 & (momentum[None] >= mom_min[sl][:, None, None])
-                & (rsi[None] <= rsi_max[sl][:, None, None])
+                & consec[None]
+            ).astype(np.int8)
+            agree_count += (active(IND_RSI) & (rsi[None] <= rsi_max[sl][:, None, None])).astype(
+                np.int8
             )
+            agree_count += (active(IND_EMA_CROSS) & (ef > es)[None]).astype(np.int8)
+            if macd_line is not None:
+                agree_count += (active(IND_MACD) & (macd_line > macd_sig)[None]).astype(np.int8)
+            if bb_mid is not None:
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    upper = bb_mid[None] + bb_std_mult[sl][:, None, None] * bb_std_series[None]
+                    lower = bb_mid[None] - bb_std_mult[sl][:, None, None] * bb_std_series[None]
+                    span = upper - lower
+                    percent_b = np.where(span == 0.0, np.nan, (frames.close[None] - lower) / span)
+                bb_vote = percent_b > bb_bullish_pct[sl][:, None, None]
+                agree_count += (active(IND_BBANDS) & np.nan_to_num(bb_vote, nan=False)).astype(
+                    np.int8
+                )
+            if stoch_k is not None:
+                stoch_vote = (stoch_k > stoch_d)[None] & (
+                    stoch_k[None] < stoch_overbought[sl][:, None, None]
+                )
+                agree_count += (active(IND_STOCHASTIC) & np.nan_to_num(stoch_vote, nan=False)).astype(
+                    np.int8
+                )
+            if adx_line is not None:
+                adx_vote = (adx_line[None] >= adx_min[sl][:, None, None]) & (
+                    plus_di > minus_di
+                )[None]
+                agree_count += (active(IND_ADX) & np.nan_to_num(adx_vote, nan=False)).astype(
+                    np.int8
+                )
+            if vwap is not None:
+                vwap_vote = (frames.close[None] > vwap[None])
+                agree_count += (active(IND_VWAP) & np.nan_to_num(vwap_vote, nan=False)).astype(
+                    np.int8
+                )
+
+            mask = base[None, :, :] & (agree_count >= min_agree[sl][:, None, None])
             # 4.1 - regime gate. NaN efficiency means not enough history to
             # judge, which classifies as chop so the gate errs toward silence.
             trending = efficiency[None] >= trend_er[sl][:, None, None]
@@ -571,9 +730,7 @@ class VectorEngine:
         candidates: dict[str, np.ndarray],
     ) -> dict[str, np.ndarray]:
         """Walk every candidate trade forward one bar at a time, together."""
-        ema_fast, ema_slow, rsi_period, atr_period, vol_lookback, mom_bars, _er = (
-            group.signature
-        )
+        ema_fast, ema_slow, rsi_period, atr_period, vol_lookback, mom_bars = group.signature[:6]
         ef = cache.get(("ema", ema_fast))
         es = cache.get(("ema", ema_slow))
         atr = np.nan_to_num(cache.get(("atr", atr_period)), nan=0.0)

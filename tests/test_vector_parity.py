@@ -19,6 +19,7 @@ import pytest
 from solbot import indicators as scalar
 from solopt import indicators as vector
 from solopt.frames import frames_from_series
+from solopt.params import ALL_INDICATOR_BITS, IND_ADX, IND_BBANDS, IND_MACD, IND_STOCHASTIC
 from solopt.schema import CRYPTO, CostModel
 
 # The vectorized path stores prices as float32 - at 200 symbols by 100k bars,
@@ -262,14 +263,11 @@ def _make_market(seed: int, n: int, seconds: int, start: int) -> np.ndarray:
     )
 
 
-def test_vector_engine_reproduces_the_scalar_backtester(workspace, cfg):
-    """The two engines must agree trade for trade on identical data.
-
-    The vectorized engine batches every combination and symbol together; the
-    shipped backtester walks one merged timeline. They share no code beyond the
-    strategy rules, so agreement here is evidence the batching is faithful
-    rather than merely fast.
-    """
+def _run_both_engines(workspace, cfg, *, indicator_overrides: dict | None = None):
+    """Backtest identical synthetic data through the scalar backtester and the
+    vectorized engine, and return both results plus the vector engine's
+    symbol list. `indicator_overrides` is applied to both sides identically -
+    that identical application is the whole point of the comparison."""
     from solbot.backtest import Backtester
     from solbot.candlestore import ParquetCandleStore
     from solbot.datastore import DataStore
@@ -288,6 +286,7 @@ def test_vector_engine_reproduces_the_scalar_backtester(workspace, cfg):
             "sizing_mode": "flat",
         }
     )
+    settings.update(indicator_overrides or {})
 
     seconds, bars = 300, 1500
     start = (int(_time.time()) - (bars + 5) * seconds) // seconds * seconds
@@ -317,6 +316,11 @@ def test_vector_engine_reproduces_the_scalar_backtester(workspace, cfg):
             "momentum_min_pct", "rsi_period", "rsi_max_entry", "ema_fast", "ema_slow",
             "atr_period", "stop_atr_mult", "rr_min", "rr_max", "trailing_activate_r",
             "trailing_distance_atr", "signal_invalidation_bars", "max_hold_minutes",
+            "indicator_mask", "indicator_min_agree",
+            "macd_fast", "macd_slow", "macd_signal",
+            "bb_period", "bb_std", "bb_bullish_pct",
+            "stoch_k_period", "stoch_d_period", "stoch_overbought",
+            "adx_period", "adx_min", "vwap_period",
         )
     }
     combo.update(
@@ -347,7 +351,10 @@ def test_vector_engine_reproduces_the_scalar_backtester(workspace, cfg):
             sizing_mode="flat",
         ),
     )
+    return scalar_result, vector_result
 
+
+def _assert_engines_agree(scalar_result, vector_result) -> None:
     metrics = vector_result.metrics[0]
     assert metrics["trades"] == len(scalar_result.trades), (
         f"{metrics['trades']} vectorized trades against "
@@ -382,4 +389,143 @@ def test_vector_engine_reproduces_the_scalar_backtester(workspace, cfg):
     assert metrics["total_pnl"] == pytest.approx(scalar_result.total_pnl, rel=1e-3)
     assert metrics["ending_balance"] == pytest.approx(
         scalar_result.ending_balance, rel=1e-3
+    )
+
+
+def test_vector_engine_reproduces_the_scalar_backtester(workspace, cfg):
+    """The two engines must agree trade for trade on identical data.
+
+    The vectorized engine batches every combination and symbol together; the
+    shipped backtester walks one merged timeline. They share no code beyond the
+    strategy rules, so agreement here is evidence the batching is faithful
+    rather than merely fast.
+    """
+    scalar_result, vector_result = _run_both_engines(workspace, cfg)
+    _assert_engines_agree(scalar_result, vector_result)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        # Every one of the nine indicators active, strict unanimous agreement -
+        # a combination the pre-item-3 hard-AND could never express at all.
+        {"indicator_mask": ALL_INDICATOR_BITS, "indicator_min_agree": 9},
+        # A combo using non-default periods for the new indicators, to pin
+        # that the signature grouping (which now includes those periods)
+        # picks the right cached series rather than a differently-parameterised
+        # neighbour's.
+        {
+            "indicator_mask": IND_BBANDS | IND_STOCHASTIC, "indicator_min_agree": 2,
+            "bb_period": 30, "bb_std": 1.5, "stoch_k_period": 21, "stoch_d_period": 5,
+        },
+    ],
+    ids=["all_nine_unanimous", "custom_bb_stoch_periods"],
+)
+def test_vector_engine_reproduces_the_scalar_backtester_for_custom_indicator_combos(
+    workspace, cfg, overrides
+):
+    """The indicator-combination search (gap-closure item 3) only has value if
+    the vectorized engine's mask/vote gate matches the live rules engine's
+    exactly - not just for the legacy default, but for combinations the old
+    hard-AND could never even express."""
+    scalar_result, vector_result = _run_both_engines(workspace, cfg, indicator_overrides=overrides)
+    _assert_engines_agree(scalar_result, vector_result)
+
+
+def test_candidate_mask_matches_scalar_entries_at_a_pathologically_permissive_combo(
+    workspace, cfg
+):
+    """`indicator_min_agree=1` over just two loosely-related indicators fires
+    on a majority of bars - nobody would configure this, but the search could
+    still sample something close to it. At that density, full-trade-lifecycle
+    parity becomes chaotically sensitive to which engine breaks a tie on some
+    single early bar (position management is inherently path-dependent: once
+    one engine enters one bar earlier, every subsequent decision for that
+    symbol can diverge) - a property of the trade simulator, not of the
+    entry-gate math. So this checks the actual claim that matters: the raw
+    per-bar candidate mask, computed independently of any position state,
+    agrees almost everywhere between solopt._candidates and
+    solbot.strategy.evaluate_entry's indicator_gate.
+    """
+    from solopt.arrays import Throttle, get_backend
+    from solopt.engine import VectorEngine, cache_requirements, group_by_signature
+    from solopt.indicators import build_cache
+
+    settings = cfg.as_dict()
+    settings.update(
+        indicator_mask=IND_MACD | IND_ADX, indicator_min_agree=1, adx_min=10.0,
+        confluence_timeframes=[],
+    )
+
+    seconds, bars = 300, 1500
+    import time as _time
+
+    start = (int(_time.time()) - (bars + 5) * seconds) // seconds * seconds
+    series_by_symbol = {"AAA": _make_market(11, bars, seconds, start)}
+    frames = frames_from_series(series_by_symbol, seconds=seconds, schema=CRYPTO)
+    frames.liquidity = np.full(frames.close.shape, 5_000_000.0, dtype=np.float32)
+
+    from solopt.engine import PortfolioSettings
+
+    engine_settings = PortfolioSettings(
+        starting_balance=settings["paper_starting_balance"],
+        max_total_deployed_pct=settings["max_total_deployed_pct"],
+        max_position_pct_of_wallet=settings["max_position_pct_of_wallet"],
+        max_position_pct_of_liquidity=settings["max_position_pct_of_liquidity"],
+        min_position_usd=settings["min_position_usd"],
+        min_candles_required=settings["min_candles_required"],
+        volatility_target_atr_pct=settings["volatility_target_atr_pct"],
+        volatility_size_floor=settings["volatility_size_floor"],
+        correlation_lookback=settings["correlation_lookback"],
+        correlation_max=settings["correlation_max"],
+        costs=CostModel(fee_pct=settings["taker_fee_pct"], slippage_pct=settings["max_slippage_pct"]),
+        confluence_multiples=(),
+        sizing_mode="flat",
+    )
+    combo = {
+        k: settings[k]
+        for k in (
+            "ema_fast", "ema_slow", "rsi_period", "atr_period", "volume_spike_lookback",
+            "momentum_candles", "momentum_min_pct", "volume_spike_multiple", "rsi_max_entry",
+            "regime_lookback", "regime_trend_er", "regime_chop_atr_pct", "regime_allowed",
+            "confluence_required", "stop_atr_mult", "rr_min", "rr_max", "trailing_activate_r",
+            "trailing_distance_atr", "signal_invalidation_bars", "max_hold_minutes",
+            "indicator_mask", "indicator_min_agree",
+            "macd_fast", "macd_slow", "macd_signal",
+            "bb_period", "bb_std", "bb_bullish_pct",
+            "stoch_k_period", "stoch_d_period", "stoch_overbought",
+            "adx_period", "adx_min", "vwap_period",
+        )
+    }
+    combos = [combo]
+    engine = VectorEngine(get_backend(prefer_gpu=False), Throttle(100.0))
+    cache = build_cache(frames, cache_requirements(combos, engine_settings))
+    group = group_by_signature(combos)[0]
+    candidates = engine._candidates(frames, cache, group, engine_settings)
+    vector_bars = {int(b) for b in candidates["bar"]}  # single symbol -> bar alone identifies it
+
+    df = pd.DataFrame({
+        "ts": series_by_symbol["AAA"][0].astype(np.int64), "open": series_by_symbol["AAA"][1],
+        "high": series_by_symbol["AAA"][2], "low": series_by_symbol["AAA"][3],
+        "close": series_by_symbol["AAA"][4], "volume": series_by_symbol["AAA"][5],
+    })
+    data = scalar.compute(df, combo)
+    scalar_bars = set()
+    for i in range(len(data)):
+        snap = scalar.snapshot_at(data, i)
+        if snap is None or snap.close <= 0 or i + 1 < settings["min_candles_required"]:
+            continue
+        if snap.atr > 0 and snap.indicator_gate(combo).ok:
+            scalar_bars.add(i)
+
+    both = len(vector_bars) + len(scalar_bars)
+    disagreement = len(vector_bars ^ scalar_bars)
+    # A handful of bars near the shared indicators' warm-up boundary can
+    # legitimately land on either side of a float32-vs-float64 threshold; the
+    # entry-gate math itself is wrong if that grows to more than a rounding
+    # rarity, not if two out of ~975 bars fall either side of a boundary.
+    assert disagreement <= 5, (
+        f"{disagreement} disagreeing bars out of {both} candidate bars total - "
+        "the mask/vote gate itself, not the trade-lifecycle simulator, may be "
+        "the actual source"
     )

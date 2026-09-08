@@ -609,4 +609,46 @@ def build_cache(frames: Frames, requirements: dict[str, Iterable[Any]]) -> Indic
         multiple, fast, slow = spec
         cache.series[("mtf", spec)] = aggregate_trend(close, multiple, fast, slow)
 
+    # --- indicator-combination search (gap-closure item 3) ----------------
+    macd_pairs = _distinct(tuple(int(x) for x in v) for v in requirements.get("macd_line", ()))
+    if macd_pairs:
+        add("macd_line", macd_pairs, macd_line_stack(close, macd_pairs))
+    for fast, slow, signal in _distinct(
+        tuple(int(x) for x in v) for v in requirements.get("macd_signal", ())
+    ):
+        line = cache.series.get(("macd_line", (fast, slow)))
+        if line is None:
+            line = macd_line_stack(close, [(fast, slow)])[0]
+        cache.series[("macd_signal", (fast, slow, signal))] = macd_signal_stack(
+            line, [signal]
+        )[0]
+
+    bb_periods = _distinct(int(v) for v in requirements.get("bbands", ()))
+    if bb_periods:
+        mean, std = bollinger_stack(close, bb_periods)
+        add("bb_mid", bb_periods, mean)
+        add("bb_std", bb_periods, std)
+
+    stoch_k_periods = _distinct(int(v) for v in requirements.get("stoch_k", ()))
+    if stoch_k_periods:
+        add("stoch_k", stoch_k_periods, stochastic_k_stack(high, low, close, stoch_k_periods))
+    for k_period, d_period in _distinct(
+        tuple(int(x) for x in v) for v in requirements.get("stoch_d", ())
+    ):
+        k = cache.series.get(("stoch_k", k_period))
+        if k is None:
+            k = stochastic_k_stack(high, low, close, [k_period])[0]
+        cache.series[("stoch_d", (k_period, d_period))] = stochastic_d_stack(k, [d_period])[0]
+
+    adx_periods = _distinct(int(v) for v in requirements.get("adx", ()))
+    if adx_periods:
+        adx_v, plus_v, minus_v = adx_stack(high, low, close, adx_periods)
+        add("adx", adx_periods, adx_v)
+        add("plus_di", adx_periods, plus_v)
+        add("minus_di", adx_periods, minus_v)
+
+    vwap_periods = _distinct(int(v) for v in requirements.get("vwap", ()))
+    if vwap_periods:
+        add("vwap", vwap_periods, vwap_stack(high, low, close, volume, vwap_periods))
+
     return cache

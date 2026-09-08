@@ -282,6 +282,38 @@ its next cycle via an mtime check. No SSH, no restart.
 | `shadow_min_days` | 15 | Clean days in shadow before auto-promotion is even considered |
 | `entry_gate_min_strength` | 0.0 | Raise to demand a stronger rubric score before an entry is approved |
 | `max_total_deployed_pct` | 0.90 | Total wallet exposure cap; there is no cap on *how many* positions make it up |
+| `indicator_mask` | 15 | Bitmask of which of the nine combinable indicators vote on entry — see below |
+| `indicator_min_agree` | 4 | How many of the *active* indicators must agree before an entry fires |
+
+---
+
+## Indicator-combination search
+
+Entry used to be a hard AND of four fixed checks: volume spike, momentum,
+RSI, EMA cross. The walk-forward optimizer now searches over *which*
+combination of nine indicators drives an entry, not just their periods and
+thresholds — the same four plus MACD, Bollinger Bands, Stochastic, ADX, and a
+rolling VWAP. `indicator_mask` is a bitmask (`solbot/indicators.py`'s
+`INDICATOR_BITS`: `1` volume spike, `2` momentum, `4` RSI, `8` EMA cross, `16`
+MACD, `32` Bollinger, `64` Stochastic, `128` ADX, `256` VWAP) selecting which
+indicators are *active*; `indicator_min_agree` is how many of those active
+indicators must read bullish before an entry fires — the exact AND/vote
+mechanism `confluence_required` already uses for higher-timeframe agreement,
+reused rather than reinvented.
+
+The default (`indicator_mask = 15`, `indicator_min_agree = 4`) is the first
+four bits with all four required — precisely the original hard-AND, so an
+install that has never touched these two settings trades identically to
+before this search space existed. ATR stays structural (it sizes the stop),
+never a vote.
+
+Each new indicator has its own tunable parameters (`macd_fast`/`macd_slow`/
+`macd_signal`, `bb_period`/`bb_std`/`bb_bullish_pct`,
+`stoch_k_period`/`stoch_d_period`/`stoch_overbought`, `adx_period`/`adx_min`,
+`vwap_period`), editable from the settings page's *Indicator-combination
+search* group alongside the mask and agreement count. The walk-forward
+optimizer searches this whole space — see
+[docs/OPTIMIZER.md](docs/OPTIMIZER.md).
 
 ---
 

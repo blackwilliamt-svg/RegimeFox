@@ -23,6 +23,28 @@ import numpy as np
 
 log = logging.getLogger(__name__)
 
+# Nine indicators the search can independently include/exclude from an
+# entry's vote (gap-closure item 3). Mirrors solbot.indicators.INDICATOR_BITS
+# exactly - duplicated rather than imported because solopt imports no solbot
+# (see the layout note in README.md); tests/test_vector_parity.py's
+# test_indicator_bits_mirror_solbot catches the two ever drifting apart.
+IND_VOLUME_SPIKE = 1 << 0
+IND_MOMENTUM = 1 << 1
+IND_RSI = 1 << 2
+IND_EMA_CROSS = 1 << 3
+IND_MACD = 1 << 4
+IND_BBANDS = 1 << 5
+IND_STOCHASTIC = 1 << 6
+IND_ADX = 1 << 7
+IND_VWAP = 1 << 8
+ALL_INDICATOR_BITS = 0x1FF
+LEGACY_INDICATOR_MASK = IND_VOLUME_SPIKE | IND_MOMENTUM | IND_RSI | IND_EMA_CROSS
+
+
+def popcount(mask: int) -> int:
+    return bin(int(mask) & 0xFFFFFFFF).count("1")
+
+
 # Everything the optimizer is allowed to tune. Anything not listed here is a
 # risk control or a venue constraint, and is deliberately not up for search.
 TUNABLE: dict[str, tuple[type, float, float]] = {
@@ -47,6 +69,19 @@ TUNABLE: dict[str, tuple[type, float, float]] = {
     "regime_chop_atr_pct": (float, 0.001, 0.50),
     "regime_allowed": (int, 1, 7),          # bitmask: 1 trending | 2 ranging | 4 choppy
     "confluence_required": (int, 0, 4),
+    # --- indicator-combination search (gap-closure item 3) ----------------
+    "indicator_mask": (int, 0, ALL_INDICATOR_BITS),
+    "indicator_min_agree": (int, 0, 9),
+    "macd_fast": (int, 2, 100),
+    "macd_slow": (int, 3, 200),
+    "macd_signal": (int, 1, 100),
+    "bb_period": (int, 2, 200),
+    "bb_std": (float, 0.5, 5.0),
+    "stoch_k_period": (int, 2, 200),
+    "stoch_d_period": (int, 1, 50),
+    "adx_period": (int, 2, 100),
+    "adx_min": (float, 0.0, 80.0),
+    "vwap_period": (int, 2, 500),
 }
 
 # Sensible starting grid. Coarse on purpose: a fine grid over sixteen axes is a
@@ -74,6 +109,29 @@ DEFAULT_GRID: dict[str, list[Any]] = {
     "regime_chop_atr_pct": [0.03],
     "regime_allowed": [1, 3],
     "confluence_required": [1, 2],
+    # A curated set of masks rather than a uniform sample of the 512 possible
+    # ones: the legacy four, the legacy four plus one new indicator at a time,
+    # a combo of only new indicators, and every indicator active. Between
+    # those and indicator_min_agree, is_valid() (below) prunes any pairing
+    # that could never fire (min_agree above the mask's own popcount).
+    "indicator_mask": [
+        LEGACY_INDICATOR_MASK,
+        LEGACY_INDICATOR_MASK | IND_MACD,
+        LEGACY_INDICATOR_MASK | IND_ADX | IND_VWAP,
+        IND_MACD | IND_BBANDS | IND_STOCHASTIC,
+        ALL_INDICATOR_BITS,
+    ],
+    "indicator_min_agree": [1, 2, 3, 4],
+    "macd_fast": [8, 12],
+    "macd_slow": [21, 26],
+    "macd_signal": [9],
+    "bb_period": [14, 20],
+    "bb_std": [1.5, 2.0, 2.5],
+    "stoch_k_period": [9, 14],
+    "stoch_d_period": [3],
+    "adx_period": [14],
+    "adx_min": [15.0, 20.0, 25.0],
+    "vwap_period": [20],
 }
 
 
@@ -94,6 +152,12 @@ def is_valid(combo: dict[str, Any]) -> bool:
         return False
     if combo["momentum_candles"] > combo["volume_spike_lookback"]:
         return False
+    if "macd_fast" in combo and "macd_slow" in combo:
+        if combo["macd_fast"] >= combo["macd_slow"]:
+            return False
+    if "indicator_mask" in combo and "indicator_min_agree" in combo:
+        if combo["indicator_min_agree"] > popcount(combo["indicator_mask"]):
+            return False
     return True
 
 
