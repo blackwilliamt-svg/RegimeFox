@@ -88,7 +88,8 @@
       return;
     }
 
-    var padL = 8, padR = 62, padT = 10, padB = 22;
+    var regimeBand = (opts.regime && opts.regime.length) ? 8 : 0;
+    var padL = 8, padR = 62, padT = 10 + regimeBand, padB = 22;
     var volH = Math.round(height * 0.18);
     var plotH = height - padT - padB - volH;
     var plotW = s.width - padL - padR;
@@ -207,6 +208,25 @@
     var every = Math.max(1, Math.floor(data.length / 6));
     for (var i = 0; i < data.length; i += every) {
       ctx.fillText(fmtTime(data[i].time), x(i), height - padB + 6);
+    }
+
+    /* fuzzy-regime overlay (fuzzy-regime section, step 6): a thin strip along
+     * the top, one segment per bar, colored by that bar's dominant regime
+     * cluster - a quick "where has this coin's character been" read at a
+     * glance, with the exact membership breakdown left to the readout text
+     * beside the chart rather than crowding it onto the strip itself. */
+    if (regimeBand) {
+      var byTs = {};
+      opts.regime.forEach(function (r) { byTs[r.ts] = r; });
+      var clusterColors = [t.accent, t.green, t.amber, t.purple, t.red, t.muted];
+      var stripY = padT - regimeBand;
+      var sw = Math.max(1, plotW / data.length);
+      data.forEach(function (c, i) {
+        var r = byTs[c.time];
+        if (!r) return;
+        ctx.fillStyle = clusterColors[r.dominant % clusterColors.length];
+        ctx.fillRect(x(i) - sw / 2, stripY, sw, regimeBand - 1);
+      });
     }
   }
 

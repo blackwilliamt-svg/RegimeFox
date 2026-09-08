@@ -5,10 +5,12 @@ import numpy as np
 import pytest
 
 from solbot.indicators import Snapshot
-from solbot.regime_classify import classify_current_regime, feature_vector_from_snapshot
+from solbot.regime_classify import classify_current_regime, classify_series, feature_vector_from_snapshot
 from solopt.fuzzy import Standardizer, discover_best_k
 from solopt.regime_discovery import CoinRegimeModel
 from solopt.store import RunStore
+
+from test_strategy import make_candles
 
 
 def _fake_model(symbol: str) -> CoinRegimeModel:
@@ -140,3 +142,72 @@ def test_dominant_cluster_picks_the_highest_membership():
         feature_vector=(1.0, 2.0, 3.0),
     )
     assert membership.dominant_cluster() == 1
+
+
+# --------------------------------------------------------------------------
+# per-bar classification for the chart overlay (fuzzy-regime section, step 6)
+# --------------------------------------------------------------------------
+def _candles_with_varied_volume(n: int = 200, seed: int = 7) -> pd.DataFrame:
+    """make_candles' volume is a constant, which starves volume_zscore's
+    rolling standard deviation (real markets always have some volume
+    variance); this gives it some."""
+    import numpy as np
+
+    df = make_candles(n, seed=seed)
+    rng = np.random.default_rng(seed + 1)
+    df["volume"] = np.maximum(100.0, rng.lognormal(np.log(1000.0), 0.5, n))
+    return df
+
+
+def _settings_cfg() -> dict:
+    return {
+        "ema_fast": 9, "ema_slow": 21, "rsi_period": 14, "atr_period": 14,
+        "volume_spike_lookback": 20, "momentum_candles": 3,
+        "regime_lookback": 20, "regime_trend_er": 0.35, "regime_chop_atr_pct": 0.03,
+        "confluence_timeframes": [],
+        "macd_fast": 12, "macd_slow": 26, "macd_signal": 9,
+        "bb_period": 20, "bb_std": 2.0, "bb_bullish_pct": 0.5,
+        "stoch_k_period": 14, "stoch_d_period": 3, "stoch_overbought": 80.0,
+        "adx_period": 14, "adx_min": 20.0, "vwap_period": 20,
+        "regime_vol_zscore_period": 20,
+    }
+
+
+def test_classify_series_returns_one_entry_per_valid_bar():
+    df = _candles_with_varied_volume(200)
+    model = _fake_model("AAA")
+
+    out = classify_series(df, model.as_dict(), _settings_cfg())
+
+    assert out
+    assert len(out) <= len(df)   # warm-up bars are skipped, not padded
+    assert all("ts" in row and "dominant" in row and "percentages" in row for row in out)
+
+
+def test_classify_series_percentages_sum_to_one():
+    df = _candles_with_varied_volume(200)
+    model = _fake_model("AAA")
+
+    out = classify_series(df, model.as_dict(), _settings_cfg())
+    for row in out:
+        assert sum(row["percentages"].values()) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_classify_series_is_empty_for_an_empty_dataframe():
+    import pandas as pd
+
+    model = _fake_model("AAA")
+    assert classify_series(pd.DataFrame(), model.as_dict(), _settings_cfg()) == []
+
+
+def test_classify_series_is_empty_for_a_malformed_model():
+    df = _candles_with_varied_volume(200)
+    assert classify_series(df, {"centroids": "not-a-scaler"}, _settings_cfg()) == []
+
+
+def test_classify_series_dominant_matches_argmax_of_percentages():
+    df = _candles_with_varied_volume(200)
+    model = _fake_model("AAA")
+    out = classify_series(df, model.as_dict(), _settings_cfg())
+    for row in out:
+        assert row["dominant"] == max(row["percentages"], key=row["percentages"].get)

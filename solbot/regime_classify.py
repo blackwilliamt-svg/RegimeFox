@@ -16,7 +16,9 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
-from .indicators import Snapshot
+import pandas as pd
+
+from .indicators import Snapshot, compute
 
 log = logging.getLogger(__name__)
 
@@ -99,3 +101,51 @@ def classify_current_regime(
         n_clusters=len(centroids),
         feature_vector=features,
     )
+
+
+def classify_series(
+    df: pd.DataFrame, model_dict: dict[str, Any], cfg: dict[str, Any], *, precomputed: bool = False
+) -> list[dict[str, Any]]:
+    """Fuzzy membership at every bar of `df`, not just the last one - the
+    fuzzy-regime section's step 6: overlaying a coin's regime history on its
+    price chart needs a reading per historical bar, not only the live one
+    classify_current_regime answers.
+
+    Returns one entry per bar with a valid feature vector - `{"ts", "dominant",
+    "percentages"}` - skipping bars still inside indicator warm-up (rather
+    than a None placeholder, which would just push the "no data yet" handling
+    onto every caller).
+    """
+    if df.empty:
+        return []
+
+    from solopt.fuzzy import Standardizer, membership_stack
+
+    try:
+        scaler = Standardizer.from_dict(model_dict["scaler"])
+        centroids_list = model_dict["centroids"]
+    except (KeyError, TypeError):
+        log.warning("regime model is malformed, cannot classify a series")
+        return []
+
+    data = df if precomputed else compute(df, cfg)
+    if data.empty:
+        return []
+
+    features = data[["adx", "atr_pct", "volume_zscore"]].to_numpy(dtype=float)
+    valid = ~pd.isna(features).any(axis=1)
+    if not valid.any():
+        return []
+
+    scaled = scaler.transform(features[valid])
+    import numpy as np
+
+    membership = membership_stack(scaled, np.asarray(centroids_list, dtype=np.float64))
+
+    ts_valid = data["ts"].to_numpy()[valid]
+    out: list[dict[str, Any]] = []
+    for i in range(membership.shape[0]):
+        percentages = {j: float(v) for j, v in enumerate(membership[i])}
+        dominant = max(percentages, key=percentages.get)
+        out.append({"ts": int(ts_valid[i]), "dominant": dominant, "percentages": percentages})
+    return out

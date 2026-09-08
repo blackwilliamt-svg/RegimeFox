@@ -6,6 +6,7 @@ state (control actions go through the form routes, which enqueue commands).
 from __future__ import annotations
 
 import json
+import logging
 import time
 from typing import Any
 
@@ -16,6 +17,7 @@ from ..clients import JupiterClient, RugCheckClient
 from ..ratelimit import TokenBucket
 from ..recovery import reconcile_halted
 
+log = logging.getLogger(__name__)
 bp = Blueprint("api", __name__)
 
 
@@ -159,7 +161,59 @@ def candles(mint: str):
         (mint,),
     ).fetchall()
 
-    return jsonify({"mint": mint, "candles": series, "positions": _rows(markers)})
+    payload = {"mint": mint, "candles": series, "positions": _rows(markers)}
+    if request.args.get("regime"):
+        payload["regime"] = _regime_overlay(mint, df, config.as_dict())
+    return jsonify(payload)
+
+
+def _regime_overlay(mint: str, df: Any, cfg_dict: dict[str, Any]) -> dict[str, Any] | None:
+    """Fuzzy-regime section, step 6: this coin's regime history over the
+    same candles just returned, plus its current live membership - opt-in
+    (``?regime=1``) since it costs a full indicator pass over the window,
+    not worth paying on every 5s poll of every open position's chart.
+    Returns None (not an error payload) when the coin has no discovered
+    model yet, same "ordinary, not exceptional" posture as everywhere else
+    fuzzy-regime lookups can come up empty.
+    """
+    try:
+        from ..wfmc import DAILY_STORE_PATH
+        from solopt.store import RunStore
+
+        store = RunStore(DAILY_STORE_PATH)
+        stored = store.get_regime_model(mint)
+    except Exception:
+        log.debug("regime model lookup failed for %s", mint, exc_info=True)
+        return None
+    if stored is None or df.empty:
+        return None
+
+    from ..indicators import compute, snapshot_at
+    from ..regime_classify import classify_series, feature_vector_from_snapshot
+    from solopt.fuzzy import Standardizer, membership_for
+    import numpy as np
+
+    data = compute(df, cfg_dict)
+    history = classify_series(data, stored["model"], cfg_dict, precomputed=True)
+
+    current = None
+    snap = snapshot_at(data, -1)
+    if snap is not None:
+        try:
+            scaler = Standardizer.from_dict(stored["model"]["scaler"])
+            features = feature_vector_from_snapshot(snap)
+            if all(f == f for f in features):  # no NaN
+                scaled = scaler.transform(np.asarray([features]))[0]
+                u = membership_for(scaled, np.asarray(stored["model"]["centroids"], dtype=np.float64))
+                current = {i: round(float(v), 4) for i, v in enumerate(u)}
+        except (KeyError, TypeError):
+            current = None
+
+    return {
+        "n_clusters": stored["model"].get("n_clusters"),
+        "history": history,
+        "current": current,
+    }
 
 
 @bp.get("/events")

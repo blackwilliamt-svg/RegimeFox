@@ -116,9 +116,13 @@
     <input type="text" id="marketSymbolInput" list="marketSymbolDatalist"
            placeholder="Search a symbol in the universe…" style="width:auto; min-width:220px">
     <datalist id="marketSymbolDatalist"></datalist>
+    <label class="hint" style="margin-left:auto; display:flex; align-items:center; gap:4px">
+      <input type="checkbox" id="marketRegimeToggle"> fuzzy regime overlay
+    </label>
   </div>
   <div class="chart-box"><canvas id="marketChart"></canvas></div>
   <p class="hint" id="marketChartHint"></p>
+  <p class="hint" id="marketRegimeReadout"></p>
 </div>
 
 <div class="position-charts" id="positionCharts" style="margin-bottom:16px"></div>

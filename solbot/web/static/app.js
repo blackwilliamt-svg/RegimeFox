@@ -221,6 +221,26 @@
     }
   }
 
+  var REGIME_NAMES = ["cluster 0", "cluster 1", "cluster 2", "cluster 3", "cluster 4", "cluster 5"];
+
+  function renderRegimeReadout(enabled, regime) {
+    var out = el("marketRegimeReadout");
+    if (!out) return;
+    if (!enabled) {
+      out.textContent = "";
+      return;
+    }
+    if (!regime || !regime.current) {
+      out.textContent = "fuzzy regime: no discovered model for this coin yet";
+      return;
+    }
+    var parts = Object.keys(regime.current)
+      .map(function (k) { return { k: Number(k), v: regime.current[k] }; })
+      .sort(function (a, b) { return b.v - a.v; })
+      .map(function (p) { return (REGIME_NAMES[p.k] || ("cluster " + p.k)) + " " + (p.v * 100).toFixed(0) + "%"; });
+    out.textContent = "fuzzy regime (live): " + parts.join(" · ");
+  }
+
   function loadMarketChart() {
     var canvas = el("marketChart");
     var hint = el("marketChartHint");
@@ -230,6 +250,7 @@
     return afterUniverse.then(function () {
       if (!marketMint) {
         if (hint) hint.textContent = "No coins in the universe yet — try Refresh universe.";
+        renderRegimeReadout(false, null);
         return;
       }
       if (hint) {
@@ -237,8 +258,16 @@
         hint.textContent = row ? (row.symbol || marketMint) + " · " + marketUniverse.length +
           " coins in the current universe" : "";
       }
-      return get("/api/candles/" + encodeURIComponent(marketMint) + "?limit=200").then(function (d) {
-        window.SolChart.candles(canvas, d.candles, { height: 300 });
+      var toggle = el("marketRegimeToggle");
+      var withRegime = toggle && toggle.checked;
+      var url = "/api/candles/" + encodeURIComponent(marketMint) + "?limit=200" +
+        (withRegime ? "&regime=1" : "");
+      return get(url).then(function (d) {
+        window.SolChart.candles(canvas, d.candles, {
+          height: 300,
+          regime: withRegime && d.regime ? d.regime.history : null
+        });
+        renderRegimeReadout(withRegime, d.regime);
       });
     });
   }
@@ -248,6 +277,12 @@
     if (!input) return;
     input.addEventListener("change", resolveMarketSymbolInput);
     input.addEventListener("blur", resolveMarketSymbolInput);
+  })();
+
+  (function wireMarketRegimeToggle() {
+    var toggle = el("marketRegimeToggle");
+    if (!toggle) return;
+    toggle.addEventListener("change", function () { loadMarketChart().catch(noop); });
   })();
 
   /* ---------- equity ---------- */
