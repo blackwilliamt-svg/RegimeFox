@@ -116,6 +116,28 @@ DEFAULTS: dict[str, Any] = {
     "confluence_required": 1,             # how many must agree before an entry
     "confluence_enabled": True,
 
+    # --- indicator-combination search (gap-closure item 3) -----------------
+    # Which of the nine combinable entry indicators are active, and how many of
+    # the active ones must agree before an entry fires - see
+    # solbot/indicators.py's INDICATOR_BITS. The legacy default (first four
+    # bits, all four required) is exactly the old hard-AND of volume spike +
+    # momentum + RSI + EMA cross, so an install that has never touched these
+    # two keys trades identically to before this search space existed.
+    "indicator_mask": 15,                 # volume_spike | momentum | rsi | ema_cross
+    "indicator_min_agree": 4,
+    "macd_fast": 12,
+    "macd_slow": 26,
+    "macd_signal": 9,
+    "bb_period": 20,
+    "bb_std": 2.0,
+    "bb_bullish_pct": 0.5,                # %B above this reads bullish
+    "stoch_k_period": 14,
+    "stoch_d_period": 3,
+    "stoch_overbought": 80.0,
+    "adx_period": 14,
+    "adx_min": 20.0,                      # below this, no trend to trade
+    "vwap_period": 20,
+
     # --- exit rules -------------------------------------------------------
     "trailing_activate_r": 1.0,           # arm the trail after +1R
     "trailing_distance_atr": 1.5,
@@ -312,6 +334,20 @@ SPEC: dict[str, Bound] = {
     "regime_chop_atr_pct": (float, 0.001, 0.50),
     "regime_allowed": (int, 1, 7),
     "confluence_required": (int, 0, 4),
+    "indicator_mask": (int, 0, 511),
+    "indicator_min_agree": (int, 0, 9),
+    "macd_fast": (int, 2, 100),
+    "macd_slow": (int, 3, 200),
+    "macd_signal": (int, 1, 100),
+    "bb_period": (int, 2, 200),
+    "bb_std": (float, 0.5, 5.0),
+    "bb_bullish_pct": (float, 0.0, 1.0),
+    "stoch_k_period": (int, 2, 200),
+    "stoch_d_period": (int, 1, 50),
+    "stoch_overbought": (float, 50.0, 100.0),
+    "adx_period": (int, 2, 100),
+    "adx_min": (float, 0.0, 80.0),
+    "vwap_period": (int, 2, 500),
     "correlation_lookback": (int, 10, 500),
     "correlation_max": (float, 0.1, 1.0),
     "volatility_size_floor": (float, 0.05, 1.0),
@@ -505,6 +541,17 @@ def validate(pending: dict[str, Any], merged: dict[str, Any]) -> dict[str, Any]:
         )
     if after["drawdown_tolerance"] <= 0:
         raise ConfigError("drawdown_tolerance must be positive")
+    if after["macd_fast"] >= after["macd_slow"]:
+        raise ConfigError("macd_fast must be shorter than macd_slow")
+    from .indicators import popcount  # noqa: PLC0415  (avoid a module-load cycle)
+
+    active = popcount(int(after["indicator_mask"]))
+    if after["indicator_min_agree"] > active:
+        raise ConfigError(
+            f"indicator_min_agree ({after['indicator_min_agree']}) exceeds the "
+            f"{active} indicator(s) selected in indicator_mask, so no entry could "
+            "ever satisfy it"
+        )
     return clean
 
 

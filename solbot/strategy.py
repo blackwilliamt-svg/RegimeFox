@@ -23,7 +23,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .indicators import Snapshot, compute, regime_allowed, snapshot_at
+from .indicators import INDICATOR_BITS, Snapshot, compute, regime_allowed, snapshot_at
 
 
 @dataclass(slots=True)
@@ -60,6 +60,53 @@ def _finite(x: Any, default: float = 0.0) -> float:
     return default if (np.isnan(f) or np.isinf(f)) else f
 
 
+def _indicator_messages(
+    snap: Snapshot, cfg: dict[str, Any], vol_ratio: float, mom: float
+) -> dict[str, tuple[str, str]]:
+    """(pass message, fail message) for each of the nine combinable
+    indicators - only ever shown for the ones `indicator_mask` has active."""
+    return {
+        "volume_spike": (
+            f"volume {vol_ratio:.1f}x its {cfg['volume_spike_lookback']}-bar average",
+            f"volume only {vol_ratio:.1f}x average "
+            f"(need {float(cfg['volume_spike_multiple']):.1f}x)",
+        ),
+        "momentum": (
+            f"momentum +{mom * 100:.2f}% over {cfg['momentum_candles']} rising candles",
+            f"momentum {mom * 100:.2f}% below "
+            f"{float(cfg['momentum_min_pct']) * 100:.2f}% or not consecutive",
+        ),
+        "rsi": (
+            f"RSI {snap.rsi:.0f}",
+            f"RSI {snap.rsi:.0f} above {float(cfg['rsi_max_entry']):.0f} (blow-off top)",
+        ),
+        "ema_cross": (
+            f"EMA{cfg['ema_fast']} above EMA{cfg['ema_slow']}",
+            f"EMA{cfg['ema_fast']} below EMA{cfg['ema_slow']}",
+        ),
+        "macd": (
+            "MACD above its signal line",
+            "MACD below its signal line",
+        ),
+        "bbands": (
+            f"price in the upper Bollinger band ({snap.bb_percent * 100:.0f}%B)",
+            f"price only {snap.bb_percent * 100:.0f}%B of the Bollinger band",
+        ),
+        "stochastic": (
+            f"stochastic %K {snap.stoch_k:.0f} above %D and not overbought",
+            f"stochastic %K {snap.stoch_k:.0f} below %D or overbought",
+        ),
+        "adx": (
+            f"ADX {snap.adx:.0f} trending up (+DI over -DI)",
+            f"ADX {snap.adx:.0f} below {float(cfg.get('adx_min', 20.0)):.0f} or -DI leading",
+        ),
+        "vwap": (
+            "price above VWAP",
+            "price below VWAP",
+        ),
+    }
+
+
 # --------------------------------------------------------------------------
 # Entry
 # --------------------------------------------------------------------------
@@ -88,36 +135,26 @@ def evaluate_entry(
     reasons: list[str] = []
     passed: list[str] = []
 
-    # --- 1. volume spike --------------------------------------------------
+    # --- 1-4/9. the indicator-combination gate (gap-closure item 3) -------
+    # Which of the nine combinable indicators are active, and how many of the
+    # active ones must read bullish, is entirely config-driven -
+    # `snap.indicator_gate`. The legacy default (volume spike + momentum + RSI
+    # + EMA cross, all four required) reproduces the original hard-AND exactly.
     vol_ratio = _finite(snap.volume_ratio)
-    vol_needed = float(cfg["volume_spike_multiple"])
-    if vol_ratio >= vol_needed:
-        passed.append(f"volume {vol_ratio:.1f}x its {cfg['volume_spike_lookback']}-bar average")
-    else:
-        reasons.append(f"volume only {vol_ratio:.1f}x average (need {vol_needed:.1f}x)")
-
-    # --- 2. momentum confirmed across candles -----------------------------
     mom = _finite(snap.momentum_pct)
-    mom_needed = float(cfg["momentum_min_pct"])
-    trend_ok = snap.ema_fast > snap.ema_slow
-    if mom >= mom_needed and snap.consecutive_up and trend_ok:
-        passed.append(
-            f"momentum +{mom * 100:.2f}% over {cfg['momentum_candles']} rising candles, "
-            f"EMA{cfg['ema_fast']} above EMA{cfg['ema_slow']}"
+    gate = snap.indicator_gate(cfg)
+    mask = int(cfg.get("indicator_mask", 0))
+    messages = _indicator_messages(snap, cfg, vol_ratio, mom)
+    for name, bit in INDICATOR_BITS.items():
+        if not (mask & bit):
+            continue
+        pass_msg, fail_msg = messages[name]
+        (passed if gate.votes[name] else reasons).append(pass_msg if gate.votes[name] else fail_msg)
+    if not gate.ok:
+        reasons.append(
+            f"only {len(gate.agreed)} of {gate.active_count} active indicators agree "
+            f"(need {gate.min_agree})"
         )
-    else:
-        if mom < mom_needed:
-            reasons.append(f"momentum {mom * 100:.2f}% below {mom_needed * 100:.2f}%")
-        if not snap.consecutive_up:
-            reasons.append(f"not {cfg['momentum_candles']} consecutive rising candles")
-        if not trend_ok:
-            reasons.append("fast EMA below slow EMA")
-
-    # --- overbought guard -------------------------------------------------
-    if snap.rsi > float(cfg["rsi_max_entry"]):
-        reasons.append(f"RSI {snap.rsi:.0f} above {cfg['rsi_max_entry']:.0f} (blow-off top)")
-    else:
-        passed.append(f"RSI {snap.rsi:.0f}")
 
     # --- 3. liquidity depth for the intended size -------------------------
     max_by_liq = liquidity_usd * float(cfg["max_position_pct_of_liquidity"])
@@ -166,7 +203,7 @@ def evaluate_entry(
     # to the 1s tier while the signal is still forming, so the entry window is
     # not missed while it is being confirmed.
     interest = bool(
-        vol_ratio >= max(1.2, vol_needed * 0.6)
+        vol_ratio >= max(1.2, float(cfg["volume_spike_multiple"]) * 0.6)
         and (mom > 0 or snap.ema_fast > snap.ema_slow)
     )
 
