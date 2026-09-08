@@ -359,6 +359,38 @@
     wrap.style.display = "";
   }
 
+  /* ---------- backfill timing estimate (backtest page) ---------- */
+  function loadBackfillEstimate() {
+    var input = el("pullMonths");
+    var out = el("pullEstimate");
+    if (!input || !out) return Promise.resolve();
+    var months = parseInt(input.value, 10) || 12;
+    return get("/api/backfill/estimate?months=" + months).then(function (d) {
+      var hours = d.hours_estimate;
+      if (hours === undefined || hours === null) { out.textContent = "—"; return; }
+      var line = "~" + hours.toFixed(1) + "h for " + (d.tokens || 0) + " coins × " +
+        d.months + " month" + (d.months === 1 ? "" : "s") +
+        " at the current binance_rps (" + d.calls.toLocaleString() + " API calls).";
+      if (!d.within_target) {
+        line += " Exceeds the " + d.target_hours + "h target — narrow the window or " +
+          "raise binance_rps in settings.";
+      }
+      out.textContent = line;
+      out.className = "hint " + (d.within_target ? "" : "warn");
+    });
+  }
+
+  (function wireBackfillEstimate() {
+    var input = el("pullMonths");
+    if (!input) return;
+    var timer = null;
+    input.addEventListener("input", function () {
+      clearTimeout(timer);
+      timer = setTimeout(function () { loadBackfillEstimate().catch(noop); }, 300);
+    });
+    loadBackfillEstimate().catch(noop);
+  })();
+
   /* ---------- walk-forward tab ---------- */
   var wfFeedSince = 0;
   var wfRunId = null;

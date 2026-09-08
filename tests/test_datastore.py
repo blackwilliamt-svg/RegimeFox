@@ -97,3 +97,47 @@ def test_bulk_backfill_respects_should_stop_between_tokens(tmp_path):
 
     assert report.stopped_early == "cancelled"
     assert report.tokens_done == 0
+
+
+# --------------------------------------------------------------------------
+# Timing estimate: a deep-history backfill (up to the 96-month/8-year bound)
+# across up to ~100 coins is meant to fit inside a 12-hour target.
+# --------------------------------------------------------------------------
+def test_estimate_pull_scales_linearly_with_tokens_and_months():
+    store = DataStore(None, {"binance_rps": 5.0})
+
+    one = store.estimate_pull(1, 1)
+    ten_tokens = store.estimate_pull(10, 1)
+    two_months = store.estimate_pull(1, 2)
+
+    assert ten_tokens["calls"] == one["calls"] * 10
+    assert two_months["calls"] == one["calls"] * 2
+
+
+def test_estimate_pull_respects_the_configured_binance_rps():
+    slow = DataStore(None, {"binance_rps": 1.0}).estimate_pull(10, 12)
+    fast = DataStore(None, {"binance_rps": 10.0}).estimate_pull(10, 12)
+
+    assert slow["calls"] == fast["calls"]                       # same request volume...
+    assert slow["seconds_estimate"] > fast["seconds_estimate"]  # ...just throttled harder
+
+
+def test_estimate_pull_flags_a_deep_backfill_that_misses_the_12_hour_target():
+    store = DataStore(None, {"binance_rps": 5.0})
+
+    # 8 years across 100 coins at the modest default throttle: a real,
+    # honestly-reported miss - not something this estimate should hide.
+    deep = store.estimate_pull(100, 96)
+    assert deep["hours_estimate"] > deep["target_hours"]
+    assert deep["within_target"] is False
+
+    # The same scope comfortably fits once binance_rps is raised - the lever
+    # an operator actually has, within its existing (0.5, 50.0) bound.
+    fast_store = DataStore(None, {"binance_rps": 12.0})
+    assert fast_store.estimate_pull(100, 96)["within_target"] is True
+
+
+def test_estimate_pull_falls_back_to_a_sane_default_rps_when_unconfigured():
+    store = DataStore(None, {})
+    estimate = store.estimate_pull(5, 3)
+    assert estimate["seconds_estimate"] > 0

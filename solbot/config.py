@@ -247,6 +247,10 @@ DEFAULTS: dict[str, Any] = {
     # Kept indefinitely - no retention window. Raw candle Parquet files are
     # small (single-digit GB compressed for the whole universe over a year),
     # unlike walk-forward/Monte Carlo output, which does need one (spec 6c/7).
+    # Default stays a modest 1 year; the bound goes up to 96 months (8 years)
+    # for the deep-history backfill target - see DataStore.estimate_pull()
+    # for whether a given (months, tokens, binance_rps) combination actually
+    # fits inside the 12-hour window that target assumes.
     "bulk_backfill_months": 12,
 
     # --- data retention ---------------------------------------------------
@@ -426,7 +430,7 @@ SPEC: dict[str, Bound] = {
     "jupiter_burst": (int, 1, 100),
     "jupiter_price_batch_size": (int, 1, 50),
     "binance_rps": (float, 0.5, 50.0),
-    "bulk_backfill_months": (int, 1, 24),
+    "bulk_backfill_months": (int, 1, 96),
     "rugcheck_rps": (float, 0.1, 50.0),
     "price_tick_retention_hours": (int, 1, 8760),
     "wfmc_result_retention_days": (int, 7, 3650),

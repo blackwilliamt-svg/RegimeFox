@@ -987,11 +987,57 @@ class Engine:
 
         def worker() -> None:
             try:
-                self.store.run_initial_pull(pairs, months=months)
+                report = self.store.run_initial_pull(pairs, months=months)
             except Exception:
                 log.exception("historical pull failed")
+                return
+            self._maybe_trigger_runpod_after_backfill(report, len(pairs))
 
         threading.Thread(target=worker, name="historical-pull", daemon=True).start()
+
+    def _maybe_trigger_runpod_after_backfill(self, report: Any, total_tokens: int) -> None:
+        """Kick off the monthly RunPod retest once the *whole* backfill has
+        landed - never per-coin, which would fire the same expensive batched
+        job (:meth:`solbot.wfmc.run_monthly` already batches every routed
+        coin into one set of RunPod workers) once per token instead of once
+        for the freshly-backfilled universe.
+
+        Opt-in via the same ``wfmc_monthly_enabled`` flag that gates the
+        scheduled monthly cadence in :meth:`_maybe_monthly_wfmc` - an
+        operator who has not turned RunPod spend on at all should not get a
+        surprise GPU bill just for clicking "pull history". A backfill that
+        stopped early or covered nothing does not have enough history behind
+        it yet to be worth a full-space search against.
+        """
+        if not self.cfg.get("wfmc_monthly_enabled", False):
+            return
+        if report.stopped_early or report.tokens_done == 0:
+            db.log_event(
+                "Backfill did not finish cleanly; skipping the RunPod trigger "
+                f"({report.tokens_done}/{total_tokens} tokens, "
+                f"{report.stopped_early or 'no candles written'}).",
+                level="warn", category="system",
+            )
+            return
+        db.log_event(
+            f"Historical backfill finished for all {report.tokens_done} tokens; "
+            "starting the monthly RunPod full-space retest.",
+            category="system",
+        )
+
+        def worker() -> None:
+            try:
+                wfmc.run_monthly(self.cfg, self.store, self.config.secrets)
+            except Exception:
+                log.exception("post-backfill RunPod trigger failed")
+                db.log_event(
+                    "Post-backfill RunPod retest failed; see the worker log.",
+                    level="alert", category="system",
+                )
+
+        threading.Thread(
+            target=worker, name="runpod-post-backfill", daemon=True
+        ).start()
 
     def _start_backtest(self, payload: dict[str, Any], conn: sqlite3.Connection) -> None:
         if self._backtest_hook is None:

@@ -194,13 +194,33 @@ class DataStore:
     # ------------------------------------------------------------------
     # Binance backfill
     # ------------------------------------------------------------------
+    # A deep-history backfill (up to bulk_backfill_months' 96-month/8-year
+    # ceiling) across up to 100 coins is meant to fit inside a working day -
+    # the number the estimate below is judged against.
+    BACKFILL_TARGET_HOURS = 12.0
+    AVG_MONTH_SECONDS = 30.44 * 86400  # calendar months vary; the estimate only needs to be close
+
     def estimate_pull(self, token_count: int, months: int) -> dict[str, Any]:
-        """Rough cost of a bulk pull before running it, for the dashboard."""
+        """Real cost of a bulk pull before running it - REST calls at the
+        one-call-per-1000-candles page size, throttled to ``binance_rps`` -
+        not a guess, so the dashboard can tell an operator *before* they
+        commit whether an 8-year/100-coin pull will land inside the 12-hour
+        target or needs a narrower request (fewer months, fewer tokens, or a
+        raised binance_rps) instead.
+        """
+        calls_per_month = max(1, -(-int(self.AVG_MONTH_SECONDS) // (MAX_KLINES_PER_CALL * BASE_SECONDS)))
+        calls = token_count * months * calls_per_month
+        rps = max(0.1, float(self.cfg.get("binance_rps", 5.0)))
+        seconds = calls / rps
+        hours = seconds / 3600.0
         return {
             "tokens": token_count,
             "months": months,
-            "archives": token_count * months,
-            "seconds_estimate": int(token_count * months * 1.5),
+            "calls": calls,
+            "seconds_estimate": int(seconds),
+            "hours_estimate": round(hours, 2),
+            "within_target": hours <= self.BACKFILL_TARGET_HOURS,
+            "target_hours": self.BACKFILL_TARGET_HOURS,
         }
 
     def bulk_backfill(

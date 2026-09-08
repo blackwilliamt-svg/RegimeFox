@@ -285,6 +285,23 @@ def universe():
     return jsonify(out)
 
 
+@bp.get("/backfill/estimate")
+def backfill_estimate():
+    """Real cost of a bulk historical pull, before the operator commits to
+    one - see DataStore.estimate_pull() for why this replaced a rough guess.
+    """
+    from ..datastore import DataStore
+
+    config = cfg()
+    conn = db.connect()
+    months = request.args.get("months", type=int) or int(config["bulk_backfill_months"])
+    months = max(1, min(months, 96))
+    token_count = conn.execute("SELECT COUNT(*) AS n FROM universe").fetchone()["n"]
+
+    store = DataStore(None, config.as_dict())
+    return jsonify(store.estimate_pull(token_count, months))
+
+
 @bp.get("/progress")
 def progress():
     from ..candlestore import ParquetCandleStore
