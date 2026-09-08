@@ -728,7 +728,36 @@
       if (canvas && Object.keys(series).length) {
         window.SolChart.lines(canvas, series, { height: 180 });
       }
+
+      renderDriftCompare(latest, names);
     });
+  }
+
+  function renderDriftCompare(latest, names) {
+    var body = el("driftCompareRows");
+    if (!body) return;
+    var usable = names.filter(function (n) {
+      var det = latest[n].detail || {};
+      return (det.live_trades || 0) > 0 && det.expected && det.expected.trades > 0;
+    });
+    if (!usable.length) {
+      body.innerHTML = "<tr><td colspan='7' class='empty'>No comparable data yet</td></tr>";
+      return;
+    }
+    body.innerHTML = usable.map(function (n) {
+      var det = latest[n].detail || {};
+      var exp = det.expected || {};
+      var wrGap = cls((det.live_win_rate || 0) - (exp.win_rate || 0));
+      var expGap = cls((det.live_expectancy || 0) - (exp.expectancy || 0));
+      var pfGap = cls((det.live_profit_factor || 0) - (exp.profit_factor || 0));
+      return "<tr><td>" + esc(n) + "</td>" +
+        "<td class='num " + wrGap + "'>" + pctText(det.live_win_rate, 1) + "</td>" +
+        "<td class='num dim'>" + pctText(exp.win_rate, 1) + "</td>" +
+        "<td class='num " + expGap + "'>$" + (det.live_expectancy || 0).toFixed(2) + "</td>" +
+        "<td class='num dim'>$" + (exp.expectancy || 0).toFixed(2) + "</td>" +
+        "<td class='num " + pfGap + "'>" + (det.live_profit_factor || 0).toFixed(2) + "</td>" +
+        "<td class='num dim'>" + (exp.profit_factor || 0).toFixed(2) + "</td></tr>";
+    }).join("");
   }
 
   function loadParamSync() {
