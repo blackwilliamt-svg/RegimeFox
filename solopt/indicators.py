@@ -211,6 +211,236 @@ def consecutive_up_stack(close: np.ndarray, bars: Sequence[int]) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------
+# Indicator-combination search (gap-closure item 3) - MACD, Bollinger,
+# Stochastic, ADX, VWAP. Parity with solbot.indicators is asserted bar for
+# bar in tests/test_vector_parity.py; see that module's docstring for why
+# this is the constraint that matters most in the whole optimizer.
+# --------------------------------------------------------------------------
+def _rolling_extreme_stack(
+    x: np.ndarray, windows: Sequence[int], *, mode: str
+) -> np.ndarray:
+    """``[len(windows), symbols, bars]`` causal rolling max/min - pandas'
+    ``rolling(window).max()``/``.min()`` semantics (NaN before the window is
+    filled).
+
+    Block-decomposition per symbol row: prefix and suffix extrema within
+    blocks of ``window``, then one elementwise combine - the same algorithm
+    ``solopt.stress._rolling_max`` uses for its (forward-looking) window,
+    adapted here for a trailing one via an index shift, and batched over
+    symbols and several window sizes at once.
+    """
+    # float64 internally: stochastic's %K subtracts two nearly-equal prices, and
+    # float32's ~7 significant digits is not enough headroom for that
+    # cancellation to stay inside the parity test's tolerance.
+    x = np.asarray(x, dtype=np.float64)
+    n_symbols, n_bars = x.shape
+    fill = -np.inf if mode == "max" else np.inf
+    reduce = np.maximum if mode == "max" else np.minimum
+    out = np.full((len(windows), n_symbols, n_bars), NAN, dtype=np.float32)
+    for wi, raw in enumerate(windows):
+        w = max(1, int(raw))
+        if w == 1:
+            out[wi] = x
+            continue
+        if w > n_bars:
+            continue
+        pad = (-n_bars) % w
+        padded = np.concatenate(
+            [x, np.full((n_symbols, pad), fill, dtype=np.float64)], axis=1
+        )
+        blocks = padded.reshape(n_symbols, -1, w)
+        prefix = reduce.accumulate(blocks, axis=2)
+        suffix = reduce.accumulate(blocks[:, :, ::-1], axis=2)[:, :, ::-1]
+        prefix_flat = prefix.reshape(n_symbols, -1)
+        suffix_flat = suffix.reshape(n_symbols, -1)
+        n_out = n_bars - w + 1
+        forward = reduce(suffix_flat[:, :n_out], prefix_flat[:, w - 1 : w - 1 + n_out])
+        out[wi, :, w - 1 :] = forward
+    return out
+
+
+def _ema_stack_f64(close: np.ndarray, spans: Sequence[int]) -> np.ndarray:
+    """Same recursion as :func:`ema_stack`, kept in float64 throughout.
+
+    MACD's line is the *difference* of two EMAs that are usually close in
+    magnitude - float32's ~7 significant digits leave too little headroom for
+    that cancellation once both spans exceed a few hundred bars of history,
+    which the module-wide float32 storage convention elsewhere in this file
+    is fine with only because nothing else here subtracts two near-equal
+    large numbers.
+    """
+    x = np.asarray(close, dtype=np.float64)
+    n_symbols, n_bars = x.shape
+    alphas = np.asarray(
+        [2.0 / (max(1, int(s)) + 1.0) for s in spans], dtype=np.float64
+    ).reshape(-1, 1)
+    n_alpha = alphas.shape[0]
+    out = np.empty((n_alpha, n_symbols, n_bars), dtype=np.float64)
+    if n_bars == 0:
+        return out
+    prev = np.repeat(x[None, :, 0], n_alpha, axis=0)
+    out[:, :, 0] = prev
+    one_minus = 1.0 - alphas
+    for t in range(1, n_bars):
+        prev = alphas * x[None, :, t] + one_minus * prev
+        out[:, :, t] = prev
+    return out
+
+
+def macd_line_stack(close: np.ndarray, pairs: Sequence[tuple[int, int]]) -> np.ndarray:
+    """``[len(pairs), symbols, bars]`` MACD line for each distinct (fast, slow)."""
+    fasts = [int(f) for f, _ in pairs]
+    slows = [int(s) for _, s in pairs]
+    ef = _ema_stack_f64(close, fasts)
+    es = _ema_stack_f64(close, slows)
+    return (ef - es).astype(np.float32)
+
+
+def macd_signal_stack(macd_line: np.ndarray, spans: Sequence[int]) -> np.ndarray:
+    """``[len(spans), symbols, bars]`` signal line for one (fast, slow) pair's
+    MACD line - ``ema(macd_line, signal)`` with no warm-up mask, matching
+    ``solbot.indicators.macd``'s ``ema()`` call exactly. `macd_line` is 2D
+    ``[symbols, bars]``, one distinct (fast, slow) pair at a time."""
+    alphas = [2.0 / (max(1, int(s)) + 1.0) for s in spans]
+    return ewm_stack(macd_line, alphas, start=0)
+
+
+def bollinger_stack(
+    close: np.ndarray, periods: Sequence[int]
+) -> tuple[np.ndarray, np.ndarray]:
+    """``[len(periods), symbols, bars]`` rolling mean and population std
+    (ddof=0), computed from prefix sums of x and x^2 in O(1) per period."""
+    close = np.asarray(close, dtype=np.float64)  # variance needs the precision
+    n_symbols, n_bars = close.shape
+    cum = _prefix_sum(close)
+    cum2 = _prefix_sum(close * close)
+    idx = np.arange(n_bars, dtype=np.int64)
+
+    mean_out = np.full((len(periods), n_symbols, n_bars), NAN, dtype=np.float32)
+    std_out = np.full((len(periods), n_symbols, n_bars), NAN, dtype=np.float32)
+    for i, raw in enumerate(periods):
+        p = max(2, int(raw))
+        lo = idx - p
+        enough = idx >= p - 1
+        lo_c = np.maximum(lo, -1) + 1
+        total = cum[:, idx + 1] - cum[:, lo_c]
+        total2 = cum2[:, idx + 1] - cum2[:, lo_c]
+        mean = total / p
+        var = np.maximum(total2 / p - mean * mean, 0.0)
+        mean_out[i] = np.where(enough[None, :], mean, np.nan).astype(np.float32)
+        std_out[i] = np.where(enough[None, :], np.sqrt(var), np.nan).astype(np.float32)
+    return mean_out, std_out
+
+
+def stochastic_k_stack(
+    high: np.ndarray, low: np.ndarray, close: np.ndarray, k_periods: Sequence[int]
+) -> np.ndarray:
+    """``[len(k_periods), symbols, bars]`` %K."""
+    close64 = np.asarray(close, dtype=np.float64)
+    lowest = _rolling_extreme_stack(low, k_periods, mode="min").astype(np.float64)
+    highest = _rolling_extreme_stack(high, k_periods, mode="max").astype(np.float64)
+    span = highest - lowest
+    with np.errstate(divide="ignore", invalid="ignore"):
+        k = 100.0 * (close64[None, :, :] - lowest) / np.where(span == 0.0, NAN, span)
+    return k.astype(np.float32)
+
+
+def stochastic_d_stack(k: np.ndarray, d_periods: Sequence[int]) -> np.ndarray:
+    """``[len(d_periods), symbols, bars]`` %D - a plain rolling mean of one
+    %K series, via the same prefix-sum trick as the Bollinger mean."""
+    n_symbols, n_bars = k.shape
+    valid = ~np.isnan(k)
+    filled = np.where(valid, k, 0.0).astype(np.float64)
+    cum = _prefix_sum(filled)
+    cum_n = _prefix_sum(valid.astype(np.float64))
+    idx = np.arange(n_bars, dtype=np.int64)
+
+    out = np.full((len(d_periods), n_symbols, n_bars), NAN, dtype=np.float32)
+    for i, raw in enumerate(d_periods):
+        p = max(1, int(raw))
+        lo = np.maximum(idx - p, -1) + 1
+        total = cum[:, idx + 1] - cum[:, lo]
+        count = cum_n[:, idx + 1] - cum_n[:, lo]
+        enough = (idx >= p - 1) & (count >= p)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            mean = total / np.where(count == 0, np.nan, count)
+        out[i] = np.where(enough[None, :], mean, np.nan).astype(np.float32)
+    return out
+
+
+def adx_stack(
+    high: np.ndarray, low: np.ndarray, close: np.ndarray, periods: Sequence[int]
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """``[len(periods), symbols, bars]`` ADX, +DI, -DI - Wilder's definition,
+    matching ``solbot.indicators.adx`` bar for bar."""
+    high = np.asarray(high, dtype=np.float32)
+    low = np.asarray(low, dtype=np.float32)
+    n_symbols, n_bars = high.shape
+
+    up_move = np.zeros_like(high)
+    down_move = np.zeros_like(low)
+    if n_bars > 1:
+        up_move[:, 1:] = high[:, 1:] - high[:, :-1]
+        down_move[:, 1:] = -(low[:, 1:] - low[:, :-1])
+    plus_dm = np.where((up_move > down_move) & (up_move > 0.0), up_move, 0.0).astype(np.float32)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0.0), down_move, 0.0).astype(
+        np.float32
+    )
+    tr = true_range(high, low, close)
+
+    periods = [max(2, int(p)) for p in periods]
+    alphas = [1.0 / p for p in periods]
+    mins = [p - 1 for p in periods]  # matches atr_stack's warm-up convention
+
+    smoothed_tr = ewm_stack(tr, alphas, start=0, min_index=mins)
+    smoothed_plus = ewm_stack(plus_dm, alphas, start=0, min_index=mins)
+    smoothed_minus = ewm_stack(minus_dm, alphas, start=0, min_index=mins)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        plus_di = 100.0 * smoothed_plus / np.where(smoothed_tr == 0.0, NAN, smoothed_tr)
+        minus_di = 100.0 * smoothed_minus / np.where(smoothed_tr == 0.0, NAN, smoothed_tr)
+        di_sum = plus_di + minus_di
+        dx = 100.0 * np.abs(plus_di - minus_di) / np.where(di_sum == 0.0, NAN, di_sum)
+
+    # Wilder-smooth DX per distinct period. dx carries NaN through the warm-up,
+    # which ewm_stack (adjust=False) propagates from the first NaN onward - so
+    # each period's DX must be smoothed against its own min_index, one call per
+    # period rather than one batched call across all of them.
+    adx_out = np.full((len(periods), n_symbols, n_bars), NAN, dtype=np.float32)
+    for i, (alpha, p) in enumerate(zip(alphas, periods)):
+        dx_p = np.where(np.isnan(dx[i]), NAN, dx[i])
+        smoothed = ewm_stack(np.nan_to_num(dx_p, nan=0.0), [alpha], start=p - 1)[0]
+        adx_out[i] = np.where(np.arange(n_bars)[None, :] < (2 * p - 2), NAN, smoothed)
+
+    return adx_out, plus_di.astype(np.float32), minus_di.astype(np.float32)
+
+
+def vwap_stack(
+    high: np.ndarray, low: np.ndarray, close: np.ndarray, volume: np.ndarray,
+    periods: Sequence[int],
+) -> np.ndarray:
+    """``[len(periods), symbols, bars]`` rolling volume-weighted average price."""
+    typical = ((high + low + close) / 3.0).astype(np.float64)
+    volume = np.asarray(volume, dtype=np.float64)
+    n_symbols, n_bars = typical.shape
+    cum_pv = _prefix_sum(typical * volume)
+    cum_v = _prefix_sum(volume)
+    idx = np.arange(n_bars, dtype=np.int64)
+
+    out = np.full((len(periods), n_symbols, n_bars), NAN, dtype=np.float32)
+    for i, raw in enumerate(periods):
+        p = max(2, int(raw))
+        lo = np.maximum(idx - p, -1) + 1
+        enough = idx >= p - 1
+        num = cum_pv[:, idx + 1] - cum_pv[:, lo]
+        den = cum_v[:, idx + 1] - cum_v[:, lo]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            val = num / np.where(den == 0.0, np.nan, den)
+        out[i] = np.where(enough[None, :], val, np.nan).astype(np.float32)
+    return out
+
+
+# --------------------------------------------------------------------------
 # Regime detection (spec 4.1)
 # --------------------------------------------------------------------------
 TRENDING, RANGING, CHOPPY = 0, 1, 2

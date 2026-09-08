@@ -56,7 +56,9 @@ def _block(df: pd.DataFrame, column: str) -> np.ndarray:
     return df[column].to_numpy(dtype=np.float32)[None, :]
 
 
-def assert_matches(got: np.ndarray, expected: pd.Series, name: str) -> None:
+def assert_matches(
+    got: np.ndarray, expected: pd.Series, name: str, *, atol: float = ATOL
+) -> None:
     a = np.asarray(got, dtype=np.float64).ravel()
     b = expected.to_numpy(dtype=np.float64)
     assert a.shape == b.shape, f"{name}: shape {a.shape} against {b.shape}"
@@ -68,7 +70,7 @@ def assert_matches(got: np.ndarray, expected: pd.Series, name: str) -> None:
     both = ~np.isnan(a)
     if not both.any():
         return
-    allowed = ATOL + RTOL * np.abs(b[both])
+    allowed = atol + RTOL * np.abs(b[both])
     error = np.abs(a[both] - b[both])
     worst = int(np.argmax(error - allowed))
     assert (error <= allowed).all(), (
@@ -175,6 +177,70 @@ def test_regime_classification_matches(series):
         efficiency, atr_pct, trend_er=trend_er, chop_atr_pct=chop
     )
     assert np.array_equal(got.ravel(), computed["regime"].to_numpy())
+
+
+# --------------------------------------------------------------------------
+# Indicator-combination search (gap-closure item 3)
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize("fast,slow,signal", [(12, 26, 9), (5, 13, 4)])
+def test_macd_matches_pandas(series, fast, slow, signal):
+    macd_line, macd_signal = scalar.macd(series["close"], fast, slow, signal)
+    got_line = vector.macd_line_stack(_block(series, "close"), [(fast, slow)])[0]
+    assert_matches(got_line, macd_line, f"macd_line{fast}/{slow}")
+    got_signal = vector.macd_signal_stack(got_line, [signal])[0]
+    assert_matches(got_signal, macd_signal, f"macd_signal{fast}/{slow}/{signal}")
+
+
+@pytest.mark.parametrize("period", [10, 20])
+def test_bollinger_matches_pandas(series, period):
+    mid, upper, lower = scalar.bollinger_bands(series["close"], period, 2.0)
+    expected_pb = scalar.percent_b(series["close"], upper, lower)
+
+    mean, std = vector.bollinger_stack(_block(series, "close"), [period])
+    got_upper = mean[0] + 2.0 * std[0]
+    got_lower = mean[0] - 2.0 * std[0]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        got_pb = (_block(series, "close")[0] - got_lower) / (got_upper - got_lower)
+
+    assert_matches(mean[0], mid, f"bb_mid{period}")
+    assert_matches(got_pb, expected_pb, f"bb_percent{period}")
+
+
+@pytest.mark.parametrize("k_period,d_period", [(14, 3), (9, 5)])
+def test_stochastic_matches_pandas(series, k_period, d_period):
+    # %K's numerator (close - lowest_low) is occasionally near zero - close
+    # sitting almost exactly at the window low - so the same float32-input
+    # cancellation the module docstring calls out for momentum shows up here
+    # too, amplified by %K's own 100x scale. A slightly wider absolute
+    # tolerance for this one series, same rationale as momentum's ATOL.
+    k, d = scalar.stochastic(series, k_period, d_period)
+    got_k = vector.stochastic_k_stack(
+        _block(series, "high"), _block(series, "low"), _block(series, "close"), [k_period]
+    )[0]
+    assert_matches(got_k, k, f"stoch_k{k_period}", atol=2e-3)
+    got_d = vector.stochastic_d_stack(got_k, [d_period])[0]
+    assert_matches(got_d, d, f"stoch_d{k_period}/{d_period}", atol=2e-3)
+
+
+@pytest.mark.parametrize("period", [7, 14])
+def test_adx_matches_pandas(series, period):
+    adx_line, plus_di, minus_di = scalar.adx(series, period)
+    got_adx, got_plus, got_minus = vector.adx_stack(
+        _block(series, "high"), _block(series, "low"), _block(series, "close"), [period]
+    )
+    assert_matches(got_plus[0], plus_di, f"plus_di{period}")
+    assert_matches(got_minus[0], minus_di, f"minus_di{period}")
+    assert_matches(got_adx[0], adx_line, f"adx{period}")
+
+
+@pytest.mark.parametrize("period", [10, 20])
+def test_vwap_matches_pandas(series, period):
+    expected = scalar.vwap(series, period)
+    got = vector.vwap_stack(
+        _block(series, "high"), _block(series, "low"), _block(series, "close"),
+        _block(series, "volume"), [period],
+    )[0]
+    assert_matches(got, expected, f"vwap{period}")
 
 
 # --------------------------------------------------------------------------
