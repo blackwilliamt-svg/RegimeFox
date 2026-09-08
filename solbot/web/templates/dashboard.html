@@ -110,6 +110,17 @@
   </div>
 </div>
 
+<div class="panel" style="margin-bottom:16px">
+  <div class="panel-head">
+    <h2>Market</h2>
+    <input type="text" id="marketSymbolInput" list="marketSymbolDatalist"
+           placeholder="Search a symbol in the universe…" style="width:auto; min-width:220px">
+    <datalist id="marketSymbolDatalist"></datalist>
+  </div>
+  <div class="chart-box"><canvas id="marketChart"></canvas></div>
+  <p class="hint" id="marketChartHint"></p>
+</div>
+
 <div class="position-charts" id="positionCharts" style="margin-bottom:16px"></div>
 
 <div class="grid grid-2">

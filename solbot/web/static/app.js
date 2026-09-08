@@ -174,6 +174,82 @@
     });
   }
 
+  /* ---------- market chart (always visible, symbol search over the universe) ---------- */
+  var marketUniverse = [];        // [{mint, symbol, label}], sorted by volume desc (server order)
+  var marketMint = null;          // currently displayed mint
+  var marketUniverseLoaded = false;
+
+  function marketLabel(row) {
+    return (row.symbol || row.mint.slice(0, 8)) + " — " + row.mint.slice(0, 6) + "…";
+  }
+
+  function loadMarketUniverse() {
+    var input = el("marketSymbolInput");
+    if (!input) return Promise.resolve();
+    return get("/api/universe").then(function (rows) {
+      marketUniverse = rows.map(function (r) {
+        return { mint: r.mint, symbol: r.symbol, label: marketLabel(r) };
+      });
+      var list = el("marketSymbolDatalist");
+      if (list) {
+        list.innerHTML = marketUniverse.map(function (r) {
+          return '<option value="' + esc(r.label) + '">';
+        }).join("");
+      }
+      marketUniverseLoaded = true;
+      // Default to the top-ranked (highest 24h volume) coin once, and whenever
+      // the previously-selected mint drops out of the universe.
+      var stillPresent = marketMint && marketUniverse.some(function (r) { return r.mint === marketMint; });
+      if (!stillPresent && marketUniverse.length) {
+        marketMint = marketUniverse[0].mint;
+        input.value = marketUniverse[0].label;
+      }
+    });
+  }
+
+  function resolveMarketSymbolInput() {
+    var input = el("marketSymbolInput");
+    if (!input) return;
+    var typed = input.value.trim().toLowerCase();
+    if (!typed) return;
+    var hit = marketUniverse.find(function (r) {
+      return r.label.toLowerCase() === typed || (r.symbol || "").toLowerCase() === typed;
+    });
+    if (hit && hit.mint !== marketMint) {
+      marketMint = hit.mint;
+      loadMarketChart();
+    }
+  }
+
+  function loadMarketChart() {
+    var canvas = el("marketChart");
+    var hint = el("marketChartHint");
+    if (!canvas) return Promise.resolve();
+
+    var afterUniverse = marketUniverseLoaded ? Promise.resolve() : loadMarketUniverse();
+    return afterUniverse.then(function () {
+      if (!marketMint) {
+        if (hint) hint.textContent = "No coins in the universe yet — try Refresh universe.";
+        return;
+      }
+      if (hint) {
+        var row = marketUniverse.find(function (r) { return r.mint === marketMint; });
+        hint.textContent = row ? (row.symbol || marketMint) + " · " + marketUniverse.length +
+          " coins in the current universe" : "";
+      }
+      return get("/api/candles/" + encodeURIComponent(marketMint) + "?limit=200").then(function (d) {
+        window.SolChart.candles(canvas, d.candles, { height: 300 });
+      });
+    });
+  }
+
+  (function wireMarketSearch() {
+    var input = el("marketSymbolInput");
+    if (!input) return;
+    input.addEventListener("change", resolveMarketSymbolInput);
+    input.addEventListener("blur", resolveMarketSymbolInput);
+  })();
+
   /* ---------- equity ---------- */
   function loadEquity() {
     var canvas = el("equityChart");
@@ -601,6 +677,7 @@
   function refreshCharts() {
     loadPositions().catch(noop);
     loadEquity().catch(noop);
+    loadMarketChart().catch(noop);
     drawMonteCarlo();
   }
   function noop() {}
@@ -610,6 +687,7 @@
     loadPositions().catch(noop);
     loadEvents().catch(noop);
     loadEquity().catch(noop);
+    loadMarketChart().catch(noop);
     loadProgress().catch(noop);
     loadWalkForward().catch(noop);
     loadDrift().catch(noop);
