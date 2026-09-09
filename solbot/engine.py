@@ -981,7 +981,8 @@ class Engine:
         return f"position {position_id} is not open"
 
     def _start_pull(self, payload: dict[str, Any], conn: sqlite3.Connection) -> None:
-        pairs = self.store.pair_map(conn)
+        top_n = int(payload["top_n"]) if payload.get("top_n") else None
+        pairs = self.store.pair_map(conn, top_n=top_n)
         wanted = payload.get("mints")
         if wanted:
             pairs = {m: p for m, p in pairs.items() if m in wanted}
@@ -989,7 +990,7 @@ class Engine:
 
         def worker() -> None:
             try:
-                report = self.store.run_initial_pull(pairs, months=months)
+                report = self.store.run_initial_pull(pairs, months=months, top_n=top_n)
             except Exception:
                 log.exception("historical pull failed")
                 return

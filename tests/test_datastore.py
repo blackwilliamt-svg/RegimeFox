@@ -171,3 +171,87 @@ def test_estimate_pull_falls_back_to_a_sane_default_rps_when_unconfigured():
     store = DataStore(None, {})
     estimate = store.estimate_pull(5, 3)
     assert estimate["seconds_estimate"] > 0
+
+
+# --------------------------------------------------------------------------
+# Historical-pull fix-up section 6: an optional top_n scopes pair_map() to
+# the top N routed mints by market cap - a one-off narrowing for the manual
+# historical-pull button only, never touching the universe table's own
+# filters or any other caller.
+# --------------------------------------------------------------------------
+def _seed_universe_row(conn, mint: str, pair: str, *, mcap: float | None, volume: float) -> None:
+    conn.execute(
+        "INSERT INTO universe(mint, symbol, binance_pair, mcap, volume_24h_usd, updated_at) "
+        "VALUES (?,?,?,?,?,?)",
+        (mint, pair[:-4], pair, mcap, volume, db.now()),
+    )
+
+
+def test_pair_map_top_n_ranks_by_market_cap_descending(workspace):
+    conn = workspace["conn"]
+    _seed_universe_row(conn, "MintSmallCapAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "SMLUSDT", mcap=1_000_000, volume=9_000_000)
+    _seed_universe_row(conn, "MintHugeCapAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "HUGUSDT", mcap=900_000_000, volume=1_000)
+    _seed_universe_row(conn, "MintMidCapAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "MIDUSDT", mcap=50_000_000, volume=500_000)
+    conn.commit()
+
+    store = DataStore(binance=None, cfg={"candle_minutes": 1})
+    top2 = store.pair_map(conn, top_n=2)
+
+    assert list(top2.keys()) == [
+        "MintHugeCapAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "MintMidCapAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    ]
+    assert "MintSmallCapAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" not in top2
+
+
+def test_pair_map_top_n_sorts_null_or_zero_market_cap_last_using_volume_as_tiebreak(workspace):
+    conn = workspace["conn"]
+    _seed_universe_row(conn, "MintKnownCapAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "KNWUSDT", mcap=5_000_000, volume=1)
+    _seed_universe_row(conn, "MintNullCapHiVolAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "HIVUSDT", mcap=None, volume=9_000_000)
+    _seed_universe_row(conn, "MintZeroCapLoVolAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "LOVUSDT", mcap=0, volume=100)
+    conn.commit()
+
+    store = DataStore(binance=None, cfg={"candle_minutes": 1})
+    ranked = list(store.pair_map(conn, top_n=3).keys())
+
+    # known market cap always sorts ahead of null/zero, regardless of volume...
+    assert ranked[0] == "MintKnownCapAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    # ...and among the null/zero-cap coins, higher volume breaks the tie.
+    assert ranked[1] == "MintNullCapHiVolAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    assert ranked[2] == "MintZeroCapLoVolAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+
+def test_pair_map_without_top_n_returns_the_full_universe_unchanged(workspace):
+    conn = workspace["conn"]
+    for i in range(5):
+        _seed_universe_row(
+            conn, f"MintFull{i:0>36}", f"F{i}USDT", mcap=float(i) * 1_000_000, volume=1_000.0
+        )
+    conn.commit()
+
+    store = DataStore(binance=None, cfg={"candle_minutes": 1})
+    assert len(store.pair_map(conn)) == 5
+    assert len(store.pair_map(conn, top_n=None)) == 5
+
+
+def test_a_top_n_scoped_historical_pull_does_not_affect_other_jobs_pair_map_calls(workspace):
+    """The live trading universe / daily-incremental / backtest / regime-pass
+    all call pair_map() with no top_n and must see the full universe, even
+    right after a top_n-scoped pull has run against the same table."""
+    conn = workspace["conn"]
+    _seed_universe_row(conn, "MintOneAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "ONEUSDT", mcap=10_000_000, volume=1)
+    _seed_universe_row(conn, "MintTwoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "TWOUSDT", mcap=5_000_000, volume=1)
+    _seed_universe_row(conn, "MintThreeAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "THRUSDT", mcap=1_000_000, volume=1)
+    conn.commit()
+
+    store = DataStore(binance=None, cfg={"candle_minutes": 1})
+
+    # A top_n=1 historical pull happens (as if the dashboard button had just
+    # been used)...
+    scoped = store.pair_map(conn, top_n=1)
+    assert len(scoped) == 1
+
+    # ...the universe table itself, and every other caller's own pair_map()
+    # call, are completely unaffected by that having happened.
+    assert len(store.pair_map(conn)) == 3
+    assert conn.execute("SELECT COUNT(*) AS n FROM universe").fetchone()["n"] == 3

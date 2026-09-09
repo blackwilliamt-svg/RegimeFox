@@ -275,10 +275,17 @@ def regime_pass():
 @bp.route("/backtest/pull", methods=["POST"])
 def historical_pull():
     months = request.form.get("months", type=int)
-    _enqueue("historical_pull", {"months": months} if months else {})
+    top_n = request.form.get("top_n", type=int)
+    payload: dict[str, Any] = {}
+    if months:
+        payload["months"] = months
+    if top_n:
+        payload["top_n"] = top_n
+    _enqueue("historical_pull", payload)
     flash(
-        "Historical pull queued. Progress will appear here; this is the heavy "
-        "one-time load, so it is rate limited.",
+        (f"Historical pull queued for the top {top_n} tokens by market cap. "
+         if top_n else "Historical pull queued. ")
+        + "Progress will appear here; this is the heavy one-time load, so it is rate limited.",
         "success",
     )
     return redirect(url_for("dashboard.backtest"))

@@ -18,8 +18,17 @@
     </div>
     <form method="post" action="{{ url_for('dashboard.historical_pull') }}" class="btn-row">
       <input type="number" name="months" id="pullMonths" value="12" min="1" max="96" style="width:100px">
+      <label for="pullTopN" style="display:inline; margin:0">Top N coins
+        <input type="number" name="top_n" id="pullTopN" min="1" max="2000" placeholder="all"
+               style="width:90px; display:inline-block">
+      </label>
       <button class="btn-primary">Start historical pull</button>
     </form>
+    <p class="hint" style="margin-top:4px">
+      Leave "Top N coins" blank to pull the full current universe (default). Set it to scope
+      this one pull to the top N coins by market cap — the live trading universe and every
+      other job are unaffected.
+    </p>
     <p class="hint" id="pullEstimate" style="margin-top:8px">—</p>
     <div id="dailyPullProgress" style="margin:14px 0 0">
       <div class="progress"><div id="dailyPullBar" style="width:0%"></div></div>

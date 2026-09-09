@@ -336,22 +336,27 @@ class DataStore:
         months: int | None = None,
         conn: sqlite3.Connection | None = None,
         should_stop: Callable[[], bool] | None = None,
+        top_n: int | None = None,
     ) -> PullReport:
         """The bulk backfill with dashboard progress reporting attached.
 
         Wired to the dashboard's manual button - the spec keeps this heavy,
         one-time load under the user's control rather than firing it
-        automatically at startup.
+        automatically at startup. `pairs` is expected to already be scoped
+        (e.g. via `pair_map(top_n=...)`) by the caller; `top_n` here is only
+        used to phrase the starting message ("top N by market cap" instead
+        of a bare token count) - it does not do any filtering itself.
         """
         conn = conn or db.connect()
         months = months or int(self.cfg["bulk_backfill_months"])
         total = len(pairs)
+        scope = f"the top {top_n} tokens by market cap" if top_n else f"{total} tokens"
         db.set_progress(
             JOB_INITIAL_PULL,
             status="running",
             done=0,
             total=total,
-            message=f"Starting a {months}-month pull for {total} tokens",
+            message=f"Starting a {months}-month pull for {scope}",
             conn=conn,
         )
 
@@ -466,11 +471,41 @@ class DataStore:
             pass  # the local WFMC store may not exist yet on a fresh install
         return deleted
 
-    def pair_map(self, conn: sqlite3.Connection | None = None) -> dict[str, str]:
-        """``{mint: binance_pair}`` for every routed universe token."""
+    def pair_map(
+        self, conn: sqlite3.Connection | None = None, *, top_n: int | None = None
+    ) -> dict[str, str]:
+        """``{mint: binance_pair}`` for every routed universe token.
+
+        `top_n`, when given, narrows this to the top `top_n` mints ranked by
+        market cap (``universe.mcap``, sourced from Jupiter's token API at
+        every universe refresh - real data already in this table, not a
+        proxy), coins with no known market cap sorted last and broken by
+        24h volume. This is a one-off scoping for the manual historical-pull
+        button (dashboard fix-up section 6) - every other caller (daily
+        incremental pull, backtest, walk-forward, regime pass) calls this
+        with the default `top_n=None` and gets the exact same full routed
+        universe as before; it does not touch the universe table's own
+        liquidity/volume floor filters or the live trading universe.
+        """
         conn = conn or db.connect()
-        rows = conn.execute(
-            "SELECT mint, binance_pair FROM universe WHERE binance_pair IS NOT NULL "
-            "AND binance_pair != ''"
-        ).fetchall()
+        if top_n:
+            # Known-market-cap rows always sort ahead of null/zero ones
+            # (first ORDER BY key); the CASE pins every null/zero row's
+            # second key to the same 0, so within THAT bucket the third key
+            # (volume) is what actually breaks ties, rather than mcap's own
+            # NULL-sorts-last-in-DESC behaviour doing it by accident.
+            rows = conn.execute(
+                "SELECT mint, binance_pair FROM universe "
+                "WHERE binance_pair IS NOT NULL AND binance_pair != '' "
+                "ORDER BY (mcap IS NULL OR mcap <= 0) ASC, "
+                "CASE WHEN mcap IS NULL OR mcap <= 0 THEN 0 ELSE mcap END DESC, "
+                "volume_24h_usd DESC "
+                "LIMIT ?",
+                (int(top_n),),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT mint, binance_pair FROM universe WHERE binance_pair IS NOT NULL "
+                "AND binance_pair != ''"
+            ).fetchall()
         return {r["mint"]: r["binance_pair"] for r in rows}
