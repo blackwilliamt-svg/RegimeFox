@@ -17,7 +17,10 @@
       <p class="hint" id="pullLabel">{{ pull.message or 'Not run yet' }}</p>
     </div>
     <form method="post" action="{{ url_for('dashboard.historical_pull') }}" class="btn-row">
-      <input type="number" name="months" id="pullMonths" value="12" min="1" max="96" style="width:100px">
+      <label for="pullMonths" style="display:inline; margin:0">Months of history
+        <input type="number" name="months" id="pullMonths" value="12" min="1" max="96"
+               style="width:100px; display:inline-block">
+      </label>
       <label for="pullTopN" style="display:inline; margin:0">Top N coins
         <input type="number" name="top_n" id="pullTopN" min="1" max="2000" placeholder="all"
                style="width:90px; display:inline-block">
