@@ -765,10 +765,12 @@ def _ping_provider(provider: str, key: str, config: Any) -> tuple[bool, str]:
         from ..runpod import RunPodClient
 
         try:
-            # /gputypes is RunPod's cheapest authenticated GET - same call
-            # gpu_price_per_hour() already makes during a real benchmark,
-            # just used here purely to confirm the key is accepted.
-            RunPodClient(key).transport.request("GET", "/gputypes")
+            # GET /pods is RunPod's cheapest authenticated REST call - an
+            # empty list is a perfectly valid response, this is purely to
+            # confirm the key itself is accepted. (Not /gputypes: RunPod's
+            # REST API has no such endpoint at all - the GPU catalog is
+            # GraphQL-only, see gpu_price_per_hour()/HttpxTransport.)
+            RunPodClient(key).transport.request("GET", "/pods")
             return True, ""
         except Exception as exc:
             return False, f"{type(exc).__name__}: {exc}"[:300]

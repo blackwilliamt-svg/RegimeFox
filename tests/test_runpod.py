@@ -80,17 +80,26 @@ class FakeTransport:
             self.pods.pop(pod_id, None)
             return {}
 
-        if method == "GET" and path == "/gputypes":
-            if self.gputypes_fails:
-                raise RunPodError("simulated /gputypes outage")
-            return {
-                "gpuTypes": [
-                    {"id": name, "communityPrice": price}
-                    for name, price in self.gpu_prices.items()
-                ]
-            }
+        if method == "GET" and path == "/pods":
+            return {"pods": list(self.pods.values())}
 
         raise RunPodError(f"unhandled fake request: {method} {path}")
+
+    def graphql(self, query: str, variables: dict | None = None) -> dict:
+        # The only GraphQL query this codebase issues is gpuTypes - the GPU
+        # catalog/pricing lookup, since RunPod's REST API has no equivalent
+        # endpoint (a real key rotation attempt hitting exactly that gap -
+        # a 400 from RunPod's own gateway for GET /v1/gputypes - is what
+        # this fake exists to prevent regressing back to).
+        self.calls.append(("POST", "graphql:gpuTypes", variables or {}))
+        if self.gputypes_fails:
+            raise RunPodError("simulated GraphQL gpuTypes outage")
+        return {
+            "gpuTypes": [
+                {"id": name, "communityPrice": price}
+                for name, price in self.gpu_prices.items()
+            ]
+        }
 
 
 @pytest.fixture
@@ -193,6 +202,16 @@ def test_gpu_price_per_hour_reads_the_matching_tier(client, transport):
     transport.gpu_prices = {"NVIDIA RTX 4090": 0.79, "NVIDIA RTX 3090": 0.5}
     assert client.gpu_price_per_hour("NVIDIA RTX 4090") == 0.79
     assert client.gpu_price_per_hour("NVIDIA RTX 3090") == 0.5
+
+
+def test_gpu_price_per_hour_uses_graphql_not_a_rest_path(client, transport):
+    """Regression: RunPod's REST API has no GPU-types endpoint at all (a
+    real key rotation hit a 400 from RunPod's own gateway for the
+    previously-assumed GET /v1/gputypes) - the GPU catalog is GraphQL-only."""
+    transport.gpu_prices = {"NVIDIA RTX 4090": 0.79}
+    client.gpu_price_per_hour("NVIDIA RTX 4090")
+    assert ("GET", "/gputypes", {}) not in transport.calls
+    assert any(call[1] == "graphql:gpuTypes" for call in transport.calls)
 
 
 def test_gpu_price_per_hour_is_none_for_an_unlisted_tier(client, transport):
@@ -327,3 +346,46 @@ def test_cost_per_1000_combinations_is_none_without_both_numbers():
     assert BenchmarkResult(
         "t", ok=True, cost_usd=2.0, combinations_evaluated=1000
     ).cost_per_1000_combinations == pytest.approx(2.0)
+
+
+# --------------------------------------------------------------------------
+# Settings-page key validation ping (solbot.web.api._ping_provider)
+# --------------------------------------------------------------------------
+def test_ping_provider_validates_runpod_against_a_real_rest_endpoint(monkeypatch):
+    """Regression: the settings page's "validate this RunPod key" check
+    used to call GET /gputypes too, which RunPod's REST API does not have -
+    every real RunPod key rotation failed with a 400 from RunPod's own
+    gateway. GET /pods is a real, cheap, authenticated REST call."""
+    from solbot.web.api import _ping_provider
+
+    calls = []
+
+    def fake_request(self, method, path, *, json=None):
+        calls.append((method, path))
+        return {"pods": []}
+
+    monkeypatch.setattr("solbot.runpod.HttpxTransport.request", fake_request)
+
+    ok, error = _ping_provider("runpod", "fake-key", config=None)
+
+    assert ok is True
+    assert error == ""
+    assert ("GET", "/pods") in calls
+    assert ("GET", "/gputypes") not in calls
+
+
+def test_ping_provider_reports_the_real_failure_reason(monkeypatch):
+    from solbot.runpod import RunPodError
+    from solbot.web.api import _ping_provider
+
+    def fake_request(self, method, path, *, json=None):
+        raise RunPodError(
+            "RunPod GET /gputypes returned HTTP 400: path does not exist in the specification"
+        )
+
+    monkeypatch.setattr("solbot.runpod.HttpxTransport.request", fake_request)
+
+    ok, error = _ping_provider("runpod", "fake-key", config=None)
+
+    assert ok is False
+    assert "400" in error

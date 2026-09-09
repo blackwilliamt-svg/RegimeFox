@@ -30,6 +30,8 @@ from typing import Any, Callable, Protocol
 log = logging.getLogger(__name__)
 
 API_BASE = "https://rest.runpod.io/v1"
+# GPU catalog/pricing is GraphQL-only - see HttpxTransport's docstring.
+GRAPHQL_API_BASE = "https://api.runpod.io/graphql"
 POD_RUNNING_STATES = {"CREATED", "RESTARTING", "RUNNING", "PENDING"}
 DEFAULT_IMAGE = "ghcr.io/example-org/solopt-worker:latest"
 MAX_POLL_SECONDS = 4 * 3600
@@ -98,10 +100,22 @@ class Transport(Protocol):
         self, method: str, path: str, *, json: dict[str, Any] | None = None
     ) -> dict[str, Any]: ...
 
+    def graphql(
+        self, query: str, variables: dict[str, Any] | None = None
+    ) -> dict[str, Any]: ...
+
 
 @dataclass
 class HttpxTransport:
-    """The real transport: httpx against RunPod's REST API."""
+    """The real transport: httpx against RunPod's REST API for
+    pods/network-volumes/templates (the REST v1 surface at ``API_BASE``),
+    and its older GraphQL API for GPU catalog/pricing - the REST API's
+    OpenAPI schema (``GET /v1/openapi.json``) has no GPU-types endpoint at
+    all; that data has only ever been exposed via GraphQL
+    (``GRAPHQL_API_BASE``), confirmed against RunPod's own published spec
+    after a real key rotation attempt hit exactly this gap (a 400 from
+    RunPod's own API gateway saying ``/v1/gputypes`` does not exist).
+    """
 
     api_key: str
     timeout: float = 30.0
@@ -121,6 +135,31 @@ class HttpxTransport:
             return response.json() if response.content else {}
         except ValueError as exc:
             raise RunPodError(f"RunPod {path} did not return JSON") from exc
+
+    def graphql(self, query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
+        import httpx
+
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        body: dict[str, Any] = {"query": query}
+        if variables is not None:
+            body["variables"] = variables
+        try:
+            response = httpx.post(
+                GRAPHQL_API_BASE, json=body, headers=headers, timeout=self.timeout
+            )
+        except httpx.HTTPError as exc:
+            raise RunPodError(f"could not reach RunPod's GraphQL API: {exc}") from exc
+        if response.status_code >= 400:
+            raise RunPodError(
+                f"RunPod GraphQL returned HTTP {response.status_code}: {response.text[:300]}"
+            )
+        try:
+            payload = response.json() if response.content else {}
+        except ValueError as exc:
+            raise RunPodError("RunPod GraphQL did not return JSON") from exc
+        if payload.get("errors"):
+            raise RunPodError(f"RunPod GraphQL error: {str(payload['errors'])[:300]}")
+        return payload.get("data") or {}
 
 
 @dataclass
@@ -188,31 +227,47 @@ class RunPodClient:
     # ------------------------------------------------------------------
     # Pricing
     # ------------------------------------------------------------------
+    GPU_TYPES_QUERY = """
+        query gpuTypes {
+          gpuTypes {
+            id
+            displayName
+            communityPrice
+            securePrice
+            lowestPrice {
+              uninterruptablePrice
+            }
+          }
+        }
+    """
+
     def gpu_price_per_hour(self, gpu_type: str) -> float | None:
         """This tier's current $/hr from RunPod's own catalog - never a
         hardcoded guess, since GPU pricing moves and a stale number here
         would silently mislead the cost comparison it exists to inform.
 
-        Returns None (rather than raising) when the tier can't be found or
-        the catalog can't be reached - the caller reports cost as unknown
-        rather than failing the whole benchmark over one lookup.
+        The GPU catalog is GraphQL-only (see HttpxTransport's docstring) -
+        RunPod's REST API has no equivalent endpoint. Returns None (rather
+        than raising) when the tier can't be found or the catalog can't be
+        reached - the caller reports cost as unknown rather than failing
+        the whole benchmark over one lookup.
         """
         try:
-            data = self.transport.request("GET", "/gputypes")
+            data = self.transport.graphql(self.GPU_TYPES_QUERY)
         except RunPodError:
             return None
-        types = data if isinstance(data, list) else data.get("gpuTypes") or data.get("data") or []
+        types = data.get("gpuTypes") or []
         for entry in types:
             if not isinstance(entry, dict):
                 continue
-            name = entry.get("id") or entry.get("displayName") or entry.get("name")
+            name = entry.get("id") or entry.get("displayName")
             if name != gpu_type:
                 continue
+            lowest = entry.get("lowestPrice") or {}
             price = (
                 entry.get("communityPrice")
                 or entry.get("securePrice")
-                or entry.get("lowestPrice")
-                or entry.get("pricePerHour")
+                or (lowest.get("uninterruptablePrice") if isinstance(lowest, dict) else None)
             )
             try:
                 return float(price) if price is not None else None
