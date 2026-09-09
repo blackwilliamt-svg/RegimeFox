@@ -472,15 +472,22 @@ class RunPodClient:
         candles: Any,
         interval: str,
         report_run_id_start: int = 1,
+        progress: Callable[[int, int, str], None] | None = None,
         **kwargs: Any,
     ) -> list[BenchmarkResult]:
         """Benchmark each tier in turn, one at a time - concurrent tiers
         would confound wall-clock time with however this droplet's own
         upload bandwidth happened to be shared between them.
+
+        ``progress(index, total, gpu_type)``, if given, fires right before
+        that tier's benchmark starts - dashboard step 4's live status for
+        what would otherwise be a silent multi-minute-to-multi-hour wait.
         """
         tiers = tiers or DEFAULT_BENCHMARK_TIERS
         results = []
         for i, gpu_type in enumerate(tiers):
+            if progress is not None:
+                progress(i, len(tiers), gpu_type)
             result = self.benchmark_tier(
                 gpu_type,
                 mints=mints,

@@ -381,6 +381,7 @@ def backfill_estimate():
 def progress():
     from ..candlestore import ParquetCandleStore
     from ..datastore import BASE_INTERVAL, JOB_DAILY_INCREMENTAL
+    from ..wfmc import RUNPOD_BENCHMARK_JOB
 
     conn = db.connect()
     mints = [r["mint"] for r in conn.execute("SELECT mint FROM universe").fetchall()]
@@ -391,6 +392,7 @@ def progress():
             "daily_incremental_pull": db.get_progress(JOB_DAILY_INCREMENTAL),
             "backtest": db.get_progress("backtest"),
             "regime_pass": db.get_progress("regime_pass"),
+            "runpod_benchmark": db.get_progress(RUNPOD_BENCHMARK_JOB),
             "candle_coverage": {
                 **candles.universe_coverage(mints, BASE_INTERVAL),
                 "disk": candles.disk_usage(),
@@ -715,6 +717,18 @@ def _ping_provider(provider: str, key: str, config: Any) -> tuple[bool, str]:
         if len(key) < 24:
             return False, "a bulk-data token must be at least 24 characters"
         return True, ""
+
+    if provider == "runpod":
+        from ..runpod import RunPodClient
+
+        try:
+            # /gputypes is RunPod's cheapest authenticated GET - same call
+            # gpu_price_per_hour() already makes during a real benchmark,
+            # just used here purely to confirm the key is accepted.
+            RunPodClient(key).transport.request("GET", "/gputypes")
+            return True, ""
+        except Exception as exc:
+            return False, f"{type(exc).__name__}: {exc}"[:300]
 
     bucket = TokenBucket(2.0, 2, reserve=0.0, name=f"{provider}-ping")
     try:

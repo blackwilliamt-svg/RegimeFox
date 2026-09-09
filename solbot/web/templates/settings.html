@@ -59,9 +59,13 @@
     an estimate. This never changes <code>runpod_gpu_type</code> automatically; confirm a
     recommendation yourself once you've seen the numbers.
   </p>
-  <form method="post" action="{{ url_for('dashboard.benchmark_runpod') }}">
-    <button class="btn-ghost">Run benchmark now</button>
+  <form method="post" action="{{ url_for('dashboard.benchmark_runpod') }}" id="runpodBenchmarkForm">
+    <button class="btn-ghost" id="runpodBenchmarkBtn" type="submit">Run benchmark now</button>
   </form>
+  <div id="runpodBenchmarkProgress" style="margin:12px 0">
+    <div class="progress"><div id="runpodBenchmarkBar" style="width:{{ runpod_benchmark_progress.percent or 0 }}%"></div></div>
+    <p class="hint" id="runpodBenchmarkLabel">{{ runpod_benchmark_progress.message or 'Not run yet' }}</p>
+  </div>
   {% if runpod_benchmark and runpod_benchmark.get('results') %}
   <div class="table-scroll" style="margin-top:12px">
     <table>

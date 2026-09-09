@@ -308,6 +308,114 @@ def test_run_benchmark_flags_a_tier_that_failed_to_tear_down_cleanly(workspace, 
 
 
 # --------------------------------------------------------------------------
+# Settings fix-up section 4, item 2: live status/progress for the benchmark -
+# it launches real billed pods and can take a while, so "Run benchmark now"
+# needs something to show while it's in flight, the same bar()-polling
+# pattern run_regime_pass/run_monthly already use (REGIME_PASS_JOB etc.).
+# --------------------------------------------------------------------------
+def test_run_benchmark_reports_failed_progress_when_no_api_key(workspace, settings):
+    store = DataStore(binance=None, cfg=settings)
+
+    class NoKey:
+        runpod_api_key = ""
+
+    wfmc.run_benchmark(settings, store, NoKey(), conn=workspace["conn"])
+
+    progress = db.get_progress(wfmc.RUNPOD_BENCHMARK_JOB, conn=workspace["conn"])
+    assert progress["status"] == "failed"
+    assert "RUNPOD_API_KEY" in progress["message"]
+
+
+def test_run_benchmark_reports_failed_progress_when_no_routed_universe(workspace, settings):
+    store = DataStore(binance=None, cfg=settings)
+    wfmc.run_benchmark(settings, store, _Secrets(), conn=workspace["conn"])
+
+    progress = db.get_progress(wfmc.RUNPOD_BENCHMARK_JOB, conn=workspace["conn"])
+    assert progress["status"] == "failed"
+    assert "universe" in progress["message"]
+
+
+def test_run_benchmark_reports_progress_per_tier_and_a_done_summary_at_the_end(
+    workspace, settings, monkeypatch
+):
+    from tests.test_runpod import FakeTransport
+
+    conn = workspace["conn"]
+    _seed_universe(conn, {MINT_A: "AAAUSDT"})
+    _seed_minutes(MINT_A, days=1)
+
+    transport = FakeTransport()
+    transport.gpu_prices = {"TIER-CHEAP": 0.3, "TIER-PRICEY": 1.2}
+    client = RunPodClient(
+        api_key="test-key", transport=transport,
+        poll_interval_seconds=0.01, max_poll_seconds=0.05,
+    )
+    orig_create_pod = client.create_pod
+
+    def create_pod_and_arm(*a, **kw):
+        pod = orig_create_pod(*a, **kw)
+        transport.pod_polls_until_stopped[pod["id"]] = 1
+        return pod
+
+    client.create_pod = create_pod_and_arm
+    store = DataStore(binance=None, cfg=settings)
+
+    seen: list[dict] = []
+    original_set_progress = db.set_progress
+
+    def spy(job, **kwargs):
+        if job == wfmc.RUNPOD_BENCHMARK_JOB:
+            seen.append(dict(kwargs))
+        return original_set_progress(job, **kwargs)
+
+    monkeypatch.setattr("solbot.wfmc.db.set_progress", spy)
+
+    result = wfmc.run_benchmark(
+        settings, store, _Secrets(), conn=conn, runpod_client=client,
+        tiers=["TIER-CHEAP", "TIER-PRICEY"], max_seconds=0.05,
+    )
+    assert result["ran"]
+
+    statuses = [s["status"] for s in seen]
+    assert statuses[0] == "running"      # reported at start, before any tier
+    assert statuses[-1] == "done"        # a final done/failed state at the end
+    assert any(
+        s["status"] == "running" and "tier 1 of 2" in s.get("message", "") for s in seen
+    )
+    assert any(
+        s["status"] == "running" and "tier 2 of 2" in s.get("message", "") for s in seen
+    )
+
+    final = db.get_progress(wfmc.RUNPOD_BENCHMARK_JOB, conn=conn)
+    assert final["status"] == "done"
+    assert final["done"] == final["total"] == 2
+    assert "benchmark finished" in final["message"].lower()
+
+
+def test_run_benchmark_reports_failed_progress_when_it_could_not_start(workspace, settings):
+    from solbot.runpod import RunPodError
+
+    conn = workspace["conn"]
+    _seed_universe(conn, {MINT_A: "AAAUSDT"})
+    _seed_minutes(MINT_A, days=1)
+
+    class ExplodingClient:
+        def benchmark_tiers(self, *a, **kw):
+            raise RunPodError("simulated launch failure")
+
+    store = DataStore(binance=None, cfg=settings)
+    result = wfmc.run_benchmark(
+        settings, store, _Secrets(), conn=conn, runpod_client=ExplodingClient(),
+        tiers=["TIER-A"],
+    )
+
+    assert not result["ran"]
+    progress = db.get_progress(wfmc.RUNPOD_BENCHMARK_JOB, conn=conn)
+    assert progress["status"] == "failed"
+    assert "simulated launch failure" in progress["message"]
+
+
+# --------------------------------------------------------------------------
 # Fuzzy-regime section, step 5: manual trigger + progress - dispatched to
 # RunPod exactly like run_monthly, never run in-process on the droplet.
 # --------------------------------------------------------------------------

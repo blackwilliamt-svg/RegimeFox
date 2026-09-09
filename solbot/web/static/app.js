@@ -469,9 +469,10 @@
     box.innerHTML = lines.map(function (l) { return "<div>" + l + "</div>"; }).join("");
   });
 
-  /* ---------- progress (backtest page) ---------- */
+  /* ---------- progress (backtest page, settings page) ---------- */
   function loadProgress() {
-    if (!el("pullProgress") && !el("backtestProgress") && !el("regimePassProgress")) {
+    if (!el("pullProgress") && !el("backtestProgress") && !el("regimePassProgress") &&
+        !el("runpodBenchmarkProgress")) {
       return Promise.resolve();
     }
     return get("/api/progress").then(function (d) {
@@ -479,6 +480,16 @@
       bar("dailyPull", d.daily_incremental_pull);
       bar("backtest", d.backtest);
       bar("regimePass", d.regime_pass);
+      bar("runpodBenchmark", d.runpod_benchmark);
+      // Real, billed pods get launched per tier - keep the button from
+      // being clicked again mid-run, the same way a double-click on any
+      // other "launch something real" action in this dashboard is avoided.
+      var benchBtn = el("runpodBenchmarkBtn");
+      if (benchBtn && d.runpod_benchmark) {
+        var running = d.runpod_benchmark.status === "running";
+        benchBtn.disabled = running;
+        benchBtn.textContent = running ? "Running…" : "Run benchmark now";
+      }
       var cov = el("candleCoverage");
       if (cov && d.candle_coverage) {
         var c = d.candle_coverage;
@@ -488,6 +499,28 @@
       }
     });
   }
+
+  // settings.html opts out of the dashboard's general live-polling loop
+  // (data-live="off" - it's a form page, not a live view), so the RunPod
+  // benchmark's progress bar needs its own small trigger to actually poll,
+  // reusing loadProgress()/bar() rather than duplicating their logic.
+  (function wireRunpodBenchmarkProgress() {
+    if (!el("runpodBenchmarkProgress")) return;
+    loadProgress().catch(noop);
+    setInterval(function () { loadProgress().catch(noop); }, POLL_MS);
+  })();
+
+  (function wireRunpodBenchmarkForm() {
+    var form = el("runpodBenchmarkForm");
+    var btn = el("runpodBenchmarkBtn");
+    if (!form || !btn) return;
+    form.addEventListener("submit", function () {
+      // Immediate feedback before the first poll tick lands; loadProgress()
+      // takes over (and can re-enable it) once the job actually starts.
+      btn.disabled = true;
+      btn.textContent = "Running…";
+    });
+  })();
 
   function bar(prefix, p) {
     if (!p) return;

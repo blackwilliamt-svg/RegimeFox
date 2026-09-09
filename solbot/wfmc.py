@@ -26,7 +26,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import db, paramsync
+from . import db, paramsync, secrets_store
 from .candlestore import ParquetCandleStore
 
 log = logging.getLogger(__name__)
@@ -307,7 +307,8 @@ def run_monthly(
     from .runpod import RunPodClient, RunPodError
 
     conn = conn or db.connect()
-    if not secrets.runpod_api_key:
+    runpod_key = secrets_store.resolve_runpod_key(secrets, conn)
+    if not runpod_key:
         return {"ran": False, "reason": "RUNPOD_API_KEY is not configured"}
 
     mints = list(store.pair_map(conn))
@@ -317,7 +318,7 @@ def run_monthly(
     batch_size = int(cfg.get("runpod_batch_size", 75))
     batches = [mints[i : i + batch_size] for i in range(0, len(mints), batch_size)]
 
-    client = runpod_client or RunPodClient(secrets.runpod_api_key)
+    client = runpod_client or RunPodClient(runpod_key)
     jobs: list[dict[str, Any]] = []
     errors: list[str] = []
 
@@ -368,7 +369,8 @@ def run_monthly(
 # --------------------------------------------------------------------------
 # GPU-tier benchmark (gap-closure item 7)
 # --------------------------------------------------------------------------
-RUNPOD_BENCHMARK_KEY = "runpod_benchmark_results"
+RUNPOD_BENCHMARK_KEY = "runpod_benchmark_results"  # the stored result + recommendation
+RUNPOD_BENCHMARK_JOB = "runpod_benchmark"          # live status/progress, dashboard step 4
 
 
 def run_benchmark(
@@ -388,24 +390,48 @@ def run_benchmark(
     Stores the result and a recommendation under RUNPOD_BENCHMARK_KEY for the
     settings page to show; it never changes `runpod_gpu_type` itself - the
     operator confirms that from the numbers, same as every other setting.
+    Live status/progress is reported separately under RUNPOD_BENCHMARK_JOB
+    (db.set_progress) - this launches real billed pods and can take a
+    while, so the dashboard's "Run benchmark now" button has something to
+    show while it's in flight, the same bar()-polling pattern
+    run_regime_pass/run_monthly already use.
     """
     from .runpod import BENCHMARK_TIMEOUT_SECONDS, DEFAULT_BENCHMARK_TIERS, RunPodClient, RunPodError
 
     conn = conn or db.connect()
-    if not secrets.runpod_api_key:
+    tier_list = tiers or DEFAULT_BENCHMARK_TIERS
+
+    runpod_key = secrets_store.resolve_runpod_key(secrets, conn)
+    if not runpod_key:
+        db.set_progress(
+            RUNPOD_BENCHMARK_JOB, status="failed", message="RUNPOD_API_KEY is not configured", conn=conn,
+        )
         return {"ran": False, "reason": "RUNPOD_API_KEY is not configured"}
 
     mints = list(store.pair_map(conn))
     if not mints:
+        db.set_progress(
+            RUNPOD_BENCHMARK_JOB, status="failed", message="no routed universe tokens to test", conn=conn,
+        )
         return {"ran": False, "reason": "no routed universe tokens to test"}
 
-    client = runpod_client or RunPodClient(secrets.runpod_api_key)
+    client = runpod_client or RunPodClient(runpod_key)
     run_id_start = next_run_id(conn)
 
+    db.set_progress(
+        RUNPOD_BENCHMARK_JOB, status="running", done=0, total=len(tier_list),
+        message=f"starting RunPod GPU-tier benchmark: {', '.join(tier_list)}", conn=conn,
+    )
     db.log_event(
-        f"RunPod GPU-tier benchmark started: {', '.join(tiers or DEFAULT_BENCHMARK_TIERS)}.",
+        f"RunPod GPU-tier benchmark started: {', '.join(tier_list)}.",
         category="system", conn=conn,
     )
+
+    def report_tier_progress(index: int, total: int, gpu_type: str) -> None:
+        db.set_progress(
+            RUNPOD_BENCHMARK_JOB, status="running", done=index, total=total,
+            message=f"benchmarking tier {index + 1} of {total}: {gpu_type}", conn=conn,
+        )
 
     try:
         results = client.benchmark_tiers(
@@ -419,8 +445,10 @@ def run_benchmark(
             s3_access_key=getattr(secrets, "runpod_s3_access_key", ""),
             s3_secret_key=getattr(secrets, "runpod_s3_secret_key", ""),
             max_seconds=BENCHMARK_TIMEOUT_SECONDS if max_seconds is None else max_seconds,
+            progress=report_tier_progress,
         )
     except RunPodError as exc:
+        db.set_progress(RUNPOD_BENCHMARK_JOB, status="failed", message=str(exc)[:300], conn=conn)
         db.log_event(
             f"RunPod GPU-tier benchmark could not start: {exc}",
             level="alert", category="system", conn=conn,
@@ -437,7 +465,7 @@ def run_benchmark(
 
     failed = [r.gpu_type for r in results if not r.ok]
     dirty = [r.gpu_type for r in results if r.teardown_clean is False]
-    db.log_event(
+    summary_message = (
         "RunPod GPU-tier benchmark finished: "
         + "; ".join(
             f"{r.gpu_type} {r.elapsed_seconds:.0f}s"
@@ -446,11 +474,22 @@ def run_benchmark(
         )
         + (f". Recommendation: {recommendation}." if recommendation else "")
         + (f" FAILED: {', '.join(failed)}." if failed else "")
-        + (f" NOT CLEANLY TORN DOWN: {', '.join(dirty)}." if dirty else ""),
+        + (f" NOT CLEANLY TORN DOWN: {', '.join(dirty)}." if dirty else "")
+    )
+    db.log_event(
+        summary_message,
         level="alert" if (failed or dirty) else "info",
         category="system",
         detail=payload,
         conn=conn,
+    )
+    # The benchmark itself completed either way (ran=True below) - a per-tier
+    # failure or dirty teardown is called out in the message, not a job-level
+    # "failed" status, which is reserved for the benchmark never starting at
+    # all (missing key, no universe, RunPodError above).
+    db.set_progress(
+        RUNPOD_BENCHMARK_JOB, status="done", done=len(tier_list), total=len(tier_list),
+        message=summary_message, conn=conn,
     )
     return {"ran": True, **payload}
 
@@ -517,7 +556,8 @@ def run_regime_pass(
     from .runpod import RunPodClient, RunPodError
 
     conn = conn or db.connect()
-    if not secrets.runpod_api_key:
+    runpod_key = secrets_store.resolve_runpod_key(secrets, conn)
+    if not runpod_key:
         db.set_progress(
             REGIME_PASS_JOB, status="failed", message="RUNPOD_API_KEY is not configured", conn=conn,
         )
@@ -542,7 +582,7 @@ def run_regime_pass(
         message="dispatching fuzzy regime discovery to RunPod", conn=conn,
     )
 
-    client = runpod_client or RunPodClient(secrets.runpod_api_key)
+    client = runpod_client or RunPodClient(runpod_key)
     jobs: list[dict[str, Any]] = []
     errors: list[str] = []
 

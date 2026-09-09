@@ -24,9 +24,11 @@ from . import db
 log = logging.getLogger(__name__)
 
 # "bulk_data" is the bearer token a RunPod worker presents to report a run's
-# progress back. Every provider is rotatable from the settings page and falls
-# back to the environment.
-PROVIDERS = ("jupiter", "rugcheck", "bulk_data")
+# progress back. "runpod" is this droplet's own RunPod API key, used to
+# orchestrate the monthly retest / GPU-tier benchmark / fuzzy-regime pass.
+# Every provider is rotatable from the settings page and falls back to the
+# environment.
+PROVIDERS = ("jupiter", "rugcheck", "bulk_data", "runpod")
 
 
 class SecretsUnavailable(RuntimeError):
@@ -117,6 +119,7 @@ def _env_keys(secrets: Any) -> dict[str, str]:
         "jupiter": secrets.jupiter_api_key,
         "rugcheck": secrets.rugcheck_api_key,
         "bulk_data": getattr(secrets, "bulk_data_token", ""),
+        "runpod": getattr(secrets, "runpod_api_key", ""),
     }
 
 
@@ -133,6 +136,24 @@ def effective_keys(secrets: Any, encryption_key: str, conn: sqlite3.Connection |
         if stored:
             out[provider] = stored
     return out
+
+
+def resolve_runpod_key(secrets: Any, conn: sqlite3.Connection | None = None) -> str:
+    """RunPod's rotated-or-env key - the same "dashboard rotation wins over
+    the environment" rule every other provider gets (effective_keys()),
+    but standalone rather than routed through it: wfmc.py's monthly-run /
+    benchmark / regime-pass orchestration only ever wants this one
+    provider, and is exercised in tests against lightweight ``secrets``
+    doubles that intentionally don't define jupiter/rugcheck/bulk_data's
+    fields too - effective_keys() would AttributeError on those.
+    """
+    conn = conn or db.connect()
+    encryption_key = getattr(secrets, "secret_encryption_key", "") or ""
+    try:
+        stored = read_key("runpod", encryption_key, conn)
+    except SecretsUnavailable:
+        stored = None
+    return stored or (getattr(secrets, "runpod_api_key", "") or "")
 
 
 def key_status(

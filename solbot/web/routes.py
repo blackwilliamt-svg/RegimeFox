@@ -108,7 +108,7 @@ def walkforward():
 
 @bp.route("/settings")
 def settings():
-    from ..wfmc import RUNPOD_BENCHMARK_KEY
+    from ..wfmc import RUNPOD_BENCHMARK_JOB, RUNPOD_BENCHMARK_KEY
 
     config = cfg()
     return render_template(
@@ -120,6 +120,7 @@ def settings():
         .execute("SELECT * FROM settings_audit ORDER BY id DESC LIMIT 40")
         .fetchall(),
         runpod_benchmark=db.kv_get(RUNPOD_BENCHMARK_KEY, {}),
+        runpod_benchmark_progress=db.get_progress(RUNPOD_BENCHMARK_JOB),
     )
 
 
