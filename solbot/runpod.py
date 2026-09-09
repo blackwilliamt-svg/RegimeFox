@@ -38,10 +38,14 @@ MAX_POLL_SECONDS = 4 * 3600
 POLL_INTERVAL_SECONDS = 30
 
 # Candidate tiers for manage.py benchmark-runpod, in the price band this bot's
-# job size actually needs - the same "believed correct, verify against
-# RunPod's live catalog before trusting it" caveat as the module docstring
-# applies to these three names as much as to anything else here.
-DEFAULT_BENCHMARK_TIERS = ["NVIDIA RTX 4090", "NVIDIA RTX 3090", "NVIDIA RTX A5000"]
+# job size actually needs. Must match RunPod's REST API's own gpuTypeIds
+# enum exactly (confirmed against GET /v1/openapi.json's PodCreateInput
+# schema after a real benchmark run) - the consumer cards are listed under
+# their full "GeForce" name ("NVIDIA GeForce RTX 4090", not "NVIDIA RTX
+# 4090"); the workstation card's short name was already correct.
+DEFAULT_BENCHMARK_TIERS = [
+    "NVIDIA GeForce RTX 4090", "NVIDIA GeForce RTX 3090", "NVIDIA RTX A5000",
+]
 # A representative slice, not the real monthly job - enough to compare
 # per-tier throughput without paying for (or waiting through) the genuine
 # multi-hour run on three GPUs just to benchmark them.
@@ -293,7 +297,12 @@ class RunPodClient:
                 "imageName": self.image,
                 "gpuTypeIds": [gpu_type],
                 "networkVolumeId": volume_id,
-                "env": [{"key": k, "value": v} for k, v in env.items()],
+                # A plain {key: value} object, not a list of {key, value}
+                # pairs - the latter is what a real pod-creation call's own
+                # 400 flagged as not matching PodCreateInput's schema (env's
+                # type there is "object", confirmed against GET
+                # /v1/openapi.json).
+                "env": dict(env),
                 "containerDiskInGb": 20,
                 "volumeMountPath": "/data",
             },

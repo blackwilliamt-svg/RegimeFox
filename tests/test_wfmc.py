@@ -473,7 +473,10 @@ def test_run_regime_pass_launches_a_runpod_batch_per_chunk_and_verifies_teardown
     pod_calls = [c for c in transport.calls if c[0] == "POST" and c[1] == "/pods"]
     assert len(pod_calls) == 2
     for _, _, body in pod_calls:
-        env = {e["key"]: e["value"] for e in body["env"]}
+        # A plain {key: value} object - RunPod's PodCreateInput schema, not
+        # a list of {key, value} pairs (a real pod-creation call's own 400
+        # is what caught that mismatch).
+        env = body["env"]
         assert env["SOLOPT_JOB_KIND"] == "regime-pass"
         assert env["SOLOPT_REGIME_K_RANGE"] == "4,5,6"
 
