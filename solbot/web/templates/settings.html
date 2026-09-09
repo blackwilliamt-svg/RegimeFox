@@ -71,7 +71,7 @@
     <table>
       <thead>
         <tr><th>Tier</th><th class="num">Time</th><th class="num">Cost</th>
-          <th class="num">$/1000 combos</th><th>Teardown</th></tr>
+          <th class="num">$/1000 combos</th><th>Teardown</th><th>Error</th></tr>
       </thead>
       <tbody>
         {% for r in runpod_benchmark['results'] %}
@@ -85,6 +85,7 @@
             {% elif r.teardown_clean == false %}<span class="neg">NOT CLEAN</span>
             {% else %}—{% endif %}
           </td>
+          <td class="hint">{{ r.error or '—' }}</td>
         </tr>
         {% endfor %}
       </tbody>
