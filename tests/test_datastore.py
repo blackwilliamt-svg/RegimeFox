@@ -174,10 +174,14 @@ def test_estimate_pull_falls_back_to_a_sane_default_rps_when_unconfigured():
 
 
 # --------------------------------------------------------------------------
-# Historical-pull fix-up section 6: an optional top_n scopes pair_map() to
-# the top N routed mints by market cap - a one-off narrowing for the manual
-# historical-pull button only, never touching the universe table's own
-# filters or any other caller.
+# pair_map()'s optional top_n scopes it to the top N routed mints by market
+# cap, never touching the universe table's own filters or any other
+# caller. It was briefly the manual historical-pull button's own scoping
+# mechanism; a later fix-up (section 6, "replace the historical pull
+# entirely") retired that in favour of always pulling every Binance.US
+# pair's full history instead - see DataStore.full_binance_pairs()/
+# full_history_backfill() and tests/test_full_history_pull.py. top_n
+# itself stays as a general DataStore capability (still exercised here).
 # --------------------------------------------------------------------------
 def _seed_universe_row(conn, mint: str, pair: str, *, mcap: float | None, volume: float) -> None:
     conn.execute(

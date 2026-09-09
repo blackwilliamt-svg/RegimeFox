@@ -1,15 +1,20 @@
-"""Settings fix-up section 7: the historical-pull form's previously-bare
-"months" number field gets a visible label, and market-cap ranking (added
-in section 6) is confirmed to use real data already flowing through
-/api/universe rather than a proxy.
+"""The historical-pull page went through two fix-ups in sequence:
 
-Real market cap already existed in this codebase before this fix-up:
-universe.mcap (solbot/db.py's schema) is populated straight from Jupiter's
-token API on every universe refresh (solbot/universe.py's _persist()) -
-the same source liquidity_usd/volume_24h_usd already come from. Section
-6's top_n ranking (tests/test_datastore.py) uses that column directly, so
-there is no CoinGecko integration or new column here - see that section's
-commit message for the full explanation.
+1. A settings fix-up gave the previously-bare "months" and "top N coins"
+   number fields visible labels.
+2. Combined fix-up section 6 ("replace the historical pull entirely") then
+   removed both of those fields outright - the pull always covers every
+   Binance.US pair's full available history now, with nothing left to
+   scope. This file's first two tests were rewritten from "the fields have
+   labels" to "the fields are gone" for that reason; see
+   tests/test_full_history_pull.py for the new behaviour's own coverage.
+
+The market-cap test below predates and is independent of both fix-ups: it
+confirms /api/universe already surfaces real market cap data
+(universe.mcap, populated straight from Jupiter's token API on every
+universe refresh - solbot/universe.py's _persist()) rather than a proxy,
+which pair_map()'s still-existing top_n ranking (tests/test_datastore.py)
+relies on.
 """
 from __future__ import annotations
 
@@ -48,21 +53,27 @@ def client(app):
     return c
 
 
-def test_months_field_has_a_visible_label(client, workspace):
+def test_the_months_field_is_gone(client, workspace):
+    """Section 6 removed it entirely - there is nothing left to scope."""
     resp = client.get("/backtest")
     assert resp.status_code == 200
     body = resp.data.decode("utf-8")
-    # A <label for="pullMonths"> wrapping/preceding the input, not just a
-    # bare <input id="pullMonths">.
-    assert 'for="pullMonths"' in body
-    assert "Months of history" in body
+    assert 'id="pullMonths"' not in body
+    assert 'name="months"' not in body
 
 
-def test_top_n_field_also_has_a_visible_label(client, workspace):
+def test_the_top_n_field_is_gone(client, workspace):
     resp = client.get("/backtest")
     body = resp.data.decode("utf-8")
-    assert 'for="pullTopN"' in body
-    assert "Top N coins" in body
+    assert 'id="pullTopN"' not in body
+    assert 'name="top_n"' not in body
+
+
+def test_the_pull_form_posts_with_no_scoping_fields_at_all(client, workspace):
+    resp = client.get("/backtest")
+    body = resp.data.decode("utf-8")
+    assert 'id="pullBtn"' in body
+    assert "Start historical pull" in body
 
 
 def test_universe_api_already_surfaces_market_cap(client, workspace):

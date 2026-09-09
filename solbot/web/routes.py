@@ -274,18 +274,14 @@ def regime_pass():
 
 @bp.route("/backtest/pull", methods=["POST"])
 def historical_pull():
-    months = request.form.get("months", type=int)
-    top_n = request.form.get("top_n", type=int)
-    payload: dict[str, Any] = {}
-    if months:
-        payload["months"] = months
-    if top_n:
-        payload["top_n"] = top_n
-    _enqueue("historical_pull", payload)
+    """Always every Binance.US pair, always its full available history -
+    no scoping parameters at all (dashboard fix-up section 6 replaces the
+    old months/top-N-scoped form entirely)."""
+    _enqueue("historical_pull", {})
     flash(
-        (f"Historical pull queued for the top {top_n} tokens by market cap. "
-         if top_n else "Historical pull queued. ")
-        + "Progress will appear here; this is the heavy one-time load, so it is rate limited.",
+        "Full Binance.US history pull queued - every listed pair, its full available "
+        "history. Progress will appear here; this is the heavy one-time load, so it is "
+        "rate limited.",
         "success",
     )
     return redirect(url_for("dashboard.backtest"))

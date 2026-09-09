@@ -61,6 +61,17 @@ class ParquetCandleStore:
     def _month_path(self, mint: str, interval: str, label: str) -> Path:
         return self._coin_dir(mint, interval) / f"{label}.parquet"
 
+    def all_mints(self, interval: str) -> list[str]:
+        """Every mint/symbol key that has any file on disk at ``interval`` -
+        the per-coin coverage list (dashboard fix-up section 6) wants every
+        coin with history stored, not just whatever a caller's own mint
+        list already knows about (a coin no longer, or never, in the routed
+        universe still shows up here if its candles are on disk)."""
+        d = self.root / interval
+        if not d.exists():
+            return []
+        return sorted(p.name for p in d.iterdir() if p.is_dir())
+
     def months_available(self, mint: str, interval: str) -> list[str]:
         d = self._coin_dir(mint, interval)
         if not d.exists():
@@ -223,6 +234,18 @@ class ParquetCandleStore:
             "last_ts": last_ts,
             "days": round(((last_ts or 0) - (first_ts or 0)) / 86400.0, 1) if last_ts else 0.0,
         }
+
+    def per_mint_coverage(self, interval: str) -> list[dict[str, Any]]:
+        """One row per coin with any history on disk at ``interval`` - the
+        dashboard's per-coin coverage list (fix-up section 6), reusing the
+        exact same per-mint values ``universe_coverage`` already computes
+        and sums, just keeping them separate instead of collapsing them."""
+        out = []
+        for mint in self.all_mints(interval):
+            cov = self.coverage(mint, interval)
+            if cov["bars"]:
+                out.append({"mint": mint, **cov})
+        return out
 
     def universe_coverage(self, mints: Iterable[str], interval: str) -> dict[str, Any]:
         """Aggregate coverage across every coin, for the dashboard's summary card."""

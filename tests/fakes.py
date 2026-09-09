@@ -58,23 +58,38 @@ class FakeBinance:
         assets: list[BinanceAsset] | None = None,
         *,
         klines_fn: Any = None,
+        backward_fn: Any = None,
     ) -> None:
         self._assets = list(assets or [])
         # (pair, since, until) -> list[Candle]; default is "nothing on record",
         # which is what most callers of this fake actually want.
         self._klines_fn = klines_fn or (lambda pair, since, until: [])
+        # pair -> list[Candle]; the full-history backfill's own paging
+        # (dashboard fix-up section 6) - a fake stands in for the whole
+        # backward walk rather than simulating it page by page.
+        self._backward_fn = backward_fn or (lambda pair: [])
         self.calls = 0
         self.klines_calls: list[tuple[str, int, int]] = []
+        self.backward_calls: list[str] = []
 
     def top_bases(self, limit: int = 100) -> list[BinanceAsset]:
         self.calls += 1
         ranked = sorted(self._assets, key=lambda a: a.quote_volume_24h, reverse=True)
         return ranked[: max(0, int(limit))]
 
+    def all_bases(self) -> list[BinanceAsset]:
+        self.calls += 1
+        return sorted(self._assets, key=lambda a: a.quote_volume_24h, reverse=True)
+
     def klines_range(self, pair: str, *, since: int, until: int):
         self.calls += 1
         self.klines_calls.append((pair, since, until))
         return self._klines_fn(pair, since, until)
+
+    def klines_backward(self, pair: str, *, until: int | None = None, max_pages: int = 10_000):
+        self.calls += 1
+        self.backward_calls.append(pair)
+        return self._backward_fn(pair)
 
     def close(self) -> None:
         pass

@@ -111,12 +111,21 @@ class DataStore:
         limit: int | None = None,
         since: int | None = None,
         until: int | None = None,
+        target_seconds: int | None = None,
         conn: sqlite3.Connection | None = None,   # kept for call-site symmetry; unused
     ) -> pd.DataFrame:
-        """Candles at the configured timeframe, aggregating the 1m base up."""
+        """Candles at the configured timeframe, aggregating the 1m base up.
+
+        ``target_seconds``, when given, overrides the configured trading
+        timeframe for this one call - the market chart's timeframe control
+        (dashboard fix-up section 2) asks for whatever interval the operator
+        picked, independent of ``candle_minutes``, without that picking
+        also changing what the live strategy itself trades on.
+        """
+        target = int(target_seconds) if target_seconds else self.target_seconds
         raw_limit = None
         if limit:
-            factor = max(1, self.target_seconds // BASE_SECONDS)
+            factor = max(1, target // BASE_SECONDS)
             raw_limit = limit * factor + factor
         raw = self.candles.read_range(
             mint, self.base_interval, since=since, until=until, limit=raw_limit
@@ -124,8 +133,8 @@ class DataStore:
         df = to_frame(raw)
         if df.empty:
             return df
-        if self.needs_aggregation():
-            df = resample(df, self.target_seconds)
+        if target != BASE_SECONDS:
+            df = resample(df, target)
         if limit:
             df = df.tail(limit).reset_index(drop=True)
         return df
@@ -397,6 +406,158 @@ class DataStore:
         db.log_event(
             f"Historical pull finished: {result.candles_written:,} candles, "
             f"{result.tokens_done}/{total} tokens"
+            + (f" - stopped early: {result.stopped_early}" if result.stopped_early else ""),
+            level="warn" if result.stopped_early else "info",
+            category="system",
+            detail=result.as_dict(),
+            conn=conn,
+        )
+        return result
+
+    # ------------------------------------------------------------------
+    # Full Binance.US history pull (dashboard fix-up section 6) - "replace
+    # the historical pull entirely": every Binance.US pair, its full
+    # available history, never scoped by the routed `universe` table or its
+    # liquidity/volume floors. Deliberately separate methods from
+    # bulk_backfill/estimate_pull/run_initial_pull above rather than a mode
+    # flag bolted onto them - manage.py's own `pull` CLI command still uses
+    # those, scoped to the routed universe with a fixed months window, and
+    # section 6 never asked to change that command.
+    # ------------------------------------------------------------------
+    # Binance.US launched in 2019; no pair can have more history than that,
+    # though almost every pair's own listing is much shorter. There is no
+    # exchange-info "listed since" field to compute an exact figure from
+    # before paging actually discovers it, so this is always reported as an
+    # upper bound, never as a real estimate.
+    ASSUMED_MAX_HISTORY_YEARS = 7
+
+    def full_binance_pairs(self) -> dict[str, str]:
+        """``{base_symbol: pair}`` for every base asset Binance.US currently
+        lists - most have no Solana mint at all, so this is keyed by the
+        base symbol itself (e.g. "BTC"), not a mint address. Entirely
+        independent of the routed `universe` table."""
+        return {a.symbol: a.pair for a in self.binance.all_bases()}
+
+    def estimate_full_pull(self, token_count: int) -> dict[str, Any]:
+        """Upper-bound cost of a full-history pull across `token_count`
+        pairs, assuming every one of them goes all the way back to
+        ASSUMED_MAX_HISTORY_YEARS - always the ceiling, since most pairs'
+        real history is much shorter and there is no way to know how much
+        shorter before actually paging backward through it."""
+        seconds_of_history = self.ASSUMED_MAX_HISTORY_YEARS * 365.25 * 86400
+        calls_per_token = max(
+            1, -(-int(seconds_of_history) // (MAX_KLINES_PER_CALL * BASE_SECONDS))
+        )
+        calls = token_count * calls_per_token
+        rps = max(0.1, float(self.cfg.get("binance_rps", 5.0)))
+        seconds = calls / rps
+        return {
+            "tokens": token_count,
+            "calls": calls,
+            "seconds_estimate": int(seconds),
+            "hours_estimate": round(seconds / 3600.0, 2),
+            "upper_bound": True,
+            "assumed_years": self.ASSUMED_MAX_HISTORY_YEARS,
+        }
+
+    def full_history_backfill(
+        self,
+        pairs: dict[str, str],
+        *,
+        conn: sqlite3.Connection | None = None,
+        progress: Callable[[int, int, str], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> PullReport:
+        """Every pair's full available history - paging backward per pair
+        until Binance.US returns an empty page, never a fixed months
+        window. `pairs` is expected to be `full_binance_pairs()`'s own
+        mapping (base symbol -> Binance pair), not the routed universe."""
+        conn = conn or db.connect()
+        report = PullReport(tokens_requested=len(pairs))
+
+        for idx, (key, pair) in enumerate(pairs.items(), start=1):
+            if should_stop and should_stop():
+                report.stopped_early = "cancelled"
+                break
+            try:
+                candles = self.binance.klines_backward(pair)
+            except ApiError as exc:
+                log.warning("full-history backfill failed for %s: %s", pair, exc)
+                report.tokens_failed += 1
+                if progress:
+                    progress(idx, len(pairs), pair)
+                continue
+
+            report.calls += max(1, -(-len(candles) // MAX_KLINES_PER_CALL))
+            if candles:
+                report.candles_written += self.candles.append(
+                    key, self.base_interval, [c.as_row() for c in candles],
+                    incremental=False,
+                )
+            report.tokens_done += 1
+            if progress:
+                progress(idx, len(pairs), pair)
+
+        return report
+
+    def run_full_history_pull(
+        self,
+        pairs: dict[str, str],
+        *,
+        conn: sqlite3.Connection | None = None,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> PullReport:
+        """The full-history backfill with dashboard progress reporting
+        attached - reuses the historical-pull job key/progress slot
+        (JOB_INITIAL_PULL); the dashboard's pull screen always runs this
+        now instead of the old months/top-N-scoped pull."""
+        conn = conn or db.connect()
+        total = len(pairs)
+        db.set_progress(
+            JOB_INITIAL_PULL,
+            status="running",
+            done=0,
+            total=total,
+            message=f"Starting a full-history pull for all {total} Binance.US pairs",
+            conn=conn,
+        )
+
+        def report_progress(done: int, tot: int, pair: str) -> None:
+            db.set_progress(
+                JOB_INITIAL_PULL,
+                status="running",
+                done=done,
+                total=tot,
+                message=f"Pulling full Binance.US history — {done} of {tot} pairs complete ({pair} now)",
+                conn=conn,
+            )
+
+        try:
+            result = self.full_history_backfill(
+                pairs, conn=conn, progress=report_progress, should_stop=should_stop,
+            )
+        except Exception as exc:
+            db.set_progress(
+                JOB_INITIAL_PULL, status="failed", message=str(exc)[:300], conn=conn
+            )
+            db.log_event(
+                f"Full-history pull failed: {exc}", level="alert", category="system", conn=conn
+            )
+            raise
+
+        status = "done" if not result.stopped_early else "failed"
+        db.set_progress(
+            JOB_INITIAL_PULL,
+            status=status,
+            done=result.tokens_done,
+            total=total,
+            message=result.stopped_early
+            or f"{result.candles_written:,} candles across {result.tokens_done} pairs",
+            conn=conn,
+        )
+        db.log_event(
+            f"Full Binance.US history pull finished: {result.candles_written:,} candles, "
+            f"{result.tokens_done}/{total} pairs"
             + (f" - stopped early: {result.stopped_early}" if result.stopped_early else ""),
             level="warn" if result.stopped_early else "info",
             category="system",

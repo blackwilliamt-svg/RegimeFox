@@ -177,9 +177,83 @@
   /* ---------- market chart (always visible, dropdown over the universe) ---------- */
   var marketUniverse = [];        // [{mint, symbol, label}], sorted by volume desc (server order)
   var marketMint = null;          // currently displayed mint
+  var marketLastKey = null;       // mint+interval last rendered, to know when to reset zoom/pan
   var marketUniverseLoaded = false;
   var MARKET_CHART_HEIGHT = 600;  // the dashboard's dominant panel, not one among equals
   var MARKET_RSI_HEIGHT = 110;
+
+  /* ---- timeframe/range controls: interval matches solbot/web/api.py's
+   * CHART_INTERVALS exactly (only intervals that roll up cleanly from the
+   * 1-minute base); range picks how many candles at that interval covers
+   * roughly the named wall-clock span, capped at the server's 1000 limit -
+   * persisted in localStorage the same way the indicator picker is. ---- */
+  var TIMEFRAME_STORAGE_KEY = "solbot-market-timeframe";
+  var INTERVAL_SECONDS = { "1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400 };
+  var RANGE_DAYS = { "1D": 1, "1W": 7, "1M": 30, "3M": 90, "1Y": 365, "All": 100000 };
+  var marketInterval = "1m";
+  var marketRange = "1W";
+
+  (function loadTimeframeSettings() {
+    var saved = null;
+    try { saved = JSON.parse(localStorage.getItem(TIMEFRAME_STORAGE_KEY) || "null"); } catch (e) { /* ignore */ }
+    if (saved && INTERVAL_SECONDS[saved.interval]) marketInterval = saved.interval;
+    if (saved && RANGE_DAYS[saved.range]) marketRange = saved.range;
+  })();
+
+  function saveTimeframeSettings() {
+    try {
+      localStorage.setItem(TIMEFRAME_STORAGE_KEY, JSON.stringify({ interval: marketInterval, range: marketRange }));
+    } catch (e) { /* private mode */ }
+  }
+
+  function marketLimit() {
+    var seconds = INTERVAL_SECONDS[marketInterval] || 60;
+    var days = RANGE_DAYS[marketRange] || 7;
+    return Math.max(20, Math.min(1000, Math.ceil((days * 86400) / seconds)));
+  }
+
+  function syncTimeframeButtons() {
+    var intervalGroup = el("marketIntervalGroup");
+    var rangeGroup = el("marketRangeGroup");
+    if (intervalGroup) {
+      var ibtns = intervalGroup.querySelectorAll("button");
+      for (var i = 0; i < ibtns.length; i++) {
+        ibtns[i].classList.toggle("active", ibtns[i].getAttribute("data-interval") === marketInterval);
+      }
+    }
+    if (rangeGroup) {
+      var rbtns = rangeGroup.querySelectorAll("button");
+      for (var j = 0; j < rbtns.length; j++) {
+        rbtns[j].classList.toggle("active", rbtns[j].getAttribute("data-range") === marketRange);
+      }
+    }
+  }
+
+  (function wireTimeframeButtons() {
+    var intervalGroup = el("marketIntervalGroup");
+    var rangeGroup = el("marketRangeGroup");
+    if (intervalGroup) {
+      intervalGroup.addEventListener("click", function (ev) {
+        var btn = ev.target.closest && ev.target.closest("button[data-interval]");
+        if (!btn) return;
+        marketInterval = btn.getAttribute("data-interval");
+        saveTimeframeSettings();
+        syncTimeframeButtons();
+        loadMarketChart().catch(noop);
+      });
+    }
+    if (rangeGroup) {
+      rangeGroup.addEventListener("click", function (ev) {
+        var btn = ev.target.closest && ev.target.closest("button[data-range]");
+        if (!btn) return;
+        marketRange = btn.getAttribute("data-range");
+        saveTimeframeSettings();
+        syncTimeframeButtons();
+        loadMarketChart().catch(noop);
+      });
+    }
+    syncTimeframeButtons();
+  })();
 
   function marketLabel(row) {
     return (row.symbol || row.mint.slice(0, 8)) + " — " + row.mint.slice(0, 6) + "…";
@@ -302,15 +376,20 @@
       var toggle = el("marketRegimeToggle");
       var withRegime = toggle && toggle.checked;
       var settings = readIndicatorFormInto(loadIndicatorSettings());
-      var url = "/api/candles/" + encodeURIComponent(marketMint) + "?limit=200" +
+      var url = "/api/candles/" + encodeURIComponent(marketMint) +
+        "?limit=" + marketLimit() + "&interval=" + encodeURIComponent(marketInterval) +
         (withRegime ? "&regime=1" : "") + indicatorQuery(settings);
       return get(url).then(function (d) {
         var ind = d.indicators || {};
+        var resetZoom = marketLastKey !== (marketMint + "|" + marketInterval);
+        marketLastKey = marketMint + "|" + marketInterval;
         window.SolChart.candles(canvas, d.candles, {
           height: MARKET_CHART_HEIGHT,
           regime: withRegime && d.regime ? d.regime.history : null,
           volume: settings.volume,
-          overlays: { sma: ind.sma, ema: ind.ema, bbands: ind.bbands }
+          overlays: { sma: ind.sma, ema: ind.ema, bbands: ind.bbands },
+          enableZoomPan: true,
+          resetZoom: resetZoom
         });
         renderRegimeReadout(withRegime, d.regime);
 
@@ -490,6 +569,15 @@
         benchBtn.disabled = running;
         benchBtn.textContent = running ? "Running…" : "Run benchmark now";
       }
+      // Same double-submission guard as the RunPod benchmark button: a full
+      // Binance.US pull is a long, rate-limited job, so clicking it again
+      // mid-run would just queue a second one on top of the first.
+      var pullBtn = el("pullBtn");
+      if (pullBtn && d.historical_pull) {
+        var pullRunning = d.historical_pull.status === "running";
+        pullBtn.disabled = pullRunning;
+        pullBtn.textContent = pullRunning ? "Running…" : "Start historical pull";
+      }
       var cov = el("candleCoverage");
       if (cov && d.candle_coverage) {
         var c = d.candle_coverage;
@@ -539,35 +627,87 @@
 
   /* ---------- backfill timing estimate (backtest page) ---------- */
   function loadBackfillEstimate() {
-    var input = el("pullMonths");
     var out = el("pullEstimate");
-    if (!input || !out) return Promise.resolve();
-    var months = parseInt(input.value, 10) || 12;
-    return get("/api/backfill/estimate?months=" + months).then(function (d) {
+    if (!out) return Promise.resolve();
+    return get("/api/backfill/estimate").then(function (d) {
+      if (d.error) { out.textContent = d.error; return; }
       var hours = d.hours_estimate;
       if (hours === undefined || hours === null) { out.textContent = "—"; return; }
-      var line = "~" + hours.toFixed(1) + "h for " + (d.tokens || 0) + " coins × " +
-        d.months + " month" + (d.months === 1 ? "" : "s") +
-        " at the current binance_rps (" + d.calls.toLocaleString() + " API calls).";
-      if (!d.within_target) {
-        line += " Exceeds the " + d.target_hours + "h target — narrow the window or " +
-          "raise binance_rps in settings.";
-      }
-      out.textContent = line;
-      out.className = "hint " + (d.within_target ? "" : "warn");
+      out.textContent = "Upper bound: ~" + hours.toFixed(1) + "h for " + (d.tokens || 0) +
+        " Binance.US pairs, assuming every one goes back the full " + d.assumed_years +
+        " years (" + d.calls.toLocaleString() + " API calls at the current binance_rps). " +
+        "Most pairs' real history is much shorter than that.";
+      out.className = "hint";
     });
   }
 
-  (function wireBackfillEstimate() {
-    var input = el("pullMonths");
-    if (!input) return;
-    var timer = null;
-    input.addEventListener("input", function () {
-      clearTimeout(timer);
-      timer = setTimeout(function () { loadBackfillEstimate().catch(noop); }, 300);
-    });
+  (function wirePullButton() {
+    if (!el("pullEstimate")) return;
     loadBackfillEstimate().catch(noop);
+    var form = el("pullForm");
+    var btn = el("pullBtn");
+    if (form && btn) {
+      form.addEventListener("submit", function () {
+        btn.disabled = true;
+        btn.textContent = "Running…";
+      });
+    }
   })();
+
+  /* ---------- per-coin candle coverage (backtest page) ---------- */
+  var coverageData = [];
+  var coverageSort = { key: "candles", dir: "desc" };
+
+  function loadCoverage() {
+    var body = el("coverageRows");
+    if (!body) return Promise.resolve();
+    return get("/api/candles/coverage").then(function (rows) {
+      coverageData = rows || [];
+      setText("coverageSummary", coverageData.length + " coin" +
+        (coverageData.length === 1 ? "" : "s") + " with history on disk");
+      renderCoverage();
+    });
+  }
+
+  function renderCoverage() {
+    var body = el("coverageRows");
+    if (!body) return;
+    if (!coverageData.length) {
+      body.innerHTML = "<tr><td colspan='5' class='empty'>No candle history on disk yet</td></tr>";
+      return;
+    }
+    var key = coverageSort.key, dir = coverageSort.dir === "asc" ? 1 : -1;
+    var field = { symbol: "symbol", candles: "bars", first_ts: "first_ts", last_ts: "last_ts", days: "days" }[key] || "bars";
+    var sorted = coverageData.slice().sort(function (a, b) {
+      var av = a[field], bv = b[field];
+      if (typeof av === "string" || typeof bv === "string") {
+        return dir * String(av || "").localeCompare(String(bv || ""));
+      }
+      return dir * ((av || 0) - (bv || 0));
+    });
+    body.innerHTML = sorted.map(function (r) {
+      return "<tr><td class='mono'>" + esc(r.symbol) + "</td>" +
+        "<td class='num'>" + (r.bars || 0).toLocaleString() + "</td>" +
+        "<td class='nowrap'>" + (r.first_ts ? fmtTime(r.first_ts) : "—") + "</td>" +
+        "<td class='nowrap'>" + (r.last_ts ? fmtTime(r.last_ts) : "—") + "</td>" +
+        "<td class='num'>" + (r.days || 0) + "</td></tr>";
+    }).join("");
+  }
+
+  document.addEventListener("click", function (ev) {
+    var th = ev.target.closest && ev.target.closest("th.sortable[data-sort]");
+    var coverageBody = el("coverageRows");
+    if (!th || !coverageBody) return;
+    var table = th.closest("table");
+    if (!table || !table.contains(coverageBody)) return;
+    var key = th.getAttribute("data-sort");
+    var same = coverageSort.key === key;
+    coverageSort = { key: key, dir: same && coverageSort.dir === "desc" ? "asc" : "desc" };
+    var headers = th.parentElement.querySelectorAll("th.sortable");
+    for (var i = 0; i < headers.length; i++) headers[i].classList.remove("sort-asc", "sort-desc");
+    th.classList.add(coverageSort.dir === "asc" ? "sort-asc" : "sort-desc");
+    renderCoverage();
+  });
 
   /* ---------- walk-forward tab ---------- */
   var wfFeedSince = 0;
@@ -1081,6 +1221,7 @@
     loadParamSync().catch(noop);
     loadWfmcStorage().catch(noop);
     loadSensitivity().catch(noop);
+    loadCoverage().catch(noop);
   }
 
   if (document.body.dataset.live !== "off") {

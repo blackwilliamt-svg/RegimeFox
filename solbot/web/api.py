@@ -125,6 +125,17 @@ def _last_tick(mint: str, conn: Any) -> float:
     return float(row["price"]) if row else 0.0
 
 
+# Every target interval the market chart's timeframe control (dashboard
+# fix-up section 2) can request, each an exact multiple of the 1-minute
+# base so resample()'s bucket math (ts // target_seconds) always lands on
+# a clean boundary. Only offering intervals that roll up cleanly from that
+# base is the same constraint solopt/dataset.py's own rollup() targets are
+# chosen under.
+CHART_INTERVALS = {
+    "1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400,
+}
+
+
 @bp.get("/candles/<mint>")
 def candles(mint: str):
     """OHLCV for one token plus its markers, for the per-position chart."""
@@ -134,6 +145,7 @@ def candles(mint: str):
     config = cfg()
     conn = db.connect()
     limit = min(int(request.args.get("limit", 200)), 1000)
+    target_seconds = CHART_INTERVALS.get(request.args.get("interval", ""))
 
     clients = current_app.config.get("SOLBOT_CLIENTS")
     if clients is None:
@@ -141,7 +153,7 @@ def candles(mint: str):
         current_app.config["SOLBOT_CLIENTS"] = clients
     store = DataStore(clients.binance, config.as_dict())
 
-    df = store.candles_for(mint, limit=limit, conn=conn)
+    df = store.candles_for(mint, limit=limit, target_seconds=target_seconds, conn=conn)
     series = [
         {
             "time": int(r.ts),
@@ -362,19 +374,50 @@ def universe():
 
 @bp.get("/backfill/estimate")
 def backfill_estimate():
-    """Real cost of a bulk historical pull, before the operator commits to
-    one - see DataStore.estimate_pull() for why this replaced a rough guess.
+    """Upper-bound cost of the full Binance.US history pull (dashboard
+    fix-up section 6) - every currently-listed pair, at an assumed worst
+    case history depth (see DataStore.estimate_full_pull()), since there
+    is no scoping left to estimate a narrower number from and no exchange-
+    info field that would say how far back any given pair's own listing
+    actually goes before the pull itself discovers it.
     """
+    from ..clients import build_clients
     from ..datastore import DataStore
 
     config = cfg()
-    conn = db.connect()
-    months = request.args.get("months", type=int) or int(config["bulk_backfill_months"])
-    months = max(1, min(months, 96))
-    token_count = conn.execute("SELECT COUNT(*) AS n FROM universe").fetchone()["n"]
+    clients = current_app.config.get("SOLBOT_CLIENTS")
+    if clients is None:
+        clients = build_clients(config)
+        current_app.config["SOLBOT_CLIENTS"] = clients
+    store = DataStore(clients.binance, config.as_dict())
 
-    store = DataStore(None, config.as_dict())
-    return jsonify(store.estimate_pull(token_count, months))
+    try:
+        token_count = len(store.full_binance_pairs())
+    except Exception:
+        log.debug("could not reach Binance.US for the pull estimate", exc_info=True)
+        return jsonify({"error": "could not reach Binance.US to size the estimate"}), 200
+
+    return jsonify(store.estimate_full_pull(token_count))
+
+
+@bp.get("/candles/coverage")
+def candles_coverage():
+    """Per-coin candle coverage (dashboard fix-up section 6) - every coin
+    with any history on disk, whether or not it is in the routed universe
+    right now, unlike /api/progress's candle_coverage which only sums it.
+    """
+    from ..candlestore import ParquetCandleStore
+    from ..datastore import BASE_INTERVAL
+
+    rows = ParquetCandleStore().per_mint_coverage(BASE_INTERVAL)
+    symbols = {
+        r["mint"]: r["symbol"]
+        for r in db.connect().execute("SELECT mint, symbol FROM universe").fetchall()
+    }
+    for r in rows:
+        r["symbol"] = symbols.get(r["mint"]) or r["mint"]
+    rows.sort(key=lambda r: -r["bars"])
+    return jsonify(rows)
 
 
 @bp.get("/progress")

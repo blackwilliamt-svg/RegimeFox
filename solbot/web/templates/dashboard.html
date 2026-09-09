@@ -118,6 +118,26 @@
       <input type="checkbox" id="marketRegimeToggle"> fuzzy regime overlay
     </label>
   </div>
+  <div class="indicator-picker" id="marketTimeframePicker">
+    <span class="hint" style="margin:0">Interval</span>
+    <div class="btn-group" id="marketIntervalGroup" data-value="1m">
+      <button type="button" class="btn-sm" data-interval="1m">1m</button>
+      <button type="button" class="btn-sm" data-interval="5m">5m</button>
+      <button type="button" class="btn-sm" data-interval="15m">15m</button>
+      <button type="button" class="btn-sm" data-interval="1h">1h</button>
+      <button type="button" class="btn-sm" data-interval="4h">4h</button>
+      <button type="button" class="btn-sm" data-interval="1d">1d</button>
+    </div>
+    <span class="hint" style="margin:0 0 0 10px">Range</span>
+    <div class="btn-group" id="marketRangeGroup" data-value="1W">
+      <button type="button" class="btn-sm" data-range="1D">1D</button>
+      <button type="button" class="btn-sm" data-range="1W">1W</button>
+      <button type="button" class="btn-sm" data-range="1M">1M</button>
+      <button type="button" class="btn-sm" data-range="3M">3M</button>
+      <button type="button" class="btn-sm" data-range="1Y">1Y</button>
+      <button type="button" class="btn-sm" data-range="All">All</button>
+    </div>
+  </div>
   <div class="indicator-picker" id="indicatorPicker">
     <label><input type="checkbox" id="indSMA"> SMA
       <input type="number" id="indSMAPeriod" value="20" min="2" max="400"></label>

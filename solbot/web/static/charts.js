@@ -70,13 +70,124 @@
     return (d.getMonth() + 1) + "/" + d.getDate();
   }
 
+  /* ---------- zoom/pan: a client-side window over the already-fetched
+   * candle array, not a re-fetch. State lives on the canvas element itself
+   * (canvas._zoom) so it survives the next loadMarketChart() poll tick
+   * without that tick's fresh full data resetting the user's chosen view -
+   * as long as the new data is at least as long as the current window. ---- */
+  function _sliceOverlays(overlays, lo, hi) {
+    if (!overlays) return overlays;
+    var out = {};
+    ["sma", "ema"].forEach(function (k) {
+      if (!overlays[k]) return;
+      out[k] = overlays[k].map(function (o) {
+        return { period: o.period, values: (o.values || []).slice(lo, hi) };
+      });
+    });
+    if (overlays.bbands) {
+      out.bbands = {
+        upper: (overlays.bbands.upper || []).slice(lo, hi),
+        lower: (overlays.bbands.lower || []).slice(lo, hi)
+      };
+    }
+    return out;
+  }
+
+  function _wireZoomPan(canvas, render) {
+    if (canvas._zoomWired) return;
+    canvas._zoomWired = true;
+    canvas.style.touchAction = "none";
+    canvas.style.cursor = "grab";
+
+    function total() { return (canvas._zoomFullData || []).length; }
+    function clampWindow() {
+      var z = canvas._zoom;
+      z.len = Math.max(10, Math.min(total(), z.len));
+      z.start = Math.max(0, Math.min(total() - z.len, z.start));
+    }
+
+    canvas.addEventListener("wheel", function (ev) {
+      if (!canvas._zoom || total() < 20) return;
+      ev.preventDefault();
+      var z = canvas._zoom;
+      var factor = ev.deltaY > 0 ? 1.15 : 1 / 1.15;   // scroll down = zoom out
+      var rect = canvas.getBoundingClientRect();
+      var frac = rect.width ? (ev.clientX - rect.left) / rect.width : 0.5;
+      var anchor = z.start + frac * z.len;
+      z.len = z.len * factor;
+      z.start = anchor - frac * z.len;
+      clampWindow();
+      render();
+    }, { passive: false });
+
+    var dragging = false, dragStartX = 0, dragStartWindow = 0;
+    function dragStart(x) {
+      if (!canvas._zoom || total() < 20) return;
+      dragging = true;
+      dragStartX = x;
+      dragStartWindow = canvas._zoom.start;
+      canvas.style.cursor = "grabbing";
+    }
+    function dragMove(x) {
+      if (!dragging || !canvas._zoom) return;
+      var rect = canvas.getBoundingClientRect();
+      var plotW = Math.max(1, rect.width - 70);   // padL+padR-ish; approximate is fine for panning feel
+      var barsPerPx = canvas._zoom.len / plotW;
+      canvas._zoom.start = dragStartWindow - (x - dragStartX) * barsPerPx;
+      clampWindow();
+      render();
+    }
+    function dragEnd() { dragging = false; canvas.style.cursor = "grab"; }
+
+    canvas.addEventListener("mousedown", function (ev) { dragStart(ev.clientX); });
+    canvas.addEventListener("mousemove", function (ev) { dragMove(ev.clientX); });
+    global.addEventListener("mouseup", dragEnd);
+    canvas.addEventListener("touchstart", function (ev) {
+      if (ev.touches.length === 1) dragStart(ev.touches[0].clientX);
+    }, { passive: true });
+    canvas.addEventListener("touchmove", function (ev) {
+      if (ev.touches.length === 1) { dragMove(ev.touches[0].clientX); ev.preventDefault(); }
+    }, { passive: false });
+    canvas.addEventListener("touchend", dragEnd);
+  }
+
   /* ------------------------------------------------------------------ */
   /* Candlestick chart with entry/exit markers and stop levels           */
   /* ------------------------------------------------------------------ */
-  function candles(canvas, data, opts) {
+  function candles(canvas, fullData, opts) {
     opts = opts || {};
     var t = theme();
     var height = opts.height || 300;
+
+    // Zoom/pan bookkeeping (opt-in via opts.enableZoomPan - the always-
+    // visible market chart wants this; the small per-position charts
+    // elsewhere on the dashboard do not, and must keep the page's own
+    // scroll-wheel behaviour over their canvas). Remembers the full series
+    // and re-renders on wheel/drag without asking the caller to re-fetch. A
+    // window is kept across calls (e.g. the next poll tick's fresh data) as
+    // long as it still fits; new data (a coin switch, a different interval)
+    // resets it to "all".
+    var data = fullData;
+    if (opts.enableZoomPan) {
+      canvas._zoomFullData = fullData;
+      canvas._zoomOpts = opts;
+      var total = (fullData || []).length;
+      if (!canvas._zoom || opts.resetZoom) {
+        canvas._zoom = { start: 0, len: total };
+      } else {
+        canvas._zoom.len = Math.min(canvas._zoom.len, total) || total;
+        canvas._zoom.start = Math.max(0, Math.min(total - canvas._zoom.len, canvas._zoom.start));
+      }
+      _wireZoomPan(canvas, function () {
+        candles(canvas, canvas._zoomFullData, Object.assign({}, canvas._zoomOpts, { _rerender: true }));
+      });
+
+      var lo = Math.round(canvas._zoom.start);
+      var hi = Math.round(canvas._zoom.start + canvas._zoom.len);
+      data = (fullData || []).slice(lo, hi);
+      if (opts.overlays) opts = Object.assign({}, opts, { overlays: _sliceOverlays(opts.overlays, lo, hi) });
+    }
+
     var s = setupCanvas(canvas, height);
     var ctx = s.ctx;
 

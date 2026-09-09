@@ -39,6 +39,7 @@ through the same token bucket as everything else).
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -100,8 +101,17 @@ class BinanceClient(HttpClient):
     provider = "binance"
     base_url = "https://api.binance.us"
 
-    def top_bases(self, limit: int = 100) -> list[BinanceAsset]:
-        """The ``limit`` largest non-stable base assets by 24h quote volume."""
+    def _ranked_bases(
+        self, *, exclude_stable: bool = True, exclude_leveraged: bool = True
+    ) -> list[BinanceAsset]:
+        """Every base asset the 24hr ticker currently lists, one entry per
+        base picked at its best-priority quote (see ``QUOTE_PRIORITY``),
+        sorted by 24h quote volume descending. ``top_bases`` (the trading
+        universe's own ranking, spec 2) excludes stablecoins and leveraged
+        tokens; the full-history backfill (dashboard fix-up section 6) wants
+        every listed pair with no exclusions at all, so both share this and
+        differ only in which filters they turn on.
+        """
         data = self.get("/api/v3/ticker/24hr", priority="low")
         if not isinstance(data, list):
             raise ApiError("binance: malformed ticker/24hr response", provider=self.provider)
@@ -114,9 +124,9 @@ class BinanceClient(HttpClient):
             base, quote = _split_symbol(symbol)
             if not base or quote not in QUOTE_PRIORITY:
                 continue
-            if base in STABLE_BASES:
+            if exclude_stable and base in STABLE_BASES:
                 continue
-            if any(base.endswith(suffix) for suffix in LEVERAGED_SUFFIXES):
+            if exclude_leveraged and any(base.endswith(suffix) for suffix in LEVERAGED_SUFFIXES):
                 continue
 
             volume = _to_float(row.get("quoteVolume"))
@@ -141,8 +151,21 @@ class BinanceClient(HttpClient):
                 pair=symbol,
             )
 
-        ranked = sorted(best.values(), key=lambda a: a.quote_volume_24h, reverse=True)
+        return sorted(best.values(), key=lambda a: a.quote_volume_24h, reverse=True)
+
+    def top_bases(self, limit: int = 100) -> list[BinanceAsset]:
+        """The ``limit`` largest non-stable, non-leveraged base assets by 24h
+        quote volume - the trading-universe ranking (spec 2)."""
+        ranked = self._ranked_bases(exclude_stable=True, exclude_leveraged=True)
         return ranked[: max(0, int(limit))]
+
+    def all_bases(self) -> list[BinanceAsset]:
+        """Every base asset currently listed on Binance.US, no exclusions -
+        the full-history backfill (dashboard fix-up section 6) pulls every
+        coin Binance.US lists, not just the ones the trading universe would
+        route, so stablecoins and leveraged tokens are not filtered out
+        here the way they are for ``top_bases``."""
+        return self._ranked_bases(exclude_stable=False, exclude_leveraged=False)
 
     def ping(self) -> bool:
         self.get("/api/v3/ping", priority="high")
@@ -199,6 +222,37 @@ class BinanceClient(HttpClient):
                 continue
             out.extend(page)
             cursor_ms = max(page[-1].ts * 1000 + 60_000, chunk_end)
+        seen: dict[int, Candle] = {c.ts: c for c in out}
+        return [seen[k] for k in sorted(seen)]
+
+    def klines_backward(
+        self, pair: str, *, until: int | None = None, max_pages: int = 10_000
+    ) -> list[Candle]:
+        """Every candle Binance.US has for ``pair``, found by paging
+        backward from ``until`` (default: now) until a page comes back
+        empty - the natural start of that pair's own listing, not a
+        caller-supplied bound (the full-history backfill, dashboard fix-up
+        section 6, has no other way to know how far back a given pair
+        goes). ``max_pages`` is a runaway-loop safety cap, not a target: at
+        1000 one-minute candles per page that is roughly 19 years, well
+        past anything Binance.US could plausibly have listed.
+        """
+        until = int(until) if until is not None else int(time.time())
+        step_seconds = MAX_KLINES_PER_CALL * 60
+        cursor_end = until
+        out: list[Candle] = []
+        for _ in range(max(1, int(max_pages))):
+            cursor_start = cursor_end - step_seconds
+            page = self.klines(
+                pair, start_ms=cursor_start * 1000, end_ms=cursor_end * 1000
+            )
+            if not page:
+                break
+            out.extend(page)
+            earliest = min(c.ts for c in page)
+            if earliest >= cursor_end:   # no progress - malformed page, stop rather than loop
+                break
+            cursor_end = earliest
         seen: dict[int, Candle] = {c.ts: c for c in out}
         return [seen[k] for k in sorted(seen)]
 

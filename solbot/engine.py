@@ -980,19 +980,21 @@ class Engine:
             return f"closed position {position_id}"
         return f"position {position_id} is not open"
 
-    def _start_pull(self, payload: dict[str, Any], conn: sqlite3.Connection) -> None:
-        top_n = int(payload["top_n"]) if payload.get("top_n") else None
-        pairs = self.store.pair_map(conn, top_n=top_n)
-        wanted = payload.get("mints")
-        if wanted:
-            pairs = {m: p for m, p in pairs.items() if m in wanted}
-        months = int(payload.get("months") or self.cfg["bulk_backfill_months"])
+    def _start_pull(self, _payload: dict[str, Any], conn: sqlite3.Connection) -> None:
+        """The dashboard's historical-pull button (dashboard fix-up section
+        6): always every Binance.US pair, always its full available
+        history - no months window, no top-N scoping, and never filtered
+        through the routed `universe` table or its liquidity/volume floors.
+        `_payload` is accepted (and ignored) only so the command dispatch in
+        `run()` above doesn't need a special case for this one command.
+        """
+        pairs = self.store.full_binance_pairs()
 
         def worker() -> None:
             try:
-                report = self.store.run_initial_pull(pairs, months=months, top_n=top_n)
+                report = self.store.run_full_history_pull(pairs)
             except Exception:
-                log.exception("historical pull failed")
+                log.exception("full-history pull failed")
                 return
             self._maybe_trigger_runpod_after_backfill(report, len(pairs))
 

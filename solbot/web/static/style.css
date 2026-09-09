@@ -166,6 +166,8 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .btn-ghost { background: transparent; }
 .btn-sm { padding: 4px 10px; font-size: 12px; }
 .btn-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.btn-group { display: inline-flex; gap: 2px; }
+.btn-group button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
 
 /* ---------- forms ---------- */
 label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
@@ -197,6 +199,10 @@ th {
   white-space: nowrap;
 }
 td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+th.sortable { cursor: pointer; user-select: none; }
+th.sortable:hover { color: var(--text); }
+th.sortable.sort-asc::after { content: " \25B2"; }
+th.sortable.sort-desc::after { content: " \25BC"; }
 tr:last-child td { border-bottom: none; }
 tbody tr:hover { background: var(--panel-2); }
 td.num, th.num { text-align: right; font-family: var(--mono); white-space: nowrap; }

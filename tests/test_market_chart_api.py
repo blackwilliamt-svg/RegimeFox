@@ -151,3 +151,63 @@ def test_candles_endpoint_indicator_periods_are_clamped_and_ignore_garbage(clien
     ind = resp.get_json()["indicators"]
     assert ind["sma"][0]["period"] == 400  # clamped to the hi bound, not a 500 or garbage value
     assert ind["ema"] == [{"period": 7, "values": ind["ema"][0]["values"]}]  # bad token dropped, good one kept
+
+
+# --------------------------------------------------------------------------
+# market-chart upgrade, section 2 item 4: the timeframe control's ?interval=
+# --------------------------------------------------------------------------
+def _seed_one_minute_candles(mint: str, minutes: int = 240) -> None:
+    """Real, contiguous 1-minute-spaced bars - unlike _seed_candles above
+    (600s apart despite the "1m" store label, which the indicator-overlay
+    tests don't care about but a real interval rollup needs to be honest
+    about)."""
+    rng = np.random.default_rng(3)
+    price = 1.0
+    rows = []
+    ts = 1_700_000_000 - (1_700_000_000 % 3600)  # start on a clean hour boundary
+    for i in range(minutes):
+        price = max(1e-6, price * (1 + rng.normal(0, 0.002)))
+        volume = 100.0
+        rows.append((ts + i * 60, price, price * 1.001, price * 0.999, price, volume))
+    ParquetCandleStore().append(mint, "1m", rows)
+
+
+def test_candles_endpoint_defaults_to_the_configured_trading_timeframe(client, workspace):
+    """No ?interval= at all still means whatever candle_minutes is
+    configured to - explicitly overriding it is new (section 2 item 4);
+    the pre-existing default behaviour must not change."""
+    from solbot.config import DEFAULTS
+
+    candle_minutes = int(DEFAULTS["candle_minutes"])
+    _seed_one_minute_candles(MINT, minutes=240)
+    body = client.get(f"/api/candles/{MINT}?limit=1000").get_json()
+    assert len(body["candles"]) == 240 // candle_minutes
+
+
+def test_candles_endpoint_rolls_up_to_a_requested_interval(client, workspace):
+    _seed_one_minute_candles(MINT, minutes=240)   # 4 clean hours
+    body = client.get(f"/api/candles/{MINT}?limit=1000&interval=1h").get_json()
+    assert len(body["candles"]) == 4
+
+    # Each hourly bar's own OHLC must be a real aggregate, not a resample
+    # artefact: high is the max of its 60 one-minute highs, volume the sum.
+    hourly = body["candles"][0]
+    minute_body = client.get(f"/api/candles/{MINT}?limit=1000").get_json()
+    first_hour = [c for c in minute_body["candles"] if c["time"] < minute_body["candles"][0]["time"] + 3600]
+    assert hourly["high"] == max(c["high"] for c in first_hour)
+    assert hourly["volume"] == pytest.approx(sum(c["volume"] for c in first_hour))
+
+
+def test_candles_endpoint_rejects_an_unrecognised_interval_by_ignoring_it(client, workspace):
+    """An unrecognised ?interval= falls back to the configured trading
+    timeframe (the pre-existing default), not a 400 and not the raw
+    1-minute base."""
+    from solbot.config import DEFAULTS
+
+    candle_minutes = int(DEFAULTS["candle_minutes"])
+    minutes = candle_minutes * 5
+    _seed_one_minute_candles(MINT, minutes=minutes)
+
+    with_bad_interval = client.get(f"/api/candles/{MINT}?limit=1000&interval=3m").get_json()
+    without_interval = client.get(f"/api/candles/{MINT}?limit=1000").get_json()
+    assert len(with_bad_interval["candles"]) == len(without_interval["candles"]) == 5

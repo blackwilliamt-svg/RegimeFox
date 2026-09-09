@@ -7,31 +7,20 @@
   <div class="panel">
     <h2>Historical data pull</h2>
     <p class="hint" style="margin-top:0">
-      Pulls a trailing window of 1-minute candles per coin from Binance.US (spec 3b) into
-      the local Parquet store — heavy and one-time, so it is started manually rather than
-      running on boot. A separate daily incremental pull (below) keeps every coin current
-      after that, against the same Binance.US REST API.
+      Pulls the full available history for every pair currently listed on Binance.US into
+      the local Parquet store - not scoped to the routed trading universe or its liquidity/
+      volume floors, and not a fixed trailing window: each pair is paged back as far as
+      Binance.US actually has data for it. Heavy and one-time, so it is started manually
+      rather than running on boot. A separate daily incremental pull (below) keeps every
+      routed coin current after that, against the same Binance.US REST API.
     </p>
     <div id="pullProgress" style="margin:12px 0">
       <div class="progress"><div id="pullBar" style="width:0%"></div></div>
       <p class="hint" id="pullLabel">{{ pull.message or 'Not run yet' }}</p>
     </div>
-    <form method="post" action="{{ url_for('dashboard.historical_pull') }}" class="btn-row">
-      <label for="pullMonths" style="display:inline; margin:0">Months of history
-        <input type="number" name="months" id="pullMonths" value="12" min="1" max="96"
-               style="width:100px; display:inline-block">
-      </label>
-      <label for="pullTopN" style="display:inline; margin:0">Top N coins
-        <input type="number" name="top_n" id="pullTopN" min="1" max="2000" placeholder="all"
-               style="width:90px; display:inline-block">
-      </label>
-      <button class="btn-primary">Start historical pull</button>
+    <form method="post" action="{{ url_for('dashboard.historical_pull') }}" class="btn-row" id="pullForm">
+      <button class="btn-primary" id="pullBtn">Start historical pull</button>
     </form>
-    <p class="hint" style="margin-top:4px">
-      Leave "Top N coins" blank to pull the full current universe (default). Set it to scope
-      this one pull to the top N coins by market cap — the live trading universe and every
-      other job are unaffected.
-    </p>
     <p class="hint" id="pullEstimate" style="margin-top:8px">—</p>
     <div id="dailyPullProgress" style="margin:14px 0 0">
       <div class="progress"><div id="dailyPullBar" style="width:0%"></div></div>
@@ -93,6 +82,34 @@
         {% else %}
         <tr><td colspan="8" class="empty">No backtest runs yet</td></tr>
         {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="panel" style="margin-top:16px">
+  <div class="panel-head">
+    <h2>Candle coverage by coin</h2>
+    <span class="hint" id="coverageSummary">—</span>
+  </div>
+  <p class="hint" style="margin-top:0">
+    Every coin that currently has any candle history on disk, whether or not it is in the
+    routed trading universe right now - this reflects what is actually stored, not what is
+    currently routed for trading. Click a column header to sort.
+  </p>
+  <div class="table-scroll">
+    <table>
+      <thead>
+        <tr>
+          <th class="sortable" data-sort="symbol">Symbol</th>
+          <th class="sortable num" data-sort="candles">Candles</th>
+          <th class="sortable" data-sort="first_ts">First candle</th>
+          <th class="sortable" data-sort="last_ts">Last candle</th>
+          <th class="sortable num" data-sort="days">Days of coverage</th>
+        </tr>
+      </thead>
+      <tbody id="coverageRows">
+        <tr><td colspan="5" class="empty">Loading…</td></tr>
       </tbody>
     </table>
   </div>
