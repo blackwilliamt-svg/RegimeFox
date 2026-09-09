@@ -327,7 +327,12 @@ class RunPodClient:
         report_run_id: int,
         droplet_url: str = "",
         droplet_token: str = "",
-        data_center_id: str = "US-CA-1",
+        # "US-CA-1" (the original guess) does not exist - a real benchmark
+        # run's own error confirmed the live list of datacenters that
+        # support network volumes; "US-CA-2" is on it. That list can still
+        # change on RunPod's end, so this default is a starting point, not
+        # a guarantee - a caller can always override it.
+        data_center_id: str = "US-CA-2",
         s3_access_key: str = "",
         s3_secret_key: str = "",
         extra_env: dict[str, str] | None = None,
@@ -436,7 +441,12 @@ class RunPodClient:
         report_run_id: int,
         droplet_url: str = "",
         droplet_token: str = "",
-        data_center_id: str = "US-CA-1",
+        # "US-CA-1" (the original guess) does not exist - a real benchmark
+        # run's own error confirmed the live list of datacenters that
+        # support network volumes; "US-CA-2" is on it. That list can still
+        # change on RunPod's end, so this default is a starting point, not
+        # a guarantee - a caller can always override it.
+        data_center_id: str = "US-CA-2",
         s3_access_key: str = "",
         s3_secret_key: str = "",
         max_seconds: float | None = None,
