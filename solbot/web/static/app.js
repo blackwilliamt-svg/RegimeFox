@@ -174,51 +174,36 @@
     });
   }
 
-  /* ---------- market chart (always visible, symbol search over the universe) ---------- */
+  /* ---------- market chart (always visible, dropdown over the universe) ---------- */
   var marketUniverse = [];        // [{mint, symbol, label}], sorted by volume desc (server order)
   var marketMint = null;          // currently displayed mint
   var marketUniverseLoaded = false;
+  var MARKET_CHART_HEIGHT = 600;  // the dashboard's dominant panel, not one among equals
+  var MARKET_RSI_HEIGHT = 110;
 
   function marketLabel(row) {
     return (row.symbol || row.mint.slice(0, 8)) + " — " + row.mint.slice(0, 6) + "…";
   }
 
   function loadMarketUniverse() {
-    var input = el("marketSymbolInput");
-    if (!input) return Promise.resolve();
+    var select = el("marketSymbolSelect");
+    if (!select) return Promise.resolve();
     return get("/api/universe").then(function (rows) {
       marketUniverse = rows.map(function (r) {
         return { mint: r.mint, symbol: r.symbol, label: marketLabel(r) };
       });
-      var list = el("marketSymbolDatalist");
-      if (list) {
-        list.innerHTML = marketUniverse.map(function (r) {
-          return '<option value="' + esc(r.label) + '">';
-        }).join("");
-      }
+      select.innerHTML = marketUniverse.map(function (r) {
+        return '<option value="' + esc(r.mint) + '">' + esc(r.label) + "</option>";
+      }).join("");
       marketUniverseLoaded = true;
       // Default to the top-ranked (highest 24h volume) coin once, and whenever
       // the previously-selected mint drops out of the universe.
       var stillPresent = marketMint && marketUniverse.some(function (r) { return r.mint === marketMint; });
       if (!stillPresent && marketUniverse.length) {
         marketMint = marketUniverse[0].mint;
-        input.value = marketUniverse[0].label;
       }
+      if (marketMint) select.value = marketMint;
     });
-  }
-
-  function resolveMarketSymbolInput() {
-    var input = el("marketSymbolInput");
-    if (!input) return;
-    var typed = input.value.trim().toLowerCase();
-    if (!typed) return;
-    var hit = marketUniverse.find(function (r) {
-      return r.label.toLowerCase() === typed || (r.symbol || "").toLowerCase() === typed;
-    });
-    if (hit && hit.mint !== marketMint) {
-      marketMint = hit.mint;
-      loadMarketChart();
-    }
   }
 
   var REGIME_NAMES = ["cluster 0", "cluster 1", "cluster 2", "cluster 3", "cluster 4", "cluster 5"];
@@ -241,6 +226,62 @@
     out.textContent = "fuzzy regime (live): " + parts.join(" · ");
   }
 
+  /* ---- indicator picker: persisted in localStorage so it survives a reload,
+   * same spirit as the theme toggle above. ---- */
+  var INDICATOR_STORAGE_KEY = "solbot-market-indicators";
+  var DEFAULT_INDICATORS = { sma: false, smaPeriod: 20, ema: false, emaPeriod: 9,
+    bb: false, bbPeriod: 20, rsi: false, rsiPeriod: 14, volume: true };
+
+  function loadIndicatorSettings() {
+    var saved = null;
+    try { saved = JSON.parse(localStorage.getItem(INDICATOR_STORAGE_KEY) || "null"); } catch (e) { /* ignore */ }
+    var settings = {};
+    Object.keys(DEFAULT_INDICATORS).forEach(function (k) {
+      settings[k] = (saved && saved[k] !== undefined) ? saved[k] : DEFAULT_INDICATORS[k];
+    });
+    return settings;
+  }
+
+  function saveIndicatorSettings(settings) {
+    try { localStorage.setItem(INDICATOR_STORAGE_KEY, JSON.stringify(settings)); } catch (e) { /* private mode */ }
+  }
+
+  function readIndicatorFormInto(settings) {
+    var map = {
+      sma: "indSMA", smaPeriod: "indSMAPeriod", ema: "indEMA", emaPeriod: "indEMAPeriod",
+      bb: "indBB", bbPeriod: "indBBPeriod", rsi: "indRSI", rsiPeriod: "indRSIPeriod",
+      volume: "indVolume"
+    };
+    Object.keys(map).forEach(function (k) {
+      var node = el(map[k]);
+      if (!node) return;
+      settings[k] = node.type === "checkbox" ? node.checked : (parseInt(node.value, 10) || DEFAULT_INDICATORS[k]);
+    });
+    return settings;
+  }
+
+  function applyIndicatorSettingsToForm(settings) {
+    var map = {
+      sma: "indSMA", smaPeriod: "indSMAPeriod", ema: "indEMA", emaPeriod: "indEMAPeriod",
+      bb: "indBB", bbPeriod: "indBBPeriod", rsi: "indRSI", rsiPeriod: "indRSIPeriod",
+      volume: "indVolume"
+    };
+    Object.keys(map).forEach(function (k) {
+      var node = el(map[k]);
+      if (!node) return;
+      if (node.type === "checkbox") node.checked = !!settings[k]; else node.value = settings[k];
+    });
+  }
+
+  function indicatorQuery(settings) {
+    var parts = [];
+    if (settings.sma) parts.push("sma=" + settings.smaPeriod);
+    if (settings.ema) parts.push("ema=" + settings.emaPeriod);
+    if (settings.bb) parts.push("bbands=" + settings.bbPeriod);
+    if (settings.rsi) parts.push("rsi=" + settings.rsiPeriod);
+    return parts.length ? "&" + parts.join("&") : "";
+  }
+
   function loadMarketChart() {
     var canvas = el("marketChart");
     var hint = el("marketChartHint");
@@ -260,29 +301,61 @@
       }
       var toggle = el("marketRegimeToggle");
       var withRegime = toggle && toggle.checked;
+      var settings = readIndicatorFormInto(loadIndicatorSettings());
       var url = "/api/candles/" + encodeURIComponent(marketMint) + "?limit=200" +
-        (withRegime ? "&regime=1" : "");
+        (withRegime ? "&regime=1" : "") + indicatorQuery(settings);
       return get(url).then(function (d) {
+        var ind = d.indicators || {};
         window.SolChart.candles(canvas, d.candles, {
-          height: 300,
-          regime: withRegime && d.regime ? d.regime.history : null
+          height: MARKET_CHART_HEIGHT,
+          regime: withRegime && d.regime ? d.regime.history : null,
+          volume: settings.volume,
+          overlays: { sma: ind.sma, ema: ind.ema, bbands: ind.bbands }
         });
         renderRegimeReadout(withRegime, d.regime);
+
+        var rsiBox = el("marketRsiBox"), rsiCanvas = el("marketRsiChart");
+        if (rsiBox && rsiCanvas) {
+          if (settings.rsi && ind.rsi) {
+            rsiBox.style.display = "";
+            window.SolChart.rsi(rsiCanvas, d.candles, ind.rsi.values, { height: MARKET_RSI_HEIGHT });
+          } else {
+            rsiBox.style.display = "none";
+          }
+        }
       });
     });
   }
 
-  (function wireMarketSearch() {
-    var input = el("marketSymbolInput");
-    if (!input) return;
-    input.addEventListener("change", resolveMarketSymbolInput);
-    input.addEventListener("blur", resolveMarketSymbolInput);
+  (function wireMarketSymbolSelect() {
+    var select = el("marketSymbolSelect");
+    if (!select) return;
+    select.addEventListener("change", function () {
+      if (select.value && select.value !== marketMint) {
+        marketMint = select.value;
+        loadMarketChart().catch(noop);
+      }
+    });
   })();
 
   (function wireMarketRegimeToggle() {
     var toggle = el("marketRegimeToggle");
     if (!toggle) return;
     toggle.addEventListener("change", function () { loadMarketChart().catch(noop); });
+  })();
+
+  (function wireIndicatorPicker() {
+    var picker = el("indicatorPicker");
+    if (!picker) return;
+    applyIndicatorSettingsToForm(loadIndicatorSettings());
+    picker.addEventListener("change", function () {
+      var settings = readIndicatorFormInto(loadIndicatorSettings());
+      saveIndicatorSettings(settings);
+      loadMarketChart().catch(noop);
+    });
+    // A period number input firing on every keystroke would refetch mid-typing;
+    // "change" alone already covers blur/enter for number inputs, so no extra
+    // debounce is needed here.
   })();
 
   /* ---------- equity ---------- */

@@ -110,17 +110,27 @@
   </div>
 </div>
 
-<div class="panel" style="margin-bottom:16px">
+<div class="panel panel-market" style="margin-bottom:16px">
   <div class="panel-head">
     <h2>Market</h2>
-    <input type="text" id="marketSymbolInput" list="marketSymbolDatalist"
-           placeholder="Search a symbol in the universe…" style="width:auto; min-width:220px">
-    <datalist id="marketSymbolDatalist"></datalist>
+    <select id="marketSymbolSelect" style="width:auto; min-width:220px"></select>
     <label class="hint" style="margin-left:auto; display:flex; align-items:center; gap:4px">
       <input type="checkbox" id="marketRegimeToggle"> fuzzy regime overlay
     </label>
   </div>
+  <div class="indicator-picker" id="indicatorPicker">
+    <label><input type="checkbox" id="indSMA"> SMA
+      <input type="number" id="indSMAPeriod" value="20" min="2" max="400"></label>
+    <label><input type="checkbox" id="indEMA"> EMA
+      <input type="number" id="indEMAPeriod" value="9" min="2" max="400"></label>
+    <label><input type="checkbox" id="indBB"> Bollinger Bands
+      <input type="number" id="indBBPeriod" value="20" min="2" max="400"></label>
+    <label><input type="checkbox" id="indRSI"> RSI
+      <input type="number" id="indRSIPeriod" value="14" min="2" max="100"></label>
+    <label><input type="checkbox" id="indVolume" checked> Volume</label>
+  </div>
   <div class="chart-box"><canvas id="marketChart"></canvas></div>
+  <div class="chart-box" id="marketRsiBox" style="display:none"><canvas id="marketRsiChart"></canvas></div>
   <p class="hint" id="marketChartHint"></p>
   <p class="hint" id="marketRegimeReadout"></p>
 </div>

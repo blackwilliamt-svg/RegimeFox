@@ -237,6 +237,24 @@ canvas { display: block; width: 100%; }
 
 .position-charts { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(440px, 1fr)); }
 
+/* ---------- market chart: the dashboard's dominant panel, not one among
+   equals - see loadMarketChart()'s height option in app.js for the actual
+   pixel height, this just keeps its controls from looking like every other
+   form field on the page ---------- */
+.panel-market .chart-box { margin-top: 10px; }
+.indicator-picker {
+  display: flex; flex-wrap: wrap; gap: 14px;
+  font-size: 12px; color: var(--muted);
+  padding: 8px 0; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);
+}
+.indicator-picker label {
+  display: inline-flex; align-items: center; gap: 5px;
+  margin-bottom: 0; white-space: nowrap;
+}
+.indicator-picker input[type=number] {
+  width: 52px; padding: 3px 5px; font-size: 12px;
+}
+
 /* ---------- event feed ---------- */
 .feed { max-height: 460px; overflow-y: auto; font-size: 13px; }
 .feed-item { padding: 7px 0; border-bottom: 1px solid var(--border); display: flex; gap: 10px; }

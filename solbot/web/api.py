@@ -164,7 +164,77 @@ def candles(mint: str):
     payload = {"mint": mint, "candles": series, "positions": _rows(markers)}
     if request.args.get("regime"):
         payload["regime"] = _regime_overlay(mint, df, config.as_dict())
+    indicators = _indicator_overlays(df, request.args)
+    if indicators:
+        payload["indicators"] = indicators
     return jsonify(payload)
+
+
+def _clean_series(s: Any) -> list[float | None]:
+    """pandas Series -> JSON-safe list (NaN, which plain json can't encode, becomes null).
+    Uses pandas' own isna rather than an isinstance+isnan check so this doesn't
+    quietly break if a series ever comes back as float32/object dtype."""
+    import pandas as pd
+
+    return [None if pd.isna(v) else round(float(v), 8) for v in s]
+
+
+def _parse_int_list(raw: str | None, *, max_count: int = 4, lo: int = 2, hi: int = 400) -> list[int]:
+    """'20,50' -> [20, 50], each clamped to [lo, hi], deduped, capped at max_count entries."""
+    if not raw:
+        return []
+    out: list[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            v = max(lo, min(hi, int(part)))
+        except ValueError:
+            continue
+        if v not in out:
+            out.append(v)
+        if len(out) >= max_count:
+            break
+    return out
+
+
+def _indicator_overlays(df: Any, args: Any) -> dict[str, Any]:
+    """Chart overlays for the market-chart indicator picker (dashboard step 2)
+    -- SMA/EMA/Bollinger Bands/RSI, opt-in via query params (?sma=20,50 etc.),
+    reusing solbot.indicators' pandas primitives rather than recomputing
+    anything: the same functions the live engine and backtester trust.
+    Empty/absent params compute nothing, same "pay only for what's asked
+    for" posture as the regime overlay above.
+    """
+    if df.empty:
+        return {}
+    from .. import indicators as ind
+
+    close = df["close"]
+    out: dict[str, Any] = {}
+
+    sma_periods = _parse_int_list(args.get("sma"))
+    if sma_periods:
+        out["sma"] = [{"period": p, "values": _clean_series(ind.sma(close, p))} for p in sma_periods]
+
+    ema_periods = _parse_int_list(args.get("ema"))
+    if ema_periods:
+        out["ema"] = [{"period": p, "values": _clean_series(ind.ema(close, p))} for p in ema_periods]
+
+    bb_period = _parse_int_list(args.get("bbands"), max_count=1)
+    if bb_period:
+        mid, upper, lower = ind.bollinger_bands(close, bb_period[0], 2.0)
+        out["bbands"] = {
+            "period": bb_period[0], "num_std": 2.0,
+            "mid": _clean_series(mid), "upper": _clean_series(upper), "lower": _clean_series(lower),
+        }
+
+    rsi_period = _parse_int_list(args.get("rsi"), max_count=1, hi=100)
+    if rsi_period:
+        out["rsi"] = {"period": rsi_period[0], "values": _clean_series(ind.rsi(close, rsi_period[0]))}
+
+    return out
 
 
 def _regime_overlay(mint: str, df: Any, cfg_dict: dict[str, Any]) -> dict[str, Any] | None:
@@ -270,8 +340,13 @@ def performance():
 @bp.get("/universe")
 def universe():
     conn = db.connect()
+    # No LIMIT here: the table itself is already bounded by universe_max_tokens
+    # at write time (solbot/universe.py, up to 2000) - an earlier hardcoded
+    # LIMIT 500 silently dropped coins for anyone running with
+    # universe_max_tokens raised above 500, which is exactly the "not all
+    # universe coins are showing up" symptom this was fixed for.
     rows = conn.execute(
-        "SELECT * FROM universe ORDER BY volume_24h_usd DESC LIMIT 500"
+        "SELECT * FROM universe ORDER BY volume_24h_usd DESC"
     ).fetchall()
     safety = {
         r["mint"]: {"passed": bool(r["passed"]), "reasons": json.loads(r["reasons"] or "[]")}

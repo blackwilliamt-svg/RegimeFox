@@ -89,8 +89,9 @@
     }
 
     var regimeBand = (opts.regime && opts.regime.length) ? 8 : 0;
+    var showVolume = opts.volume !== false;
     var padL = 8, padR = 62, padT = 10 + regimeBand, padB = 22;
-    var volH = Math.round(height * 0.18);
+    var volH = showVolume ? Math.round(height * 0.18) : 0;
     var plotH = height - padT - padB - volH;
     var plotW = s.width - padL - padR;
 
@@ -98,6 +99,8 @@
     if (opts.levels) {
       opts.levels.forEach(function (l) { if (l && isFinite(l.value) && l.value > 0) levels.push(l); });
     }
+
+    var overlays = opts.overlays || {};
 
     var lo = Infinity, hi = -Infinity, maxVol = 0;
     data.forEach(function (c) {
@@ -109,6 +112,20 @@
       if (l.value < lo) lo = l.value;
       if (l.value > hi) hi = l.value;
     });
+    // Overlay lines (SMA/EMA/Bollinger) can run outside the candle high/low
+    // range (a band widens past a spike, an EMA lags through one) - fold
+    // them into the autoscale so they never get silently clipped off.
+    function widenForSeries(values) {
+      (values || []).forEach(function (v) {
+        if (v === null || v === undefined || !isFinite(v)) return;
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+      });
+    }
+    (overlays.sma || []).forEach(function (o) { widenForSeries(o.values); });
+    (overlays.ema || []).forEach(function (o) { widenForSeries(o.values); });
+    if (overlays.bbands) { widenForSeries(overlays.bbands.upper); widenForSeries(overlays.bbands.lower); }
+
     var pad = (hi - lo) * 0.06 || hi * 0.02 || 1;
     lo -= pad; hi += pad;
 
@@ -133,16 +150,18 @@
     });
 
     /* volume */
-    var volTop = padT + plotH + 6;
-    data.forEach(function (c, i) {
-      if (!maxVol) return;
-      var h = (c.volume / maxVol) * (volH - 6);
-      ctx.fillStyle = c.close >= c.open ? t.green : t.red;
-      ctx.globalAlpha = 0.25;
-      var w = Math.max(1, plotW / data.length - 1.5);
-      ctx.fillRect(x(i) - w / 2, volTop + (volH - 6 - h), w, h);
-      ctx.globalAlpha = 1;
-    });
+    if (showVolume) {
+      var volTop = padT + plotH + 6;
+      data.forEach(function (c, i) {
+        if (!maxVol) return;
+        var h = (c.volume / maxVol) * (volH - 6);
+        ctx.fillStyle = c.close >= c.open ? t.green : t.red;
+        ctx.globalAlpha = 0.25;
+        var w = Math.max(1, plotW / data.length - 1.5);
+        ctx.fillRect(x(i) - w / 2, volTop + (volH - 6 - h), w, h);
+        ctx.globalAlpha = 1;
+      });
+    }
 
     /* candles */
     var cw = Math.max(1, plotW / data.length - 1.5);
@@ -162,6 +181,37 @@
       ctx.fillStyle = color;
       ctx.fillRect(cx - cw / 2, top, cw, bh);
     });
+
+    /* indicator overlays: SMA/EMA lines, Bollinger Bands (dashboard step 2).
+     * A null entry (not-enough-warm-up-yet, or a gap) breaks the stroke into
+     * a new segment rather than drawing a straight line across the hole. */
+    function strokeSeries(values, color, dash) {
+      if (!values || !values.length) return;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.4;
+      ctx.setLineDash(dash || []);
+      ctx.beginPath();
+      var drawing = false;
+      for (var i = 0; i < values.length && i < data.length; i++) {
+        var v = values[i];
+        if (v === null || v === undefined || !isFinite(v)) { drawing = false; continue; }
+        var px = x(i), py = y(v);
+        if (!drawing) { ctx.moveTo(px, py); drawing = true; } else { ctx.lineTo(px, py); }
+      }
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    if (overlays.bbands) {
+      var bb = overlays.bbands;
+      strokeSeries(bb.upper, t.purple, [3, 3]);
+      strokeSeries(bb.lower, t.purple, [3, 3]);
+      strokeSeries(bb.mid, t.purple);
+    }
+    var smaColors = [t.accent, t.amber];
+    (overlays.sma || []).forEach(function (o, i) { strokeSeries(o.values, smaColors[i % smaColors.length]); });
+    var emaColors = [t.green, t.red];
+    (overlays.ema || []).forEach(function (o, i) { strokeSeries(o.values, emaColors[i % emaColors.length], [6, 3]); });
 
     /* horizontal levels: hard stop, trailing stop, target, entry */
     levels.forEach(function (l) {
@@ -228,6 +278,61 @@
         ctx.fillRect(x(i) - sw / 2, stripY, sw, regimeBand - 1);
       });
     }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* RSI sub-panel - a thin 0-100 line chart sharing the price chart's bar
+   * spacing (same `data` array) so the two line up visually when stacked. */
+  /* ------------------------------------------------------------------ */
+  function rsi(canvas, data, values, opts) {
+    opts = opts || {};
+    var t = theme();
+    var height = opts.height || 90;
+    var s = setupCanvas(canvas, height);
+    var ctx = s.ctx;
+
+    if (!data || !data.length || !values || !values.length) {
+      return;
+    }
+
+    var padL = 8, padR = 62, padT = 8, padB = 16;
+    var plotH = height - padT - padB;
+    var plotW = s.width - padL - padR;
+    function x(i) { return padL + (i + 0.5) * (plotW / data.length); }
+    function y(v) { return padT + plotH - (v / 100) * plotH; }
+
+    [30, 50, 70].forEach(function (v) {
+      var py = y(v);
+      ctx.strokeStyle = t.border;
+      ctx.globalAlpha = v === 50 ? 0.35 : 0.5;
+      ctx.setLineDash(v === 50 ? [2, 3] : []);
+      ctx.beginPath(); ctx.moveTo(padL, py); ctx.lineTo(padL + plotW, py); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = t.muted;
+      ctx.font = "9px ui-monospace, monospace";
+      ctx.textAlign = "left";
+      ctx.textBaseline = "middle";
+      ctx.fillText(String(v), padL + plotW + 6, py);
+    });
+
+    ctx.strokeStyle = t.accent;
+    ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    var drawing = false;
+    for (var i = 0; i < values.length && i < data.length; i++) {
+      var v = values[i];
+      if (v === null || v === undefined || !isFinite(v)) { drawing = false; continue; }
+      var px = x(i), py = y(v);
+      if (!drawing) { ctx.moveTo(px, py); drawing = true; } else { ctx.lineTo(px, py); }
+    }
+    ctx.stroke();
+
+    ctx.fillStyle = t.muted;
+    ctx.font = "10px ui-monospace, monospace";
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+    ctx.fillText("RSI", padL, 2);
   }
 
   /* ------------------------------------------------------------------ */
@@ -452,6 +557,6 @@
   }
 
   global.SolChart = {
-    candles: candles, lines: lines, histogram: histogram, paths: paths, theme: theme
+    candles: candles, lines: lines, histogram: histogram, paths: paths, rsi: rsi, theme: theme
   };
 })(window);

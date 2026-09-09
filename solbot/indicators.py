@@ -64,6 +64,14 @@ def ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=max(1, int(period)), adjust=False).mean()
 
 
+def sma(series: pd.Series, period: int) -> pd.Series:
+    """Plain rolling mean - the same computation bollinger_bands' mid band
+    uses, factored out so the dashboard's chart overlay can ask for a bare
+    SMA line without duplicating that rolling-mean call."""
+    period = max(2, int(period))
+    return series.rolling(period, min_periods=period).mean()
+
+
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     period = max(2, int(period))
     delta = series.diff()
@@ -134,7 +142,7 @@ def bollinger_bands(
     vectorized twin, which computes it from a prefix sum rather than a
     per-window pass, and NaN before the window is filled either way."""
     period = max(2, int(period))
-    mid = series.rolling(period, min_periods=period).mean()
+    mid = sma(series, period)
     std = series.rolling(period, min_periods=period).std(ddof=0)
     upper = mid + num_std * std
     lower = mid - num_std * std
