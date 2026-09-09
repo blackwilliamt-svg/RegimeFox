@@ -1138,7 +1138,12 @@
           if (masked) masked.textContent = res.body.in_effect_masked;
         } else {
           status.className = "key-status hint neg";
-          status.textContent = "✗ " + (res.body.message || res.body.error || "Validation failed") +
+          // `message` is generic boilerplate ("failed validation and was not
+          // saved"); `error` is the actual reason (the exception RunPod/the
+          // provider raised) - show both, or the operator has no way to
+          // tell a bad key apart from RunPod being unreachable.
+          var reason = res.body.error ? " — " + res.body.error : "";
+          status.textContent = "✗ " + (res.body.message || "Validation failed") + reason +
             (res.body.in_effect_masked ? " (still using " + res.body.in_effect_masked + ")" : "");
         }
       }).catch(function (e) {
