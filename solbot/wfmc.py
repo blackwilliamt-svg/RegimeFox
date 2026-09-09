@@ -455,11 +455,17 @@ def run_benchmark(
         )
         return {"ran": False, "reason": str(exc)}
 
-    recommendation = _recommend_tier(results)
+    recommendation, recommended_gpu_type = _recommend_tier(results)
     payload = {
         "ts": db.now(),
         "results": [r.as_dict() for r in results],
         "recommendation": recommendation,
+        # The bare gpu_type recommendation's human-readable text embeds a
+        # cost figure in, e.g. "NVIDIA RTX 4090 ($0.0035 per 1,000
+        # combinations)" - not something runpod_gpu_type should ever be set
+        # to. This is what the settings page's "Apply this recommendation"
+        # button actually writes via config.update().
+        "recommended_gpu_type": recommended_gpu_type,
     }
     db.kv_set(RUNPOD_BENCHMARK_KEY, payload, conn)
 
@@ -494,9 +500,17 @@ def run_benchmark(
     return {"ran": True, **payload}
 
 
-def _recommend_tier(results: list[Any]) -> str:
+def _recommend_tier(results: list[Any]) -> tuple[str, str]:
     """Cheapest $/1000-combinations among tiers that actually completed and
-    tore down cleanly - a recommendation to show, never applied automatically."""
+    tore down cleanly - a recommendation to show, never applied automatically
+    from here (the settings page's "Apply this recommendation" button is the
+    only thing that ever writes it to runpod_gpu_type, and that's still a
+    deliberate separate click).
+
+    Returns (display text, bare gpu_type) - the display text embeds a cost
+    figure for the settings page to show; the bare gpu_type is the literal
+    value that button would write.
+    """
     candidates = [
         r for r in results
         if r.ok and r.teardown_clean is not False and r.cost_per_1000_combinations is not None
@@ -504,7 +518,8 @@ def _recommend_tier(results: list[Any]) -> str:
     if candidates:
         best = min(candidates, key=lambda r: r.cost_per_1000_combinations)
         return (
-            f"{best.gpu_type} (${best.cost_per_1000_combinations:.4f} per 1,000 combinations)"
+            f"{best.gpu_type} (${best.cost_per_1000_combinations:.4f} per 1,000 combinations)",
+            best.gpu_type,
         )
     # No combination counts made it back (e.g. the report round-trip did not
     # complete in this benchmark window) - fall back to raw $/hr among tiers
@@ -512,8 +527,11 @@ def _recommend_tier(results: list[Any]) -> str:
     priced = [r for r in results if r.ok and r.teardown_clean is not False and r.price_per_hour]
     if priced:
         best = min(priced, key=lambda r: r.price_per_hour)
-        return f"{best.gpu_type} (${best.price_per_hour:.2f}/hr - no combination count to compare cost-per-run)"
-    return ""
+        return (
+            f"{best.gpu_type} (${best.price_per_hour:.2f}/hr - no combination count to compare cost-per-run)",
+            best.gpu_type,
+        )
+    return "", ""
 
 
 # --------------------------------------------------------------------------

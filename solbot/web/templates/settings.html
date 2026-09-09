@@ -91,10 +91,14 @@
     </table>
   </div>
   {% if runpod_benchmark.get('recommendation') %}
-  <p class="hint" style="margin-top:8px">
-    <strong>Recommendation:</strong> {{ runpod_benchmark['recommendation'] }} —
-    update <code>runpod_gpu_type</code> below yourself if you agree.
-  </p>
+  <div class="btn-row hint" style="margin-top:8px; align-items:center">
+    <span><strong>Recommendation:</strong> {{ runpod_benchmark['recommendation'] }}</span>
+    {% if runpod_benchmark.get('recommended_gpu_type') %}
+    <form method="post" action="{{ url_for('dashboard.apply_runpod_recommendation') }}">
+      <button type="submit" class="btn-sm">Apply this recommendation</button>
+    </form>
+    {% endif %}
+  </div>
   {% endif %}
   {% endif %}
 </div>

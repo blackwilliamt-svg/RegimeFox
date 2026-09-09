@@ -287,6 +287,41 @@ def historical_pull():
 # --------------------------------------------------------------------------
 # settings
 # --------------------------------------------------------------------------
+def _apply_and_audit(pending: dict[str, Any]) -> dict[str, tuple[Any, Any]]:
+    """config.update(pending) plus the settings_audit row + log_event every
+    settings change gets - shared by save_settings and
+    apply_runpod_recommendation so a one-off single-field update goes
+    through the exact same validation/audit trail as a normal save, not a
+    special-case bypass. Raises ConfigError on rejection, same as
+    config.update() itself. Returns {} (no audit row, no event) when
+    `pending` turned out to be a no-op - config.update() already diffs
+    old-vs-new internally, so this only matters for a caller (like the
+    apply-recommendation route) that doesn't pre-filter unchanged values.
+    """
+    config = cfg()
+    applied = config.update(pending)
+    if not applied:
+        return applied
+
+    conn = db.connect()
+    who = current_user() or "dashboard"
+    for key, (old, new) in applied.items():
+        conn.execute(
+            "INSERT INTO settings_audit(ts, username, key, old_value, new_value) "
+            "VALUES (?,?,?,?,?)",
+            (db.now(), who, key, str(old), str(new)),
+        )
+    db.log_event(
+        f"{who} changed {len(applied)} setting(s): "
+        + ", ".join(f"{k} {o} -> {n}" for k, (o, n) in list(applied.items())[:8]),
+        level="warn",
+        category="system",
+        detail={k: {"from": o, "to": n} for k, (o, n) in applied.items()},
+        conn=conn,
+    )
+    return applied
+
+
 @bp.route("/settings/save", methods=["POST"])
 def save_settings():
     config = cfg()
@@ -320,28 +355,43 @@ def save_settings():
         return redirect(url_for("dashboard.settings"))
 
     try:
-        applied = config.update(pending)
+        applied = _apply_and_audit(pending)
     except ConfigError as exc:
         flash(f"Rejected: {exc}", "error")
         return redirect(url_for("dashboard.settings"))
 
-    conn = db.connect()
-    who = current_user() or "dashboard"
-    for key, (old, new) in applied.items():
-        conn.execute(
-            "INSERT INTO settings_audit(ts, username, key, old_value, new_value) "
-            "VALUES (?,?,?,?,?)",
-            (db.now(), who, key, str(old), str(new)),
-        )
-    db.log_event(
-        f"{who} changed {len(applied)} setting(s): "
-        + ", ".join(f"{k} {o} -> {n}" for k, (o, n) in list(applied.items())[:8]),
-        level="warn",
-        category="system",
-        detail={k: {"from": o, "to": n} for k, (o, n) in applied.items()},
-        conn=conn,
-    )
     flash(f"Saved {len(applied)} setting(s). The worker picks them up next cycle.", "success")
+    return redirect(url_for("dashboard.settings"))
+
+
+@bp.route("/settings/apply-runpod-recommendation", methods=["POST"])
+def apply_runpod_recommendation():
+    """One-click "Apply this recommendation" next to the GPU-tier benchmark
+    results - a deliberate, separate user action, distinct from
+    run_benchmark itself, which never applies anything on its own.
+    """
+    from ..wfmc import RUNPOD_BENCHMARK_KEY
+
+    stored = db.kv_get(RUNPOD_BENCHMARK_KEY, {}) or {}
+    recommended = (stored.get("recommended_gpu_type") or "").strip()
+    if not recommended:
+        flash(
+            "No RunPod benchmark recommendation to apply (none stored yet, or the "
+            "last benchmark didn't produce one) - run a benchmark first.",
+            "error",
+        )
+        return redirect(url_for("dashboard.settings"))
+
+    try:
+        applied = _apply_and_audit({"runpod_gpu_type": recommended})
+    except ConfigError as exc:
+        flash(f"Rejected: {exc}", "error")
+        return redirect(url_for("dashboard.settings"))
+
+    if not applied:
+        flash(f"runpod_gpu_type is already {recommended!r} - nothing to apply.", "success")
+    else:
+        flash(f"Applied recommendation: runpod_gpu_type set to {recommended!r}.", "success")
     return redirect(url_for("dashboard.settings"))
 
 
