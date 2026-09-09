@@ -173,7 +173,12 @@ def candles(mint: str):
         (mint,),
     ).fetchall()
 
-    payload = {"mint": mint, "candles": series, "positions": _rows(markers)}
+    prices = db.kv_get("last_prices", {}) or {}
+    current_price = float(prices.get(mint, 0.0)) or _last_tick(mint, conn)
+    if not current_price and series:
+        current_price = series[-1]["close"]   # worker not running - last stored candle is the best we have
+
+    payload = {"mint": mint, "candles": series, "positions": _rows(markers), "current_price": current_price}
     if request.args.get("regime"):
         payload["regime"] = _regime_overlay(mint, df, config.as_dict())
     indicators = _indicator_overlays(df, request.args)

@@ -98,16 +98,18 @@ def test_all_bases_includes_stablecoins_and_leveraged_tokens_top_bases_excludes(
 # --------------------------------------------------------------------------
 # DataStore.full_binance_pairs / estimate_full_pull / full_history_backfill
 # --------------------------------------------------------------------------
-def test_full_binance_pairs_is_independent_of_the_universe_table(workspace):
+def test_full_binance_pairs_is_not_scoped_or_filtered_by_the_universe_table(workspace):
+    """The routed universe's own floors never narrow which pairs get
+    pulled - a routed coin with no matching Binance pair here just keys by
+    its own symbol like everything else."""
     conn = workspace["conn"]
-    # A routed universe of exactly one coin...
     conn.execute(
         "INSERT INTO universe(mint, symbol, binance_pair, updated_at) VALUES (?,?,?,?)",
         (MINT_A, "ROUTED", "ROUTEDUSDT", db.now()),
     )
     conn.commit()
 
-    # ...but Binance.US itself lists three completely different bases.
+    # Binance.US itself lists three bases that do not match the routed row.
     binance = FakeBinance(assets=[
         BinanceAsset(symbol="AAA", quote_volume_24h=3.0, pair="AAAUSDT"),
         BinanceAsset(symbol="BBB", quote_volume_24h=2.0, pair="BBBUSDT"),
@@ -118,7 +120,34 @@ def test_full_binance_pairs_is_independent_of_the_universe_table(workspace):
     pairs = store.full_binance_pairs()
 
     assert pairs == {"AAA": "AAAUSDT", "BBB": "BBBUSDT", "CCC": "CCCUSDT"}
-    assert "ROUTED" not in pairs   # the routed universe never enters this at all
+    assert "ROUTED" not in pairs   # nothing here matched that routed pair
+
+
+def test_full_binance_pairs_reuses_an_already_routed_coins_own_mint_as_the_key(workspace):
+    """A pair that IS currently routed must key by that coin's own mint -
+    the same key the daily incremental pull, the backtester, and every
+    dashboard coverage summary already read candles under - not a second,
+    disconnected entry keyed by the bare Binance symbol. Otherwise a full-
+    history pull would download real candles for an already-routed coin
+    and nothing that already reads its coverage would ever see them."""
+    conn = workspace["conn"]
+    conn.execute(
+        "INSERT INTO universe(mint, symbol, binance_pair, updated_at) VALUES (?,?,?,?)",
+        (MINT_A, "ZEC", "ZECUSDT", db.now()),
+    )
+    conn.commit()
+
+    binance = FakeBinance(assets=[
+        BinanceAsset(symbol="ZEC", quote_volume_24h=1.0, pair="ZECUSDT"),
+        BinanceAsset(symbol="AAA", quote_volume_24h=1.0, pair="AAAUSDT"),
+    ])
+    store = DataStore(binance, {"candle_minutes": 1})
+
+    pairs = store.full_binance_pairs()
+
+    assert pairs[MINT_A] == "ZECUSDT"   # keyed by the mint, not "ZEC"
+    assert "ZEC" not in pairs           # no disconnected duplicate entry
+    assert pairs["AAA"] == "AAAUSDT"    # a non-routed pair still keys by symbol
 
 
 def test_estimate_full_pull_is_always_labelled_an_upper_bound():

@@ -431,12 +431,30 @@ class DataStore:
     # upper bound, never as a real estimate.
     ASSUMED_MAX_HISTORY_YEARS = 7
 
-    def full_binance_pairs(self) -> dict[str, str]:
-        """``{base_symbol: pair}`` for every base asset Binance.US currently
-        lists - most have no Solana mint at all, so this is keyed by the
-        base symbol itself (e.g. "BTC"), not a mint address. Entirely
-        independent of the routed `universe` table."""
-        return {a.symbol: a.pair for a in self.binance.all_bases()}
+    def full_binance_pairs(self, conn: sqlite3.Connection | None = None) -> dict[str, str]:
+        """``{storage_key: pair}`` for every base asset Binance.US currently
+        lists - entirely independent of the routed `universe` table's own
+        liquidity/volume floors (nothing is excluded because of them), but
+        for a pair that *is* currently routed, the storage key is that
+        coin's own mint - the same key the daily incremental pull, the
+        backtester, and every dashboard summary already read candles under
+        - rather than a second, disconnected entry keyed by the bare
+        Binance symbol. Without this, a full-history pull would silently
+        leave every already-routed coin's own coverage unchanged: it would
+        still download real candles, just under a key nothing else ever
+        looks at.
+        """
+        conn = conn or db.connect()
+        mint_by_pair = {
+            row["binance_pair"]: row["mint"]
+            for row in conn.execute(
+                "SELECT mint, binance_pair FROM universe "
+                "WHERE binance_pair IS NOT NULL AND binance_pair != ''"
+            ).fetchall()
+        }
+        return {
+            mint_by_pair.get(a.pair, a.symbol): a.pair for a in self.binance.all_bases()
+        }
 
     def estimate_full_pull(self, token_count: int) -> dict[str, Any]:
         """Upper-bound cost of a full-history pull across `token_count`

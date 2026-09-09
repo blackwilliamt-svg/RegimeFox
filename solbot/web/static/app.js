@@ -32,6 +32,18 @@
 
   function el(id) { return document.getElementById(id); }
   function money(v) { return (v < 0 ? "-$" : "$") + Math.abs(v).toFixed(2); }
+
+  // Same "how many decimals actually mean something" scaling charts.js's own
+  // (private, unexported) fmtPrice uses for the axis labels - duplicated
+  // rather than reaching into that module's closure for one small function.
+  function fmtLivePrice(v) {
+    if (v === null || v === undefined || !isFinite(v) || v === 0) return "—";
+    var abs = Math.abs(v);
+    if (abs >= 1000) return "$" + v.toFixed(0);
+    if (abs >= 1) return "$" + v.toFixed(2);
+    if (abs >= 0.01) return "$" + v.toFixed(4);
+    return "$" + v.toPrecision(3);
+  }
   function pct(v) { return (v >= 0 ? "+" : "") + v.toFixed(2) + "%"; }
   function cls(v) { return v > 0 ? "pos" : (v < 0 ? "neg" : "dim"); }
   function esc(s) {
@@ -366,6 +378,7 @@
       if (!marketMint) {
         if (hint) hint.textContent = "No coins in the universe yet — try Refresh universe.";
         renderRegimeReadout(false, null);
+        setText("marketPrice", "");
         return;
       }
       if (hint) {
@@ -381,6 +394,7 @@
         (withRegime ? "&regime=1" : "") + indicatorQuery(settings);
       return get(url).then(function (d) {
         var ind = d.indicators || {};
+        setText("marketPrice", fmtLivePrice(d.current_price));
         var resetZoom = marketLastKey !== (marketMint + "|" + marketInterval);
         marketLastKey = marketMint + "|" + marketInterval;
         window.SolChart.candles(canvas, d.candles, {

@@ -211,3 +211,45 @@ def test_candles_endpoint_rejects_an_unrecognised_interval_by_ignoring_it(client
     with_bad_interval = client.get(f"/api/candles/{MINT}?limit=1000&interval=3m").get_json()
     without_interval = client.get(f"/api/candles/{MINT}?limit=1000").get_json()
     assert len(with_bad_interval["candles"]) == len(without_interval["candles"]) == 5
+
+
+# --------------------------------------------------------------------------
+# Dashboard fix-up: the market chart had no current price displayed at all.
+# --------------------------------------------------------------------------
+def test_candles_endpoint_reports_the_live_scanner_price_when_available(client, workspace):
+    from solbot import db
+
+    _seed_candles(MINT)
+    db.kv_set("last_prices", {MINT: 42.5})
+
+    body = client.get(f"/api/candles/{MINT}?limit=60").get_json()
+    assert body["current_price"] == 42.5
+
+
+def test_candles_endpoint_falls_back_to_the_last_recorded_tick(client, workspace):
+    from solbot import db
+
+    _seed_candles(MINT)
+    conn = db.connect()
+    conn.execute(
+        "INSERT INTO price_ticks(mint, ts, price) VALUES (?,?,?)", (MINT, db.now(), 7.25)
+    )
+    conn.commit()
+
+    body = client.get(f"/api/candles/{MINT}?limit=60").get_json()
+    assert body["current_price"] == 7.25
+
+
+def test_candles_endpoint_falls_back_to_the_last_stored_candle_when_the_worker_never_ran(client, workspace):
+    """No live scanner tick and no price_ticks row at all (a fresh install,
+    or the worker has never been started) - the last stored candle's close
+    is still a real, honest number to show rather than blank."""
+    _seed_candles(MINT)
+    body = client.get(f"/api/candles/{MINT}?limit=60").get_json()
+    assert body["current_price"] == body["candles"][-1]["close"]
+
+
+def test_candles_endpoint_reports_zero_price_with_no_data_at_all(client, workspace):
+    _seed_universe_row(MINT, "MKTC")
+    body = client.get(f"/api/candles/{MINT}?limit=60").get_json()
+    assert body["current_price"] == 0.0
