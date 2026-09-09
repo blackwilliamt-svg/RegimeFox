@@ -117,6 +117,41 @@ def regenerate_backup_codes(
     return codes
 
 
+def update_password(
+    username: str, new_hash: str, conn: sqlite3.Connection | None = None
+) -> None:
+    """Replace a user's password hash only - TOTP secret, backup codes and
+    everything else on the row are untouched."""
+    conn = conn or db.connect()
+    username = username.strip().lower()
+    conn.execute(
+        "UPDATE users SET password_hash = ? WHERE username = ?", (new_hash, username)
+    )
+    db.log_event(
+        f"Password changed for {username!r}.", level="warn", category="auth", conn=conn
+    )
+
+
+def rename_user(
+    old_username: str, new_username: str, conn: sqlite3.Connection | None = None
+) -> None:
+    """Rename a user in place - password hash, TOTP secret and backup codes
+    all carry over unchanged, only the username column moves. A session held
+    under the old username simply stops resolving on its next request
+    (``current_user()`` is looked up fresh per request); that is expected,
+    not a bug to work around here."""
+    conn = conn or db.connect()
+    old_username = old_username.strip().lower()
+    new_username = new_username.strip().lower()
+    conn.execute(
+        "UPDATE users SET username = ? WHERE username = ?", (new_username, old_username)
+    )
+    db.log_event(
+        f"Dashboard user {old_username!r} renamed to {new_username!r}.",
+        category="auth", conn=conn,
+    )
+
+
 def _consume_backup_code(
     user: sqlite3.Row, code: str, conn: sqlite3.Connection
 ) -> bool:

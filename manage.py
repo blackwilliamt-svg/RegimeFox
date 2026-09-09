@@ -5,6 +5,8 @@
     python manage.py new-wallet
     python manage.py create-user <username>
     python manage.py backup-codes <username>
+    python manage.py change-password <username>
+    python manage.py rename-user <old_username> <new_username>
     python manage.py universe
     python manage.py pull --months 12
     python manage.py backtest --days 90
@@ -136,6 +138,40 @@ def cmd_backup_codes(args: argparse.Namespace) -> int:
     print("New backup codes (the old ones are now invalid):")
     for c in codes:
         print(f"  {c}")
+    return 0
+
+
+def cmd_change_password(args: argparse.Namespace) -> int:
+    from solbot.web.auth import get_user, hash_password, update_password
+
+    db.init_db()
+    if get_user(args.username) is None:
+        print(f"no such user: {args.username}")
+        return 1
+    password = getpass.getpass("Password (12+ chars): ")
+    if password != getpass.getpass("Confirm: "):
+        print("passwords do not match")
+        return 1
+    if len(password) < 12:
+        print("password must be 12+ characters")
+        return 1
+    update_password(args.username, hash_password(password))
+    print(f"Password updated for {args.username}.")
+    return 0
+
+
+def cmd_rename_user(args: argparse.Namespace) -> int:
+    from solbot.web.auth import get_user, rename_user
+
+    db.init_db()
+    if get_user(args.old_username) is None:
+        print(f"no such user: {args.old_username}")
+        return 1
+    if get_user(args.new_username) is not None:
+        print(f"a user named {args.new_username} already exists")
+        return 1
+    rename_user(args.old_username, args.new_username)
+    print(f"Renamed {args.old_username} to {args.new_username}.")
     return 0
 
 
@@ -435,6 +471,15 @@ def main() -> int:
     p = sub.add_parser("backup-codes", help="regenerate a user's backup codes")
     p.add_argument("username")
     p.set_defaults(fn=cmd_backup_codes)
+
+    p = sub.add_parser("change-password", help="change a dashboard user's password")
+    p.add_argument("username")
+    p.set_defaults(fn=cmd_change_password)
+
+    p = sub.add_parser("rename-user", help="rename a dashboard user")
+    p.add_argument("old_username")
+    p.add_argument("new_username")
+    p.set_defaults(fn=cmd_rename_user)
 
     sub.add_parser("universe", help="refresh and print the tradeable universe").set_defaults(
         fn=cmd_universe
