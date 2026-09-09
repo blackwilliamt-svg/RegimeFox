@@ -6,10 +6,11 @@ from __future__ import annotations
 
 import time
 
+from solbot import db
 from solbot.candlestore import ParquetCandleStore
 from solbot.clients.base import ApiError
 from solbot.clients.binance import Candle
-from solbot.datastore import DataStore, _month_bounds
+from solbot.datastore import JOB_INITIAL_PULL, DataStore, _month_bounds
 
 from fakes import FakeBinance
 
@@ -85,6 +86,35 @@ def test_bulk_backfill_skips_a_failed_month_but_keeps_going(tmp_path):
     assert report.tokens_done == 1          # the token still completes...
     assert report.candles_written == 1      # ...just with one month's data missing
     assert len(calls) == 2                  # both months were attempted
+
+
+def test_run_initial_pull_reports_overall_status_not_a_bare_fraction(tmp_path, workspace, monkeypatch):
+    """Progress bar sizing/clarity fix-up (spec item 3): the per-token
+    progress message reads as overall status ("X of Y tokens complete"),
+    not a raw "X/Y tokens - <pair>" counter fragment."""
+    binance = FakeBinance(klines_fn=lambda pair, since, until: [])
+    store = DataStore(binance, {"candle_minutes": 1}, candles=ParquetCandleStore(tmp_path / "candles"))
+
+    seen_messages: list[str] = []
+    original_set_progress = db.set_progress
+
+    def spy(job, **kwargs):
+        if job == JOB_INITIAL_PULL and kwargs.get("status") == "running":
+            seen_messages.append(kwargs.get("message", ""))
+        return original_set_progress(job, **kwargs)
+
+    monkeypatch.setattr("solbot.datastore.db.set_progress", spy)
+    store.run_initial_pull({MINT_A: "BTCUSD", MINT_B: "ETHUSD"}, months=1)
+
+    per_token = [m for m in seen_messages if "of" in m]
+    assert per_token, seen_messages
+    assert any(
+        m == "Pulling historical data — 1 of 2 tokens complete (BTCUSD now)"
+        or m == "Pulling historical data — 2 of 2 tokens complete (ETHUSD now)"
+        for m in per_token
+    )
+    # the old raw-counter phrasing is gone entirely, not just supplemented
+    assert not any(m.startswith(("1/2", "2/2")) for m in seen_messages)
 
 
 def test_bulk_backfill_respects_should_stop_between_tokens(tmp_path):

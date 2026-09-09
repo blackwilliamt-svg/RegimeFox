@@ -465,7 +465,7 @@ def run_and_store(
             status="running",
             done=done,
             total=total,
-            message=f"Loading {done}/{total} tokens",
+            message=f"Running backtest — {done} of {total} tokens loaded ({mint} now)",
             conn=conn,
         )
 

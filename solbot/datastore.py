@@ -361,7 +361,7 @@ class DataStore:
                 status="running",
                 done=done,
                 total=tot,
-                message=f"{done}/{tot} tokens - {pair}…",
+                message=f"Pulling historical data — {done} of {tot} tokens complete ({pair} now)",
                 conn=conn,
             )
 
