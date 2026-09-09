@@ -202,6 +202,46 @@ def test_run_monthly_launches_a_batch_per_chunk_and_verifies_teardown(workspace,
     assert any("teardown check" in e["message"].lower() for e in events)
 
 
+def test_run_monthly_falls_back_to_the_configured_gpu_tier_on_a_capacity_miss(workspace, settings):
+    """runpod_gpu_type_fallback (fix-up: RunPod capacity errors) reaches
+    the live pod-launch path - unlike the benchmark, which never falls
+    back to a different tier than the one it is measuring."""
+    from tests.test_runpod import FakeTransport
+
+    conn = workspace["conn"]
+    _seed_universe(conn, {MINT_A: "AAAUSDT"})
+    _seed_minutes(MINT_A, days=1)
+
+    transport = FakeTransport()
+    transport.pod_capacity_fails["NVIDIA GeForce RTX 4090"] = 999   # never has room
+    client = RunPodClient(
+        api_key="test-key", transport=transport,
+        poll_interval_seconds=0.01, max_poll_seconds=0.05, capacity_retry_delay_seconds=0.0,
+    )
+    store = DataStore(binance=None, cfg=settings)
+
+    result = wfmc.run_monthly(
+        {**settings, "runpod_gpu_type_fallback": "NVIDIA RTX A5000"},
+        store, _Secrets(), conn=conn, runpod_client=client,
+    )
+
+    assert result["ran"]
+    assert len(result["jobs"]) == 1
+    pod_calls = [c for c in transport.calls if c[0] == "POST" and c[1] == "/pods"]
+    assert pod_calls[-1][2]["gpuTypeIds"] == ["NVIDIA RTX A5000"]
+
+
+def test_gpu_type_fallback_parses_a_comma_separated_list_in_order():
+    assert wfmc._gpu_type_fallback(
+        {"runpod_gpu_type_fallback": "NVIDIA RTX A5000, NVIDIA GeForce RTX 3090"}
+    ) == ["NVIDIA RTX A5000", "NVIDIA GeForce RTX 3090"]
+
+
+def test_gpu_type_fallback_is_empty_when_unset():
+    assert wfmc._gpu_type_fallback({}) == []
+    assert wfmc._gpu_type_fallback({"runpod_gpu_type_fallback": ""}) == []
+
+
 # --------------------------------------------------------------------------
 # GPU-tier benchmark (gap-closure item 7)
 # --------------------------------------------------------------------------

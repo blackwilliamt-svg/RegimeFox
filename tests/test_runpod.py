@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from solbot.runpod import RunPodClient, RunPodError
+from solbot.runpod import RunPodCapacityError, RunPodClient, RunPodError
 
 
 class FakeTransport:
@@ -26,6 +26,14 @@ class FakeTransport:
         # is reachable at all.
         self.gpu_prices: dict[str, float] = {}
         self.gputypes_fails: bool = False
+        # gpu_type -> number of times POST /pods for that tier should raise
+        # RunPodCapacityError before it is allowed to succeed - simulates
+        # "no capacity right now" without touching the network at all.
+        self.pod_capacity_fails: dict[str, int] = {}
+        # When set, every POST /pods raises this instead - a non-capacity
+        # failure (bad schema, bad auth, ...) that must not be retried or
+        # trigger a tier fallback the way a capacity miss does.
+        self.pod_error: Exception | None = None
 
     def _id(self, prefix: str) -> str:
         value = f"{prefix}-{self._next_id}"
@@ -54,8 +62,18 @@ class FakeTransport:
             return dict(self.volumes[vol_id])
 
         if method == "POST" and path == "/pods":
+            if self.pod_error is not None:
+                raise self.pod_error
+            gpu_type = (json.get("gpuTypeIds") or [None])[0]
+            remaining = self.pod_capacity_fails.get(gpu_type, 0)
+            if remaining > 0:
+                self.pod_capacity_fails[gpu_type] = remaining - 1
+                raise RunPodCapacityError(
+                    "RunPod POST /pods returned HTTP 500: "
+                    "could not find any pods with required specifications"
+                )
             pod_id = self._id("pod")
-            self.pods[pod_id] = {"id": pod_id, "status": "RUNNING"}
+            self.pods[pod_id] = {"id": pod_id, "status": "RUNNING", "gpuType": gpu_type}
             self._poll_counts[pod_id] = 0
             return dict(self.pods[pod_id])
 
@@ -112,6 +130,7 @@ def client(transport) -> RunPodClient:
     return RunPodClient(
         api_key="test-key", transport=transport,
         poll_interval_seconds=0.01, max_poll_seconds=0.05,
+        capacity_retry_delay_seconds=0.0,
     )
 
 
@@ -137,6 +156,117 @@ def test_terminate_pod_stops_and_removes_it(client, transport):
     pod = client.create_pod(name="x", gpu_type="g", volume_id="v", env={})
     client.terminate_pod(pod["id"])
     assert not client.pod_exists_and_running(pod["id"])
+
+
+# --------------------------------------------------------------------------
+# Capacity errors: detection, retry, and GPU-tier fallback (fix-up: RunPod
+# returns an HTTP 500 with "could not find any pods with required
+# specifications" when no capacity is available for the requested tier -
+# transient, not a bug, so the request is worth retrying, or trying a
+# different tier, rather than failing the whole batch immediately.
+# --------------------------------------------------------------------------
+def test_create_pod_raises_the_capacity_specific_subclass(client, transport):
+    transport.pod_capacity_fails["g"] = 1   # never clears - every attempt fails
+    with pytest.raises(RunPodCapacityError):
+        client.create_pod(name="x", gpu_type="g", volume_id="v", env={})
+
+
+def test_a_non_capacity_error_is_not_a_capacity_error(client, transport):
+    """A different failure (bad schema, bad auth, ...) must not be mistaken
+    for a capacity miss - launch_batch's retry/fallback must not fire for it."""
+    transport.pod_error = RunPodError(
+        "RunPod POST /pods returned HTTP 400: malformed request"
+    )
+    with pytest.raises(RunPodError) as exc_info:
+        client.create_pod(name="x", gpu_type="g", volume_id="v", env={})
+    assert not isinstance(exc_info.value, RunPodCapacityError)
+
+
+def _launch(client, transport, *, gpu_type="tier-a", fallback=(), mints=("AAA",)):
+    return client.launch_batch(
+        batch_index=0, mints=list(mints), candles=FakeCandles(), interval="1m",
+        gpu_type=gpu_type, report_run_id=1, gpu_type_fallback=fallback,
+    )
+
+
+def test_launch_batch_retries_a_capacity_miss_and_then_succeeds(client, transport):
+    # Fails twice, then succeeds on the third attempt - within the default
+    # capacity_retry_attempts=3.
+    transport.pod_capacity_fails["tier-a"] = 2
+
+    job = _launch(client, transport)
+
+    assert job["gpu_type"] == "tier-a"
+    pod_calls = [c for c in transport.calls if c[0] == "POST" and c[1] == "/pods"]
+    assert len(pod_calls) == 3   # two failures, one success
+
+
+def test_launch_batch_does_not_retry_a_non_capacity_error(client, transport):
+    """A schema/auth-shaped RunPodError must fail immediately, not eat three
+    retries' worth of time on something retrying can never fix."""
+    transport.pod_error = RunPodError(
+        "RunPod POST /pods returned HTTP 400: malformed request"
+    )
+
+    with pytest.raises(RunPodError) as exc_info:
+        _launch(client, transport)
+    assert not isinstance(exc_info.value, RunPodCapacityError)
+
+    pod_calls = [c for c in transport.calls if c[0] == "POST" and c[1] == "/pods"]
+    assert len(pod_calls) == 1   # no retry at all
+
+
+def test_launch_batch_falls_back_to_the_next_tier_when_the_preferred_one_is_full(client, transport):
+    # The preferred tier never has capacity; the fallback tier succeeds
+    # immediately.
+    transport.pod_capacity_fails["tier-a"] = 999
+
+    job = _launch(client, transport, fallback=("tier-b",))
+
+    assert job["gpu_type"] == "tier-b"
+    pod_calls = [c for c in transport.calls if c[0] == "POST" and c[1] == "/pods"]
+    # capacity_retry_attempts (3) failed attempts on tier-a, then one
+    # successful attempt on tier-b.
+    assert len(pod_calls) == 4
+    assert [c[2]["gpuTypeIds"][0] for c in pod_calls] == ["tier-a", "tier-a", "tier-a", "tier-b"]
+
+
+def test_launch_batch_raises_clearly_when_every_tier_is_exhausted(client, transport):
+    transport.pod_capacity_fails["tier-a"] = 999
+    transport.pod_capacity_fails["tier-b"] = 999
+
+    with pytest.raises(RunPodError) as exc_info:
+        _launch(client, transport, fallback=("tier-b",))
+
+    message = str(exc_info.value)
+    assert "tier-a" in message
+    assert "tier-b" in message
+
+
+def test_launch_batch_cleans_up_the_volume_when_every_tier_is_exhausted(client, transport):
+    transport.pod_capacity_fails["tier-a"] = 999
+
+    with pytest.raises(RunPodError):
+        _launch(client, transport)
+
+    # The network volume created for the pod that never started must not be
+    # left behind billing the operator for nothing.
+    assert not transport.volumes
+
+
+def test_launch_batch_with_no_fallback_configured_only_retries_the_one_tier(client, transport):
+    """The GPU-tier benchmark's own call path - gpu_type_fallback left at
+    its default empty tuple - must behave exactly like retry-only, no
+    silent substitution of a different tier."""
+    transport.pod_capacity_fails["tier-a"] = 999
+
+    with pytest.raises(RunPodError) as exc_info:
+        _launch(client, transport)
+
+    assert "tier-a" in str(exc_info.value)
+    pod_calls = [c for c in transport.calls if c[0] == "POST" and c[1] == "/pods"]
+    assert len(pod_calls) == client.capacity_retry_attempts
+    assert all(c[2]["gpuTypeIds"] == ["tier-a"] for c in pod_calls)
 
 
 # --------------------------------------------------------------------------

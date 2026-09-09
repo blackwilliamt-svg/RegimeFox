@@ -25,9 +25,16 @@ import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Protocol, Sequence
 
 log = logging.getLogger(__name__)
+
+# The exact substring RunPod's own API uses for "no capacity right now" - a
+# real pod-creation call surfaced this as an HTTP 500 with this message once
+# the request itself was well-formed. Transient, not a bug: the same tier
+# often succeeds minutes later, and a different tier may have capacity right
+# now even if the preferred one doesn't.
+CAPACITY_ERROR_TEXT = "could not find any pods with required specifications"
 
 API_BASE = "https://rest.runpod.io/v1"
 # GPU catalog/pricing is GraphQL-only - see HttpxTransport's docstring.
@@ -56,6 +63,14 @@ BENCHMARK_TIMEOUT_SECONDS = 20 * 60
 
 class RunPodError(RuntimeError):
     """RunPod refused a request or could not be reached."""
+
+
+class RunPodCapacityError(RunPodError):
+    """RunPod has no current capacity for the requested spec (CAPACITY_ERROR_TEXT)
+    - a transient availability condition worth retrying, or trying a
+    different GPU tier, not a bug to fix. Every other RunPodError (a bad
+    key, a malformed request, an unreachable API) is not this and must not
+    be retried the same way."""
 
 
 @dataclass(slots=True)
@@ -134,7 +149,10 @@ class HttpxTransport:
         except httpx.HTTPError as exc:
             raise RunPodError(f"could not reach RunPod: {exc}") from exc
         if response.status_code >= 400:
-            raise RunPodError(f"RunPod {method} {path} returned HTTP {response.status_code}: {response.text[:300]}")
+            message = f"RunPod {method} {path} returned HTTP {response.status_code}: {response.text[:300]}"
+            if CAPACITY_ERROR_TEXT in response.text:
+                raise RunPodCapacityError(message)
+            raise RunPodError(message)
         try:
             return response.json() if response.content else {}
         except ValueError as exc:
@@ -175,6 +193,11 @@ class RunPodClient:
     # rather than actually sleeping through a poll loop.
     poll_interval_seconds: float = POLL_INTERVAL_SECONDS
     max_poll_seconds: float = MAX_POLL_SECONDS
+    # How many times to retry a single GPU tier on a capacity miss before
+    # moving on (to a fallback tier, if one was given, or giving up), and how
+    # long to wait between attempts - also overridable in tests.
+    capacity_retry_attempts: int = 3
+    capacity_retry_delay_seconds: float = 15.0
 
     def __post_init__(self) -> None:
         if self.transport is None:
@@ -308,6 +331,32 @@ class RunPodClient:
             },
         )
 
+    def _create_pod_with_retries(
+        self, *, name: str, gpu_type: str, volume_id: str, env: dict[str, str]
+    ) -> dict[str, Any]:
+        """create_pod on one specific tier, retrying a transient capacity
+        miss a few times before giving up on this tier - retry lives here,
+        at the call site, rather than inside create_pod itself, so a caller
+        that wants the raw single-attempt behaviour (or a different retry
+        policy) still has it available. Only RunPodCapacityError retries;
+        every other RunPodError (bad key, malformed request, unreachable
+        API) still fails immediately, on the first attempt.
+        """
+        last_exc: RunPodCapacityError | None = None
+        for attempt in range(1, self.capacity_retry_attempts + 1):
+            try:
+                return self.create_pod(name=name, gpu_type=gpu_type, volume_id=volume_id, env=env)
+            except RunPodCapacityError as exc:
+                last_exc = exc
+                log.warning(
+                    "no RunPod capacity for %s (attempt %d/%d): %s",
+                    gpu_type, attempt, self.capacity_retry_attempts, exc,
+                )
+                if attempt < self.capacity_retry_attempts:
+                    time.sleep(self.capacity_retry_delay_seconds)
+        assert last_exc is not None   # the loop always either returns or sets this
+        raise last_exc
+
     def pod_status(self, pod_id: str) -> str:
         data = self.transport.request("GET", f"/pods/{pod_id}")
         return str(data.get("desiredStatus") or data.get("status") or "UNKNOWN").upper()
@@ -345,14 +394,26 @@ class RunPodClient:
         s3_access_key: str = "",
         s3_secret_key: str = "",
         extra_env: dict[str, str] | None = None,
+        gpu_type_fallback: Sequence[str] = (),
     ) -> dict[str, Any]:
         """Ship one coin batch's data up and start its worker.
 
-        Returns ``{"pod_id", "volume_id", "mints"}`` so the caller can poll
-        and, later, verify teardown. `extra_env` layers on top of the
-        standard reporting env - benchmark_tier (gap-closure item 7) uses it
-        to cap the search to a small representative slice rather than a full
-        monthly-sized run.
+        Returns ``{"pod_id", "volume_id", "mints", "gpu_type"}`` so the
+        caller can poll and, later, verify teardown; ``gpu_type`` is
+        whichever tier actually launched, which may not be the preferred
+        one - see ``gpu_type_fallback`` below. `extra_env` layers on top of
+        the standard reporting env - benchmark_tier (gap-closure item 7)
+        uses it to cap the search to a small representative slice rather
+        than a full monthly-sized run.
+
+        ``gpu_type_fallback``, when given, is tried in order after
+        ``gpu_type`` itself is exhausted (each tier gets its own
+        ``capacity_retry_attempts`` retries first) - a capacity miss on the
+        preferred tier does not have to fail the whole batch when a less-
+        preferred one has room right now. Leave empty for the single-tier,
+        retry-only behaviour (what the GPU-tier benchmark uses - it wants
+        to measure each configured tier itself, not silently substitute a
+        different one).
         """
         import tempfile
 
@@ -374,19 +435,43 @@ class RunPodClient:
                     "uploaded (dry-run/test mode)", batch_index,
                 )
 
-        pod = self.create_pod(
-            name=f"wfmc-batch-{batch_index}",
-            gpu_type=gpu_type,
-            volume_id=volume_id,
-            env={
-                "SOLOPT_DROPLET_URL": droplet_url,
-                "SOLOPT_TOKEN": droplet_token,
-                "SOLOPT_REPORT_RUN_ID": str(report_run_id),
-                "SOLOPT_CONFIG": "/data/solopt.json",
-                **(extra_env or {}),
-            },
-        )
-        return {"pod_id": pod["id"], "volume_id": volume_id, "mints": mints}
+        env = {
+            "SOLOPT_DROPLET_URL": droplet_url,
+            "SOLOPT_TOKEN": droplet_token,
+            "SOLOPT_REPORT_RUN_ID": str(report_run_id),
+            "SOLOPT_CONFIG": "/data/solopt.json",
+            **(extra_env or {}),
+        }
+
+        tried: list[str] = []
+        last_exc: RunPodCapacityError | None = None
+        for tier in (gpu_type, *gpu_type_fallback):
+            tried.append(tier)
+            try:
+                pod = self._create_pod_with_retries(
+                    name=f"wfmc-batch-{batch_index}", gpu_type=tier, volume_id=volume_id, env=env,
+                )
+            except RunPodCapacityError as exc:
+                last_exc = exc
+                continue
+            if tier != gpu_type:
+                log.warning(
+                    "RunPod had no capacity for %s on batch %d; launched on the "
+                    "fallback tier %s instead", gpu_type, batch_index, tier,
+                )
+            return {"pod_id": pod["id"], "volume_id": volume_id, "mints": mints, "gpu_type": tier}
+
+        # Every tier (preferred plus every fallback) exhausted its retries -
+        # the volume was created for a pod that never started, so it must
+        # not be left behind; a cleanup failure is logged, not raised, so
+        # the real error (no capacity anywhere) is what the caller sees.
+        try:
+            self.delete_network_volume(volume_id)
+        except RunPodError:
+            log.warning("could not clean up unused volume %s after a failed launch", volume_id)
+        raise RunPodError(
+            f"no RunPod capacity for batch {batch_index} on any tier tried: {', '.join(tried)}"
+        ) from last_exc
 
     def wait_for_completion(
         self, jobs: list[dict[str, Any]], *, max_seconds: float | None = None

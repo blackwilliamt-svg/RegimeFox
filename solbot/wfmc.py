@@ -117,6 +117,16 @@ def candles_interval() -> str:
     return BASE_INTERVAL
 
 
+def _gpu_type_fallback(cfg: dict[str, Any]) -> list[str]:
+    """The operator's own ranked list of GPU tiers to fall back to when the
+    preferred `runpod_gpu_type` has no capacity - only used by the live
+    pod-launch paths (this function's callers), never by the benchmark,
+    which wants to measure each of its own configured tiers directly
+    rather than have one silently substitute for another."""
+    raw = str(cfg.get("runpod_gpu_type_fallback") or "")
+    return [t.strip() for t in raw.split(",") if t.strip()]
+
+
 # --------------------------------------------------------------------------
 # Focused grid (the daily search space)
 # --------------------------------------------------------------------------
@@ -330,12 +340,13 @@ def run_monthly(
                 mints=batch,
                 candles=store.candles,
                 interval=candles_interval(),
-                gpu_type=str(cfg.get("runpod_gpu_type") or "NVIDIA RTX 4090"),
+                gpu_type=str(cfg.get("runpod_gpu_type") or "NVIDIA GeForce RTX 4090"),
                 report_run_id=run_id,
                 droplet_url=str(cfg.get("runpod_callback_url") or ""),
                 droplet_token=getattr(secrets, "bulk_data_token", ""),
                 s3_access_key=getattr(secrets, "runpod_s3_access_key", ""),
                 s3_secret_key=getattr(secrets, "runpod_s3_secret_key", ""),
+                gpu_type_fallback=_gpu_type_fallback(cfg),
             )
             jobs.append({"run_id": run_id, **job})
         except RunPodError as exc:
@@ -618,7 +629,7 @@ def run_regime_pass(
                 mints=batch,
                 candles=store.candles,
                 interval=candles_interval(),
-                gpu_type=str(cfg.get("runpod_gpu_type") or "NVIDIA RTX 4090"),
+                gpu_type=str(cfg.get("runpod_gpu_type") or "NVIDIA GeForce RTX 4090"),
                 report_run_id=run_id,
                 droplet_url=str(cfg.get("runpod_callback_url") or ""),
                 droplet_token=getattr(secrets, "bulk_data_token", ""),
@@ -629,6 +640,7 @@ def run_regime_pass(
                     "SOLOPT_REGIME_K_RANGE": ",".join(str(k) for k in k_range),
                     "SOLOPT_REGIME_MEMBERSHIP_THRESHOLD": str(threshold),
                 },
+                gpu_type_fallback=_gpu_type_fallback(cfg),
             )
             jobs.append({"run_id": run_id, **job})
         except RunPodError as exc:

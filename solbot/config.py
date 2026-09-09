@@ -296,7 +296,16 @@ DEFAULTS: dict[str, Any] = {
     "wfmc_monthly_enabled": False,        # off until RUNPOD_API_KEY is set
     "wfmc_monthly_day_utc": 1,
     "wfmc_monthly_hour_utc": 3,
-    "runpod_gpu_type": "NVIDIA RTX 4090",  # benchmark on RunPod before trusting this
+    # Must match RunPod's own gpuTypeIds enum exactly (confirmed against
+    # GET /v1/openapi.json's PodCreateInput schema after a real pod-launch
+    # attempt) - consumer cards use their full "GeForce" name.
+    "runpod_gpu_type": "NVIDIA GeForce RTX 4090",
+    # Ranked fallback tiers, comma-separated, tried in order (each with its
+    # own capacity-retry attempts first) when runpod_gpu_type itself has no
+    # capacity - empty means "retry the preferred tier only, then fail".
+    # Live pod launches only (solbot.wfmc.run_monthly/run_regime_pass); the
+    # GPU-tier benchmark always measures its own configured tiers directly.
+    "runpod_gpu_type_fallback": "",
     "runpod_batch_size": 75,              # coins per parallel RunPod job
     "runpod_callback_url": "",             # this droplet's own public URL
     # Auto-promotion from shadow to live: no manual approval, but a long clean
@@ -470,6 +479,11 @@ BOOLS = {
 # interpolated anywhere that would let one become an injection.
 STRINGS: dict[str, int] = {
     "runpod_gpu_type": 64,
+    # A handful of GPU tier names, comma-separated - not modeled as a LISTS
+    # entry (that mechanism sorts its values, and fallback order is exactly
+    # the thing that must survive intact) so it stays a plain length-bounded
+    # string and solbot.wfmc._gpu_type_fallback splits it itself.
+    "runpod_gpu_type_fallback": 256,
     "runpod_callback_url": 512,
 }
 
