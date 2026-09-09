@@ -188,7 +188,7 @@ def verify_totp(user: sqlite3.Row, token: str, conn: sqlite3.Connection) -> bool
 
 def provisioning_uri(username: str, secret: str) -> str:
     return pyotp.TOTP(secret).provisioning_uri(
-        name=username, issuer_name="Solana TA Bot"
+        name=username, issuer_name="RegimeFox"
     )
 
 

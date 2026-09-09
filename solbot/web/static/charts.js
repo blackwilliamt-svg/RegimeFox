@@ -210,6 +210,7 @@
     if (opts.levels) {
       opts.levels.forEach(function (l) { if (l && isFinite(l.value) && l.value > 0) levels.push(l); });
     }
+    var currentPrice = (isFinite(opts.currentPrice) && opts.currentPrice > 0) ? opts.currentPrice : null;
 
     var overlays = opts.overlays || {};
 
@@ -223,6 +224,10 @@
       if (l.value < lo) lo = l.value;
       if (l.value > hi) hi = l.value;
     });
+    if (currentPrice !== null) {
+      if (currentPrice < lo) lo = currentPrice;
+      if (currentPrice > hi) hi = currentPrice;
+    }
     // Overlay lines (SMA/EMA/Bollinger) can run outside the candle high/low
     // range (a band widens past a spike, an EMA lags through one) - fold
     // them into the autoscale so they never get silently clipped off.
@@ -292,6 +297,33 @@
       ctx.fillStyle = color;
       ctx.fillRect(cx - cw / 2, top, cw, bh);
     });
+
+    /* current-price bar: a solid line across the full width of the chart at
+     * the live price (distinct from the dashed hard-stop/trailing/target
+     * "levels" below - always-on and always the same color, with a filled
+     * tag on the price axis so it reads at a glance against the candles). */
+    if (currentPrice !== null) {
+      var cpy = y(currentPrice);
+      ctx.strokeStyle = t.accent;
+      ctx.globalAlpha = 0.85;
+      ctx.lineWidth = 1.25;
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.moveTo(padL, cpy);
+      ctx.lineTo(padL + plotW, cpy);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+
+      var tag = fmtPrice(currentPrice);
+      ctx.font = "10px ui-monospace, monospace";
+      var tagW = ctx.measureText(tag).width + 8;
+      ctx.fillStyle = t.accent;
+      ctx.fillRect(padL + plotW, cpy - 7, tagW, 14);
+      ctx.fillStyle = t.panel;
+      ctx.textAlign = "left";
+      ctx.textBaseline = "middle";
+      ctx.fillText(tag, padL + plotW + 4, cpy);
+    }
 
     /* indicator overlays: SMA/EMA lines, Bollinger Bands (dashboard step 2).
      * A null entry (not-enough-warm-up-yet, or a gap) breaks the stroke into

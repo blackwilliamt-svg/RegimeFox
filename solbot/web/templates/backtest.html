@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}Backtest — Solana TA Bot{% endblock %}
+{% block title %}Backtest — RegimeFox{% endblock %}
 
 {% block content %}
 
@@ -17,10 +17,20 @@
     <div id="pullProgress" style="margin:12px 0">
       <div class="progress"><div id="pullBar" style="width:0%"></div></div>
       <p class="hint" id="pullLabel">{{ pull.message or 'Not run yet' }}</p>
+      <p id="pullError" class="hint warn" style="display:none; font-weight:600"></p>
     </div>
-    <form method="post" action="{{ url_for('dashboard.historical_pull') }}" class="btn-row" id="pullForm">
-      <button class="btn-primary" id="pullBtn">Start historical pull</button>
-    </form>
+    <div id="pullEtaBox" class="stat" style="display:none; margin:4px 0 12px">
+      <div class="label">Estimated time remaining</div>
+      <div class="value" id="pullEtaValue" style="font-size:26px">—</div>
+    </div>
+    <div class="btn-row" id="pullBtnRow">
+      <form method="post" action="{{ url_for('dashboard.historical_pull') }}" id="pullForm">
+        <button class="btn-primary" id="pullBtn" {{ 'disabled' if pull.status == 'running' }}>Start historical pull</button>
+      </form>
+      <form method="post" action="{{ url_for('dashboard.stop_historical_pull') }}" id="pullStopForm">
+        <button id="pullStopBtn" {{ 'disabled' if pull.status != 'running' }}>Stop pull</button>
+      </form>
+    </div>
     <p class="hint" id="pullEstimate" style="margin-top:8px">—</p>
     <div id="dailyPullProgress" style="margin:14px 0 0">
       <div class="progress"><div id="dailyPullBar" style="width:0%"></div></div>

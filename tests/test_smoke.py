@@ -170,6 +170,20 @@ def test_kill_switch_command_engages_and_releases(engine, workspace):
     assert not risk.kill_switch_engaged(conn)
 
 
+def test_stop_pull_command_sets_the_flag_the_pull_worker_checks(engine, workspace):
+    """The dashboard's Stop button (historical-pull stop/restart fix-up)
+    goes through the same command queue as every other control action -
+    stop_pull just has to reach engine._pull_stop, which _start_pull's
+    background thread polls as its should_stop callback."""
+    conn = workspace["conn"]
+    engine.startup()
+
+    assert not engine._pull_stop.is_set()
+    db.enqueue_command("stop_pull", {}, requested_by="tester", conn=conn)
+    engine.drain_commands()
+    assert engine._pull_stop.is_set()
+
+
 def test_unknown_command_does_not_crash_the_loop(engine, workspace):
     conn = workspace["conn"]
     engine.startup()
@@ -343,7 +357,7 @@ def test_full_login_flow_with_totp(app, workspace):
 
     page = client.get("/")
     assert page.status_code == 200
-    assert b"Solana TA Bot" in page.data
+    assert b"RegimeFox" in page.data
 
     status = client.get("/api/status")
     assert status.status_code == 200

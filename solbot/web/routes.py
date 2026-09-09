@@ -287,6 +287,17 @@ def historical_pull():
     return redirect(url_for("dashboard.backtest"))
 
 
+@bp.route("/backtest/pull/stop", methods=["POST"])
+def stop_historical_pull():
+    """Stops the running full-history pull after its current pair finishes -
+    it checks between pairs, not mid-download, so this is not instant.
+    'Start historical pull' resumes from the stop point: already-written
+    candles are on disk, and the next run just re-pages from there."""
+    _enqueue("stop_pull", {})
+    flash("Stopping the historical pull - it will finish its current pair first.", "success")
+    return redirect(url_for("dashboard.backtest"))
+
+
 # --------------------------------------------------------------------------
 # settings
 # --------------------------------------------------------------------------

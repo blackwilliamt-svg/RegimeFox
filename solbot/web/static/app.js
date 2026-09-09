@@ -403,7 +403,8 @@
           volume: settings.volume,
           overlays: { sma: ind.sma, ema: ind.ema, bbands: ind.bbands },
           enableZoomPan: true,
-          resetZoom: resetZoom
+          resetZoom: resetZoom,
+          currentPrice: d.current_price
         });
         renderRegimeReadout(withRegime, d.regime);
 
@@ -587,10 +588,12 @@
       // Binance.US pull is a long, rate-limited job, so clicking it again
       // mid-run would just queue a second one on top of the first.
       var pullBtn = el("pullBtn");
+      var pullStopBtn = el("pullStopBtn");
       if (pullBtn && d.historical_pull) {
         var pullRunning = d.historical_pull.status === "running";
         pullBtn.disabled = pullRunning;
         pullBtn.textContent = pullRunning ? "Running…" : "Start historical pull";
+        if (pullStopBtn) pullStopBtn.disabled = !pullRunning;
       }
       var cov = el("candleCoverage");
       if (cov && d.candle_coverage) {
@@ -637,6 +640,48 @@
         : (p.status === "idle" ? "Not run yet" : p.status + ": " + (p.message || ""));
     }
     wrap.style.display = "";
+
+    // A dedicated, styled error line (prefix + "Error") - a stopped-with-
+    // failure job is worth calling out distinctly from the ordinary
+    // "cancelled by operator" or "done" cases the label line already covers.
+    var errEl = el(prefix + "Error");
+    if (errEl) {
+      if (p.status === "failed") {
+        errEl.textContent = "Error: " + (p.message || "the pull stopped unexpectedly");
+        errEl.style.display = "";
+      } else {
+        errEl.style.display = "none";
+      }
+    }
+
+    // A prominent, live-updating time-remaining readout (prefix + "EtaBox"/
+    // "EtaValue") - derived from actual observed throughput (elapsed time
+    // vs. done/total) rather than the static upper-bound estimate shown
+    // before the job starts, so it tightens up as real progress comes in.
+    var etaBox = el(prefix + "EtaBox");
+    var etaValue = el(prefix + "EtaValue");
+    if (etaBox && etaValue) {
+      var done = p.done || 0, total = p.total || 0;
+      if (p.status === "running" && done > 0 && total > done && p.started_at) {
+        var elapsedS = (Date.now() / 1000) - p.started_at;
+        var remainingS = Math.max(0, (elapsedS / done) * (total - done));
+        etaValue.textContent = "~" + formatDuration(remainingS) + " remaining (" +
+          done + " of " + total + ")";
+        etaBox.style.display = "";
+      } else {
+        etaBox.style.display = "none";
+      }
+    }
+  }
+
+  function formatDuration(seconds) {
+    seconds = Math.max(0, Math.round(seconds));
+    var h = Math.floor(seconds / 3600);
+    var m = Math.floor((seconds % 3600) / 60);
+    var s = seconds % 60;
+    if (h > 0) return h + "h " + m + "m";
+    if (m > 0) return m + "m " + s + "s";
+    return s + "s";
   }
 
   /* ---------- backfill timing estimate (backtest page) ---------- */
@@ -664,6 +709,14 @@
       form.addEventListener("submit", function () {
         btn.disabled = true;
         btn.textContent = "Running…";
+      });
+    }
+    var stopForm = el("pullStopForm");
+    var stopBtn = el("pullStopBtn");
+    if (stopForm && stopBtn) {
+      stopForm.addEventListener("submit", function () {
+        stopBtn.disabled = true;
+        stopBtn.textContent = "Stopping…";
       });
     }
   })();

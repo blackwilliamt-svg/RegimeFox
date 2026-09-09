@@ -118,6 +118,11 @@ class Engine:
         # the actual position, so it can only ever attach to the trade it
         # was computed for.
         self._active_blend_detail: dict[tuple[str, str], dict[str, Any]] = {}
+        # Set while a historical/full-history pull is running so the dashboard's
+        # "Stop pull" button has something to signal; cleared at the start of
+        # every new pull so a stale set flag from a previous run can never
+        # abort the next one before it gets going.
+        self._pull_stop = threading.Event()
         self._backtest_hook = None  # set by run_worker so a daily run can fire
         # Off by default so constructing an Engine for a test or a script never
         # spawns a real WFMC run purely because the wall clock happens to match
@@ -926,6 +931,10 @@ class Engine:
             self._start_pull(payload, conn)
             return "historical pull started"
 
+        if command == "stop_pull":
+            self._pull_stop.set()
+            return "historical pull stop requested"
+
         if command == "run_backtest":
             self._start_backtest(payload, conn)
             return "backtest started"
@@ -989,10 +998,15 @@ class Engine:
         `run()` above doesn't need a special case for this one command.
         """
         pairs = self.store.full_binance_pairs()
+        # A restart after a stop (or after a prior run finished) must not
+        # inherit the previous run's stop signal.
+        self._pull_stop.clear()
 
         def worker() -> None:
             try:
-                report = self.store.run_full_history_pull(pairs)
+                report = self.store.run_full_history_pull(
+                    pairs, should_stop=self._pull_stop.is_set
+                )
             except Exception:
                 log.exception("full-history pull failed")
                 return

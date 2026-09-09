@@ -4,6 +4,8 @@ the per-coin coverage list.
 """
 from __future__ import annotations
 
+import pytest
+
 from solbot import db
 from solbot.candlestore import ParquetCandleStore
 from solbot.clients import BinanceAsset
@@ -213,6 +215,60 @@ def test_full_history_backfill_skips_a_failed_pair_but_keeps_going(tmp_path):
     assert report.candles_written == 1
 
 
+def test_run_full_history_pull_marks_cancelled_not_failed_when_stopped(workspace):
+    """The dashboard's Stop button (RegimeFox fix-up: pull stop/restart +
+    error surfacing) must not read as an error - status='cancelled', with a
+    message naming how far it got, distinct from an actual exception."""
+    conn = workspace["conn"]
+
+    def backward(pair):
+        return [Candle(ts=1000, open=1, high=1, low=1, close=1, volume=1)]
+
+    binance = FakeBinance(backward_fn=backward)
+    store = DataStore(binance, {"candle_minutes": 1}, candles=ParquetCandleStore(workspace["candles_dir"]))
+
+    # should_stop is checked once per pair, before that pair is processed
+    # (full_history_backfill's own loop) - false on the first call lets pair
+    # 1 through, true on the second stops before pair 2.
+    calls = {"n": 0}
+
+    def should_stop():
+        calls["n"] += 1
+        return calls["n"] > 1
+
+    store.run_full_history_pull(
+        {"AAA": "AAAUSDT", "BBB": "BBBUSDT", "CCC": "CCCUSDT"},
+        conn=conn, should_stop=should_stop,
+    )
+
+    progress = db.get_progress("historical_pull", conn=conn)
+    assert progress["status"] == "cancelled"
+    assert "Stopped by operator" in progress["message"]
+    assert "1 of 3" in progress["message"]
+
+
+def test_run_full_history_pull_marks_failed_on_a_real_exception(workspace):
+    """A genuine exception (not an operator-requested stop) must still read
+    as 'failed', with the exception text as the error message the dashboard
+    shows."""
+    conn = workspace["conn"]
+
+    binance = FakeBinance(backward_fn=lambda pair: [])
+    store = DataStore(binance, {"candle_minutes": 1}, candles=ParquetCandleStore(workspace["candles_dir"]))
+
+    def always_raise(pairs, **kw):
+        raise RuntimeError("binance is unreachable")
+
+    store.full_history_backfill = always_raise
+
+    with pytest.raises(RuntimeError):
+        store.run_full_history_pull({"AAA": "AAAUSDT"}, conn=conn)
+
+    progress = db.get_progress("historical_pull", conn=conn)
+    assert progress["status"] == "failed"
+    assert "binance is unreachable" in progress["message"]
+
+
 def test_a_full_history_pull_does_not_touch_the_universe_table_or_other_jobs(workspace):
     """The daily incremental / backtest / walk-forward pair_map() calls must
     see exactly the same routed universe before and after a full pull."""
@@ -263,7 +319,6 @@ def test_per_mint_coverage_excludes_mints_with_no_stored_candles(tmp_path):
 # GET /api/candles/coverage
 # --------------------------------------------------------------------------
 import pyotp
-import pytest
 
 
 @pytest.fixture

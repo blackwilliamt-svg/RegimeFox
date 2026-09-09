@@ -563,14 +563,28 @@ class DataStore:
             )
             raise
 
-        status = "done" if not result.stopped_early else "failed"
+        # "cancelled" (an operator hit Stop) is not the same situation as
+        # "failed" (an exception blew the whole pull up) even though both
+        # leave the pull incomplete - the dashboard shows them differently,
+        # and only "failed" should read as an actual error.
+        if result.stopped_early == "cancelled":
+            status = "cancelled"
+            message = (
+                f"Stopped by operator after {result.tokens_done} of {total} pairs "
+                f"({result.candles_written:,} candles written)"
+            )
+        elif result.stopped_early:
+            status = "failed"
+            message = result.stopped_early
+        else:
+            status = "done"
+            message = f"{result.candles_written:,} candles across {result.tokens_done} pairs"
         db.set_progress(
             JOB_INITIAL_PULL,
             status=status,
             done=result.tokens_done,
             total=total,
-            message=result.stopped_early
-            or f"{result.candles_written:,} candles across {result.tokens_done} pairs",
+            message=message,
             conn=conn,
         )
         db.log_event(
