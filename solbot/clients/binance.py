@@ -41,7 +41,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from .base import ApiError, HttpClient
 
@@ -226,7 +226,13 @@ class BinanceClient(HttpClient):
         return [seen[k] for k in sorted(seen)]
 
     def klines_backward(
-        self, pair: str, *, until: int | None = None, max_pages: int = 10_000
+        self,
+        pair: str,
+        *,
+        until: int | None = None,
+        max_pages: int = 10_000,
+        should_stop: Callable[[], bool] | None = None,
+        on_page: Callable[[int], None] | None = None,
     ) -> list[Candle]:
         """Every candle Binance.US has for ``pair``, found by paging
         backward from ``until`` (default: now) until a page comes back
@@ -236,16 +242,31 @@ class BinanceClient(HttpClient):
         goes). ``max_pages`` is a runaway-loop safety cap, not a target: at
         1000 one-minute candles per page that is roughly 19 years, well
         past anything Binance.US could plausibly have listed.
+
+        ``should_stop``, checked between pages, is what lets the dashboard's
+        Stop button actually interrupt a pull that is stuck deep inside one
+        long-lived pair - checking it only between *pairs* (the caller's own
+        loop) left a pair with a lot of real history, or one being slowly
+        strangled by rate-limit backoff, effectively unstoppable for as long
+        as it took to finish. ``on_page``, called with the running page
+        count after every page, is what keeps the dashboard's progress
+        readout from looking frozen while that one pair is still paging -
+        without it, nothing updates between the "N of M pairs" ticks
+        before/after this call, however long this call itself takes.
         """
         until = int(until) if until is not None else int(time.time())
         step_seconds = MAX_KLINES_PER_CALL * 60
         cursor_end = until
         out: list[Candle] = []
-        for _ in range(max(1, int(max_pages))):
+        for page_num in range(1, max(1, int(max_pages)) + 1):
+            if should_stop and should_stop():
+                break
             cursor_start = cursor_end - step_seconds
             page = self.klines(
                 pair, start_ms=cursor_start * 1000, end_ms=cursor_end * 1000
             )
+            if on_page:
+                on_page(page_num)
             if not page:
                 break
             out.extend(page)

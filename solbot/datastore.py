@@ -485,11 +485,24 @@ class DataStore:
         conn: sqlite3.Connection | None = None,
         progress: Callable[[int, int, str], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
+        page_progress: Callable[[int, int, str, int], None] | None = None,
     ) -> PullReport:
         """Every pair's full available history - paging backward per pair
         until Binance.US returns an empty page, never a fixed months
         window. `pairs` is expected to be `full_binance_pairs()`'s own
-        mapping (base symbol -> Binance pair), not the routed universe."""
+        mapping (base symbol -> Binance pair), not the routed universe.
+
+        ``should_stop`` is threaded all the way into
+        ``BinanceClient.klines_backward``, not just checked between pairs
+        here - a pair with a lot of real history (or one stuck slowly
+        retrying through rate-limit backoff) can take a very long time on
+        its own, and without this a Stop request would have no effect until
+        that single pair finally finished. ``page_progress``, forwarded as
+        klines_backward's own on_page hook, is what keeps the dashboard's
+        progress readout live while that one pair is still paging, instead
+        of looking frozen between the "N of M pairs" ticks either side of
+        this call.
+        """
         conn = conn or db.connect()
         report = PullReport(tokens_requested=len(pairs))
 
@@ -498,7 +511,15 @@ class DataStore:
                 report.stopped_early = "cancelled"
                 break
             try:
-                candles = self.binance.klines_backward(pair)
+                candles = self.binance.klines_backward(
+                    pair,
+                    should_stop=should_stop,
+                    on_page=(
+                        (lambda page_num, idx=idx, pair=pair:
+                            page_progress(idx - 1, len(pairs), pair, page_num))
+                        if page_progress else None
+                    ),
+                )
             except ApiError as exc:
                 log.warning("full-history backfill failed for %s: %s", pair, exc)
                 report.tokens_failed += 1
@@ -508,6 +529,9 @@ class DataStore:
 
             report.calls += max(1, -(-len(candles) // MAX_KLINES_PER_CALL))
             if candles:
+                # Written even when should_stop cut this pair's own paging
+                # short below - whatever was fetched before the stop is
+                # real, deduped, safe-to-resume-from history, not discarded.
                 report.candles_written += self.candles.append(
                     key, self.base_interval, [c.as_row() for c in candles],
                     incremental=False,
@@ -515,6 +539,10 @@ class DataStore:
             report.tokens_done += 1
             if progress:
                 progress(idx, len(pairs), pair)
+
+            if should_stop and should_stop():
+                report.stopped_early = "cancelled"
+                break
 
         return report
 
@@ -550,9 +578,29 @@ class DataStore:
                 conn=conn,
             )
 
+        def report_page_progress(done: int, tot: int, pair: str, page_num: int) -> None:
+            # Every page rather than throttled: klines_backward is already
+            # rate-limited to a handful of requests/second, so this writes
+            # no faster than the pull itself is already going - and it is
+            # exactly what keeps a pair with a lot of real history (or one
+            # stuck slowly retrying) from making the dashboard look frozen
+            # between "N of M pairs" ticks either side of it.
+            db.set_progress(
+                JOB_INITIAL_PULL,
+                status="running",
+                done=done,
+                total=tot,
+                message=(
+                    f"Pulling full Binance.US history — {done} of {tot} pairs complete "
+                    f"({pair} now, page {page_num})"
+                ),
+                conn=conn,
+            )
+
         try:
             result = self.full_history_backfill(
                 pairs, conn=conn, progress=report_progress, should_stop=should_stop,
+                page_progress=report_page_progress,
             )
         except Exception as exc:
             db.set_progress(

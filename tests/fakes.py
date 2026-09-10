@@ -59,6 +59,7 @@ class FakeBinance:
         *,
         klines_fn: Any = None,
         backward_fn: Any = None,
+        backward_paged_fn: Any = None,
     ) -> None:
         self._assets = list(assets or [])
         # (pair, since, until) -> list[Candle]; default is "nothing on record",
@@ -68,6 +69,11 @@ class FakeBinance:
         # (dashboard fix-up section 6) - a fake stands in for the whole
         # backward walk rather than simulating it page by page.
         self._backward_fn = backward_fn or (lambda pair: [])
+        # (pair, *, should_stop, on_page, max_pages) -> list[Candle]; the
+        # escape hatch for tests that need real page-by-page control (a mid-
+        # pair should_stop / on_page check) - klines_backward's own
+        # signature, rather than the single-shot backward_fn above.
+        self._backward_paged_fn = backward_paged_fn
         self.calls = 0
         self.klines_calls: list[tuple[str, int, int]] = []
         self.backward_calls: list[str] = []
@@ -86,9 +92,23 @@ class FakeBinance:
         self.klines_calls.append((pair, since, until))
         return self._klines_fn(pair, since, until)
 
-    def klines_backward(self, pair: str, *, until: int | None = None, max_pages: int = 10_000):
+    def klines_backward(
+        self,
+        pair: str,
+        *,
+        until: int | None = None,
+        max_pages: int = 10_000,
+        should_stop: Any = None,
+        on_page: Any = None,
+    ):
         self.calls += 1
         self.backward_calls.append(pair)
+        if self._backward_paged_fn:
+            return self._backward_paged_fn(
+                pair, should_stop=should_stop, on_page=on_page, max_pages=max_pages
+            )
+        if on_page:
+            on_page(1)
         return self._backward_fn(pair)
 
     def close(self) -> None:

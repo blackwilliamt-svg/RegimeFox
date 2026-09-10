@@ -79,6 +79,47 @@ def test_klines_backward_respects_max_pages_as_a_safety_cap(monkeypatch):
     assert len(out) == 5   # never stops on its own; the cap is what stops it
 
 
+def test_klines_backward_stops_mid_pair_when_should_stop_fires(monkeypatch):
+    """The dashboard Stop button (historical-pull stuck-job fix-up) has to
+    interrupt a pair while it is still paging, not just between pairs - a
+    pair with a lot of real history (or one stuck slowly retrying) could
+    otherwise make Stop do nothing for as long as that one pair takes."""
+    client = _client()
+
+    def always_one_candle(pair, *, start_ms, end_ms, limit=1000):
+        return [Candle(ts=end_ms // 1000 - 60, open=1, high=1, low=1, close=1, volume=1)]
+
+    monkeypatch.setattr(client, "klines", always_one_candle)
+    calls = {"n": 0}
+
+    def should_stop():
+        calls["n"] += 1
+        return calls["n"] > 3   # let 3 pages through, stop before the 4th
+
+    out = client.klines_backward("STUCKUSDT", until=10_000_000, should_stop=should_stop)
+
+    assert len(out) == 3
+    assert calls["n"] == 4   # checked once more than it allowed through
+
+
+def test_klines_backward_calls_on_page_for_every_page(monkeypatch):
+    client = _client()
+    step = 1000 * 60
+    until = 10_000_000
+
+    def fake_klines(pair, *, start_ms, end_ms, limit=1000):
+        start_s = start_ms // 1000
+        if start_s >= until - 3 * step:
+            return [Candle(ts=start_s, open=1, high=1, low=1, close=1, volume=1)]
+        return []
+
+    monkeypatch.setattr(client, "klines", fake_klines)
+    pages_seen = []
+    client.klines_backward("ETHUSDT", until=until, on_page=pages_seen.append)
+
+    assert pages_seen == [1, 2, 3, 4]   # three real pages, then the empty one that stops it
+
+
 def test_all_bases_includes_stablecoins_and_leveraged_tokens_top_bases_excludes():
     client = _client()
 
@@ -213,6 +254,79 @@ def test_full_history_backfill_skips_a_failed_pair_but_keeps_going(tmp_path):
     assert report.tokens_failed == 1
     assert report.tokens_done == 1
     assert report.candles_written == 1
+
+
+def test_full_history_backfill_stops_mid_pair_via_should_stop_and_reports_pages(tmp_path):
+    """should_stop threaded all the way into klines_backward (not just
+    checked between pairs) is what lets Stop actually interrupt a pair
+    that is still paging - and page_progress is what keeps the dashboard
+    from looking frozen while it does. This is the exact gap that let a
+    single slow/stuck pair make the whole pull look permanently frozen."""
+    def backward_paged(pair, *, should_stop, on_page, max_pages):
+        out = []
+        for page_num in range(1, 6):
+            if should_stop and should_stop():
+                break
+            out.append(Candle(ts=1000 + page_num, open=1, high=1, low=1, close=1, volume=1))
+            if on_page:
+                on_page(page_num)
+        return out
+
+    binance = FakeBinance(backward_paged_fn=backward_paged)
+    store = DataStore(binance, {"candle_minutes": 1}, candles=ParquetCandleStore(tmp_path / "candles"))
+
+    stop_calls = {"n": 0}
+
+    def should_stop():
+        stop_calls["n"] += 1
+        # Called once by the outer pair-loop's own pre-check, then once per
+        # page inside klines_backward - 3 calls (the pre-check + 2 pages)
+        # need to pass before this lets the 3rd page's check stop it.
+        return stop_calls["n"] > 3
+
+    pages_reported = []
+    report = store.full_history_backfill(
+        {"AAA": "AAAUSDT"}, should_stop=should_stop,
+        page_progress=lambda done, tot, pair, page_num: pages_reported.append((done, tot, pair, page_num)),
+    )
+
+    assert report.tokens_done == 1        # the pair "finished" with what it got
+    assert report.candles_written == 2    # only the 2 pages that got through
+    assert report.stopped_early == "cancelled"
+    assert pages_reported == [(0, 1, "AAAUSDT", 1), (0, 1, "AAAUSDT", 2)]
+
+
+def test_run_full_history_pull_surfaces_live_page_progress_mid_pair(workspace, monkeypatch):
+    """Without page_progress reaching job_progress, the dashboard's message
+    (and updated_at) never changes while a single pair is still paging -
+    exactly what made a slow pair look like a frozen job."""
+    conn = workspace["conn"]
+
+    def backward_paged(pair, *, should_stop, on_page, max_pages):
+        for page_num in range(1, 4):
+            if on_page:
+                on_page(page_num)
+        return [Candle(ts=1000, open=1, high=1, low=1, close=1, volume=1)]
+
+    binance = FakeBinance(backward_paged_fn=backward_paged)
+    store = DataStore(binance, {"candle_minutes": 1}, candles=ParquetCandleStore(workspace["candles_dir"]))
+
+    messages = []
+    orig_set_progress = db.set_progress
+
+    def capturing_set_progress(job, **kw):
+        if kw.get("message"):
+            messages.append(kw["message"])
+        return orig_set_progress(job, **kw)
+
+    monkeypatch.setattr(db, "set_progress", capturing_set_progress)
+
+    store.run_full_history_pull({"AAA": "AAAUSDT"}, conn=conn)
+
+    page_messages = [m for m in messages if "page" in m]
+    assert len(page_messages) == 3
+    assert "page 1" in page_messages[0]
+    assert "page 3" in page_messages[-1]
 
 
 def test_run_full_history_pull_marks_cancelled_not_failed_when_stopped(workspace):
