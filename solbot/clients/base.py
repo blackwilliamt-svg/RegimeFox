@@ -100,7 +100,17 @@ class HttpClient:
                     provider=self.provider,
                 )
             try:
-                resp = self._client.request(method, path, params=params, json=json_body)
+                # A caller-supplied timeout overrides the client's own
+                # constructor default for this call only; when none is
+                # given, the kwarg is omitted entirely rather than passed
+                # as None - httpx treats an explicit `timeout=None` as "no
+                # timeout at all", which would silently turn every ordinary
+                # call unbounded instead of just falling back to the
+                # client's real default.
+                request_kwargs: dict[str, Any] = {"params": params, "json": json_body}
+                if timeout is not None:
+                    request_kwargs["timeout"] = timeout
+                resp = self._client.request(method, path, **request_kwargs)
             except httpx.HTTPError as exc:
                 last_error = exc
                 if attempt >= self.max_retries:

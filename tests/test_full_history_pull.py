@@ -9,6 +9,7 @@ import pytest
 from solbot import db
 from solbot.candlestore import ParquetCandleStore
 from solbot.clients import BinanceAsset
+from solbot.clients.base import ApiError
 from solbot.clients.binance import BinanceClient, Candle
 from solbot.datastore import DataStore
 from solbot.ratelimit import TokenBucket
@@ -100,6 +101,65 @@ def test_klines_backward_stops_mid_pair_when_should_stop_fires(monkeypatch):
 
     assert len(out) == 3
     assert calls["n"] == 4   # checked once more than it allowed through
+
+
+def test_klines_backward_retries_a_failing_page_then_skips_it_and_stops_that_pair(monkeypatch):
+    """A page that still fails after PAGE_RETRY_ATTEMPTS (a timeout, a
+    rate-limiter miss - anything HttpClient's own internal retries
+    couldn't recover from) must not hang or lose everything already
+    collected for this pair by propagating out - it ends this pair's
+    paging early instead, with whatever came before still returned. This
+    is the "stuck for hours mid-pair with no exception and no progress"
+    failure mode the fix-up prompt traced to an unbounded rate-limiter
+    wait; this test covers the paging loop's own half of that fix."""
+    client = _client()
+    calls = []
+
+    def flaky_klines(pair, *, start_ms, end_ms, limit=1000):
+        calls.append((start_ms, end_ms))
+        if len(calls) == 1:
+            return [Candle(ts=end_ms // 1000 - 60, open=1, high=1, low=1, close=1, volume=1)]
+        raise ApiError("binance: gateway timeout", provider="binance")
+
+    monkeypatch.setattr(client, "klines", flaky_klines)
+    monkeypatch.setattr(client, "_sleep_backoff", lambda attempt: None)
+
+    skipped = []
+    out = client.klines_backward(
+        "FLAKYUSDT", until=10_000_000,
+        on_page_skipped=lambda page_num, exc: skipped.append((page_num, str(exc))),
+    )
+
+    assert len(out) == 1   # the one page that succeeded before the failures started
+    assert [p for p, _ in skipped] == [2]   # gave up on page 2, not page 1
+    # 1 successful call, then PAGE_RETRY_ATTEMPTS failed attempts at page 2
+    assert len(calls) == 1 + client.PAGE_RETRY_ATTEMPTS
+
+
+def test_klines_range_retries_a_failing_page_then_stops_but_keeps_what_it_had(monkeypatch):
+    """bulk_backfill's own paging primitive gets the same retry-then-give-
+    up-on-this-page treatment as klines_backward, for the same reason."""
+    client = _client()
+    calls = []
+
+    def flaky_klines(pair, *, start_ms, end_ms, limit=1000):
+        calls.append((start_ms, end_ms))
+        if len(calls) == 1:
+            return [Candle(ts=start_ms // 1000, open=1, high=1, low=1, close=1, volume=1)]
+        raise ApiError("binance: gateway timeout", provider="binance")
+
+    monkeypatch.setattr(client, "klines", flaky_klines)
+    monkeypatch.setattr(client, "_sleep_backoff", lambda attempt: None)
+
+    skipped = []
+    out = client.klines_range(
+        "FLAKYUSDT", since=0, until=10_000_000,
+        on_page_skipped=lambda chunk_start, exc: skipped.append((chunk_start, str(exc))),
+    )
+
+    assert len(out) == 1
+    assert len(skipped) == 1
+    assert len(calls) == 1 + client.PAGE_RETRY_ATTEMPTS
 
 
 def test_klines_backward_calls_on_page_for_every_page(monkeypatch):

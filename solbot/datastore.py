@@ -271,8 +271,26 @@ class DataStore:
                 end = min(end, now)
                 if start >= end:
                     continue
+                def _log_page_skipped(chunk_start: int, exc: Exception, pair: str = pair, y: int = y, m: int = m) -> None:
+                    # klines_range itself already retried this page a few
+                    # times (BinanceClient.PAGE_RETRY_ATTEMPTS) before
+                    # giving up on it - a gap here is better than this
+                    # month, and everything behind it, hanging on one page.
+                    log.warning(
+                        "bulk backfill: a page of %s %04d-%02d never came back after "
+                        "retrying - skipping the rest of that month (%s)",
+                        pair, y, m, exc,
+                    )
+                    db.log_event(
+                        f"Bulk backfill: gave up on a page of {pair} {y:04d}-{m:02d} after "
+                        f"retrying - the rest of that month is skipped ({exc})",
+                        level="warn", category="system", conn=conn,
+                    )
+
                 try:
-                    candles = self.binance.klines_range(pair, since=start, until=end)
+                    candles = self.binance.klines_range(
+                        pair, since=start, until=end, on_page_skipped=_log_page_skipped,
+                    )
                 except ApiError as exc:
                     log.warning(
                         "bulk backfill failed for %s %04d-%02d: %s", pair, y, m, exc
@@ -510,6 +528,23 @@ class DataStore:
             if should_stop and should_stop():
                 report.stopped_early = "cancelled"
                 break
+            def _log_page_skipped(page_num: int, exc: Exception, pair: str = pair) -> None:
+                # A page that still fails after klines_backward's own
+                # page-level retries - a gap in this pair's history is
+                # better than this pair (and the whole 269-pair job behind
+                # it) hanging or aborting on one unlucky page.
+                log.warning(
+                    "full-history backfill: page %d of %s never came back "
+                    "after retrying - skipping the rest of this pair (%s)",
+                    page_num, pair, exc,
+                )
+                db.log_event(
+                    f"Historical pull: gave up on page {page_num} of {pair} after "
+                    f"retrying - the rest of that pair's history is skipped, not "
+                    f"the whole job ({exc})",
+                    level="warn", category="system", conn=conn,
+                )
+
             try:
                 candles = self.binance.klines_backward(
                     pair,
@@ -519,6 +554,7 @@ class DataStore:
                             page_progress(idx - 1, len(pairs), pair, page_num))
                         if page_progress else None
                     ),
+                    on_page_skipped=_log_page_skipped,
                 )
             except ApiError as exc:
                 log.warning("full-history backfill failed for %s: %s", pair, exc)

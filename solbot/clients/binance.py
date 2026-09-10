@@ -208,15 +208,44 @@ class BinanceClient(HttpClient):
                 continue
         return out
 
-    def klines_range(self, pair: str, *, since: int, until: int) -> list[Candle]:
-        """Page through a window at 1-minute resolution, respecting the 1000-row cap."""
+    def klines_range(
+        self,
+        pair: str,
+        *,
+        since: int,
+        until: int,
+        on_page_skipped: Callable[[int, Exception], None] | None = None,
+    ) -> list[Candle]:
+        """Page through a window at 1-minute resolution, respecting the
+        1000-row cap. A page that still fails after PAGE_RETRY_ATTEMPTS
+        (see klines_backward's own docstring - same retry-then-give-up-on-
+        this-page reasoning) ends the walk early rather than propagating
+        out and losing whatever this window already collected;
+        ``on_page_skipped`` is called with the failing chunk's start
+        timestamp (seconds) and the exception."""
         out: list[Candle] = []
         cursor_ms = int(since) * 1000
         end_ms = int(until) * 1000
         step_ms = MAX_KLINES_PER_CALL * 60 * 1000
         while cursor_ms < end_ms:
             chunk_end = min(cursor_ms + step_ms, end_ms)
-            page = self.klines(pair, start_ms=cursor_ms, end_ms=chunk_end)
+
+            page: list[Candle] = []
+            last_exc: ApiError | None = None
+            for attempt in range(1, self.PAGE_RETRY_ATTEMPTS + 1):
+                try:
+                    page = self.klines(pair, start_ms=cursor_ms, end_ms=chunk_end)
+                    last_exc = None
+                    break
+                except ApiError as exc:
+                    last_exc = exc
+                    if attempt < self.PAGE_RETRY_ATTEMPTS:
+                        self._sleep_backoff(attempt)
+            if last_exc is not None:
+                if on_page_skipped:
+                    on_page_skipped(cursor_ms // 1000, last_exc)
+                break
+
             if not page:
                 cursor_ms = chunk_end
                 continue
@@ -224,6 +253,13 @@ class BinanceClient(HttpClient):
             cursor_ms = max(page[-1].ts * 1000 + 60_000, chunk_end)
         seen: dict[int, Candle] = {c.ts: c for c in out}
         return [seen[k] for k in sorted(seen)]
+
+    # A single page failing outright (after HttpClient's own internal
+    # 429/5xx retries are already exhausted) gets this many extra attempts
+    # at the page level before this pair is given up on - reusing
+    # HttpClient._sleep_backoff rather than inventing a second backoff
+    # scheme for what is, from here, the same kind of transient failure.
+    PAGE_RETRY_ATTEMPTS = 3
 
     def klines_backward(
         self,
@@ -233,6 +269,7 @@ class BinanceClient(HttpClient):
         max_pages: int = 10_000,
         should_stop: Callable[[], bool] | None = None,
         on_page: Callable[[int], None] | None = None,
+        on_page_skipped: Callable[[int, Exception], None] | None = None,
     ) -> list[Candle]:
         """Every candle Binance.US has for ``pair``, found by paging
         backward from ``until`` (default: now) until a page comes back
@@ -253,6 +290,16 @@ class BinanceClient(HttpClient):
         readout from looking frozen while that one pair is still paging -
         without it, nothing updates between the "N of M pairs" ticks
         before/after this call, however long this call itself takes.
+
+        A page that still fails after PAGE_RETRY_ATTEMPTS (a timeout, a
+        rate-limiter miss, an unlucky run of 5xxs - anything HttpClient's
+        own internal retries couldn't already recover from) ends this
+        pair's paging early rather than propagating out and losing
+        whatever was already collected for it: ``on_page_skipped`` is
+        called with the page number and the exception, and everything
+        fetched before that page is still returned. A gap in one pair's
+        history from a page that truly cannot be fetched is better than
+        that page hanging or aborting the entire multi-hundred-pair job.
         """
         until = int(until) if until is not None else int(time.time())
         step_seconds = MAX_KLINES_PER_CALL * 60
@@ -262,9 +309,25 @@ class BinanceClient(HttpClient):
             if should_stop and should_stop():
                 break
             cursor_start = cursor_end - step_seconds
-            page = self.klines(
-                pair, start_ms=cursor_start * 1000, end_ms=cursor_end * 1000
-            )
+
+            page: list[Candle] = []
+            last_exc: ApiError | None = None
+            for attempt in range(1, self.PAGE_RETRY_ATTEMPTS + 1):
+                try:
+                    page = self.klines(
+                        pair, start_ms=cursor_start * 1000, end_ms=cursor_end * 1000
+                    )
+                    last_exc = None
+                    break
+                except ApiError as exc:
+                    last_exc = exc
+                    if attempt < self.PAGE_RETRY_ATTEMPTS:
+                        self._sleep_backoff(attempt)
+            if last_exc is not None:
+                if on_page_skipped:
+                    on_page_skipped(page_num, last_exc)
+                break
+
             if on_page:
                 on_page(page_num)
             if not page:

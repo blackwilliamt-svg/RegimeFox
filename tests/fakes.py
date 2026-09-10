@@ -87,7 +87,9 @@ class FakeBinance:
         self.calls += 1
         return sorted(self._assets, key=lambda a: a.quote_volume_24h, reverse=True)
 
-    def klines_range(self, pair: str, *, since: int, until: int):
+    def klines_range(
+        self, pair: str, *, since: int, until: int, on_page_skipped: Any = None,
+    ):
         self.calls += 1
         self.klines_calls.append((pair, since, until))
         return self._klines_fn(pair, since, until)
@@ -100,6 +102,7 @@ class FakeBinance:
         max_pages: int = 10_000,
         should_stop: Any = None,
         on_page: Any = None,
+        on_page_skipped: Any = None,
     ):
         self.calls += 1
         self.backward_calls.append(pair)

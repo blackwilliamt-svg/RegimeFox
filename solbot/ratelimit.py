@@ -85,11 +85,24 @@ class TokenBucket:
                 return True
             return False
 
+    # A caller that omits `timeout` gets this, not an unbounded wait - a
+    # bug in refill accounting, or a long penalty window from a prior 429,
+    # must not be able to block a caller (and, transitively, whatever loop
+    # is waiting on it) forever with no exception and no way out. Real
+    # unbounded waiting is opt-in only, via WAIT_FOREVER.
+    DEFAULT_ACQUIRE_TIMEOUT = 60.0
+    WAIT_FOREVER = float("inf")
+
     def acquire(
         self, cost: float = 1.0, priority: str = "normal", timeout: float | None = None
     ) -> bool:
-        """Block until `cost` tokens are available. False if `timeout` elapsed."""
-        deadline = None if timeout is None else time.monotonic() + timeout
+        """Block until `cost` tokens are available. False if `timeout`
+        elapsed. `timeout=None` (the default) waits up to
+        DEFAULT_ACQUIRE_TIMEOUT, not forever - pass WAIT_FOREVER explicitly
+        for the rare case that is actually meant to block indefinitely."""
+        if timeout is None:
+            timeout = self.DEFAULT_ACQUIRE_TIMEOUT
+        deadline = None if timeout == self.WAIT_FOREVER else time.monotonic() + timeout
         with self._lock:
             while True:
                 self._refill()

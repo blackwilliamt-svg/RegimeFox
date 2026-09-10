@@ -76,6 +76,28 @@ def test_acquire_times_out_rather_than_blocking_forever():
     assert not bucket.acquire(1.0, timeout=0.05)
 
 
+def test_acquire_with_no_timeout_uses_a_default_deadline_not_forever(monkeypatch):
+    """A caller that omits `timeout` altogether (every current caller in
+    this codebase, until the full-pull mid-pair hang fix-up) must still be
+    bounded - a bug in refill accounting, or a long penalty window from a
+    prior 429, must never be able to block that caller (and whatever loop
+    is waiting on it) forever with no exception and no way out."""
+    monkeypatch.setattr(TokenBucket, "DEFAULT_ACQUIRE_TIMEOUT", 0.05)
+    bucket = TokenBucket(0.1, burst=1, reserve=0.0)
+    start = time.monotonic()
+
+    assert not bucket.acquire(1.0)   # no timeout passed at all
+
+    assert time.monotonic() - start < 1.0   # bounded by the (patched) default, not real 60s
+
+
+def test_wait_forever_is_still_available_as_an_explicit_opt_in():
+    """Genuinely unbounded waiting stays possible, just never by accident -
+    a caller has to name WAIT_FOREVER on purpose."""
+    bucket = TokenBucket(1000.0, burst=5, reserve=0.0)
+    assert bucket.acquire(1.0, timeout=TokenBucket.WAIT_FOREVER)
+
+
 def test_configure_updates_limits_live():
     bucket = TokenBucket(1.0, burst=1, reserve=0.0)
     bucket.configure(100.0, 10)
